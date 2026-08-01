@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(FEMM C CXX)
 
 option(BUILD_MANUAL "Build the manual" OFF)
+option(BUILD_GPU_SOLVER "Build the independent CUDA linear P1 PoC" OFF)
 option(SKIP_belasolv "Skip building belasolv" OFF)
 option(SKIP_csolv "Skip building csolv" OFF)
 option(SKIP_liblua "Skip building liblua" OFF)
@@ -17,6 +18,11 @@ set(INSTALL_BIN_DIR  "${CMAKE_SOURCE_DIR}/bin" CACHE PATH "Path where exe will b
 
 if(BUILD_MANUAL)
   add_subdirectory(manual)
+endif()
+
+if(BUILD_GPU_SOLVER)
+  include(CTest)
+  add_subdirectory(gpu_solver)
 endif()
 
 if (NOT SKIP_belasolv)
