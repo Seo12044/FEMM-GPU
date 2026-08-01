@@ -167,6 +167,12 @@ Status CopyToHost(void* destination, const void* source, size_t bytes)
       : Status::kInternalError;
 }
 
+// One fixed block keeps every CSR-row ownership fixed from solve to solve.
+// The costly row/vector work is parallel; scalar sums deliberately remain in
+// lane zero and ascending-index order to preserve the former solver's exact
+// floating-point and status behavior without atomics.
+constexpr int kPcgBlockThreads = 256;
+
 __global__ void DeterministicPcgKernel(
     int n, const int32_t* row_offsets, const int32_t* column_indices,
     const double* values, const double* diagonal, const double* rhs, double* x,
@@ -174,179 +180,291 @@ __global__ void DeterministicPcgKernel(
     double* matrix_direction, double relative_tolerance, int max_iterations,
     SolveInfo* info)
 {
-  if (blockIdx.x != 0 || threadIdx.x != 0)
+  if (blockIdx.x != 0)
     return;
 
-  info->status = Status::kInternalError;
-  info->iterations = 0;
-  info->residual_l2 = INFINITY;
-  if (n <= 0 || max_iterations < 0 || !(relative_tolerance > 0.0) || !(relative_tolerance < 1.0) || !isfinite(relative_tolerance)) {
-    info->status = Status::kInvalidArgument;
-    return;
+  const int lane = threadIdx.x;
+  __shared__ double scalar_a;
+  __shared__ double scalar_b;
+  __shared__ int stop;
+  __shared__ int threshold_reached;
+  __shared__ int true_residual_verified;
+  if (lane == 0) {
+    info->status = Status::kInternalError;
+    info->iterations = 0;
+    info->residual_l2 = INFINITY;
+    stop = 0;
+    threshold_reached = 0;
+    true_residual_verified = 0;
+    if (n <= 0 || max_iterations < 0 || !(relative_tolerance > 0.0)
+        || !(relative_tolerance < 1.0) || !isfinite(relative_tolerance)) {
+      info->status = Status::kInvalidArgument;
+      stop = 1;
+    }
   }
+  __syncthreads();
+  if (stop)
+    return;
 
-  double rhs_scale = 0.0;
-  for (int i = 0; i < n; ++i) {
-    if (!isfinite(rhs[i]) || !isfinite(diagonal[i])) {
-      info->status = Status::kNumericalNonfinite;
-      return;
+  if (lane == 0) {
+    for (int i = 0; i < n; ++i) {
+      if (!isfinite(rhs[i]) || !isfinite(diagonal[i])) {
+        info->status = Status::kNumericalNonfinite;
+        stop = 1;
+        break;
+      }
+      if (!(diagonal[i] > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        stop = 1;
+        break;
+      }
     }
-    if (!(diagonal[i] > 0.0)) {
-      info->status = Status::kLinearSolveBreakdown;
-      return;
-    }
+  }
+  __syncthreads();
+  if (stop)
+    return;
+
+  for (int i = lane; i < n; i += kPcgBlockThreads)
     x[i] = 0.0;
-    rhs_scale = fmax(rhs_scale, fabs(rhs[i]));
+  __syncthreads();
+  if (lane == 0) {
+    scalar_a = 0.0;
+    for (int i = 0; i < n; ++i)
+      scalar_a = fmax(scalar_a, fabs(rhs[i]));
   }
+  __syncthreads();
+  const double rhs_scale = scalar_a;
   if (rhs_scale == 0.0) {
-    info->residual_l2 = 0.0;
-    info->status = Status::kOk;
+    if (lane == 0) {
+      info->residual_l2 = 0.0;
+      info->status = Status::kOk;
+    }
     return;
   }
 
-  double rhs_norm_sq = 0.0;
-  double rho = 0.0;
-  for (int i = 0; i < n; ++i) {
+  for (int i = lane; i < n; i += kPcgBlockThreads) {
     residual[i] = rhs[i] / rhs_scale;
     preconditioned[i] = residual[i] / diagonal[i];
     direction[i] = preconditioned[i];
-    rhs_norm_sq += residual[i] * residual[i];
-    rho += residual[i] * preconditioned[i];
   }
-
-  if (!isfinite(rhs_norm_sq) || !isfinite(rho)) {
-    info->status = Status::kNumericalNonfinite;
+  __syncthreads();
+  if (lane == 0) {
+    scalar_a = 0.0;
+    scalar_b = 0.0;
+    for (int i = 0; i < n; ++i) {
+      scalar_a += residual[i] * residual[i];
+      scalar_b += residual[i] * preconditioned[i];
+    }
+    if (!isfinite(scalar_a) || !isfinite(scalar_b)) {
+      info->status = Status::kNumericalNonfinite;
+      stop = 1;
+    } else {
+      info->residual_l2 = sqrt(scalar_a);
+    }
+  }
+  __syncthreads();
+  if (stop)
     return;
-  }
-  double residual_norm_sq = rhs_norm_sq;
-  const double rhs_norm = sqrt(rhs_norm_sq);
+  double rho = scalar_b;
+  const double rhs_norm = sqrt(scalar_a);
   const double threshold = relative_tolerance * rhs_norm;
-  info->residual_l2 = sqrt(residual_norm_sq);
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
-    for (int row = 0; row < n; ++row) {
+    for (int row = lane; row < n; row += kPcgBlockThreads) {
       double sum = 0.0;
       for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry) {
         sum += values[entry] * direction[column_indices[entry]];
       }
       matrix_direction[row] = sum;
     }
+    __syncthreads();
 
-    double denominator = 0.0;
-    for (int i = 0; i < n; ++i)
-      denominator += direction[i] * matrix_direction[i];
-    if (!isfinite(denominator) || !isfinite(rho)) {
-      info->status = Status::kNumericalNonfinite;
-      return;
+    if (lane == 0) {
+      scalar_a = 0.0;
+      for (int i = 0; i < n; ++i)
+        scalar_a += direction[i] * matrix_direction[i];
+      if (!isfinite(scalar_a) || !isfinite(rho)) {
+        info->status = Status::kNumericalNonfinite;
+        stop = 1;
+      } else if (!(scalar_a > 0.0) || !(rho > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        stop = 1;
+      }
     }
-    if (!(denominator > 0.0) || !(rho > 0.0)) {
-      info->status = Status::kLinearSolveBreakdown;
+    __syncthreads();
+    if (stop)
       return;
-    }
 
-    const double alpha = rho / denominator;
-    residual_norm_sq = 0.0;
-    for (int i = 0; i < n; ++i) {
+    const double alpha = rho / scalar_a;
+    for (int i = lane; i < n; i += kPcgBlockThreads) {
       x[i] += alpha * direction[i];
       residual[i] -= alpha * matrix_direction[i];
-      residual_norm_sq += residual[i] * residual[i];
     }
-
-    info->iterations = iteration + 1;
-    if (!isfinite(residual_norm_sq)) {
-      info->status = Status::kNumericalNonfinite;
-      return;
-    }
-    info->residual_l2 = sqrt(residual_norm_sq);
-    if (!isfinite(info->residual_l2)) {
-      info->status = Status::kNumericalNonfinite;
-      return;
-    }
-    if (info->residual_l2 <= threshold) {
-      double true_residual_norm_sq = 0.0;
-      for (int row = 0; row < n; ++row) {
-        double matrix_solution = 0.0;
-        for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry) {
-          matrix_solution += values[entry] * x[column_indices[entry]];
-        }
-        residual[row] = rhs[row] / rhs_scale - matrix_solution;
-        true_residual_norm_sq += residual[row] * residual[row];
-      }
-      if (!isfinite(true_residual_norm_sq)) {
+    __syncthreads();
+    if (lane == 0) {
+      scalar_a = 0.0;
+      for (int i = 0; i < n; ++i)
+        scalar_a += residual[i] * residual[i];
+      info->iterations = iteration + 1;
+      if (!isfinite(scalar_a)) {
         info->status = Status::kNumericalNonfinite;
-        return;
+        stop = 1;
+      } else {
+        scalar_b = sqrt(scalar_a);
+        info->residual_l2 = scalar_b;
+        if (!isfinite(scalar_b)) {
+          info->status = Status::kNumericalNonfinite;
+          stop = 1;
+        } else {
+          threshold_reached = scalar_b <= threshold ? 1 : 0;
+        }
       }
-      info->residual_l2 = sqrt(true_residual_norm_sq);
-      if (info->residual_l2 <= threshold) {
-        for (int i = 0; i < n; ++i) {
+    }
+    __syncthreads();
+    if (stop)
+      return;
+    if (threshold_reached) {
+      for (int row = lane; row < n; row += kPcgBlockThreads) {
+        double matrix_solution = 0.0;
+        for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
+          matrix_solution += values[entry] * x[column_indices[entry]];
+        residual[row] = rhs[row] / rhs_scale - matrix_solution;
+      }
+      __syncthreads();
+      if (lane == 0) {
+        scalar_a = 0.0;
+        for (int i = 0; i < n; ++i)
+          scalar_a += residual[i] * residual[i];
+        if (!isfinite(scalar_a)) {
+          info->status = Status::kNumericalNonfinite;
+          stop = 1;
+        } else {
+          scalar_b = sqrt(scalar_a);
+          info->residual_l2 = scalar_b;
+          true_residual_verified = scalar_b <= threshold ? 1 : 0;
+        }
+      }
+      __syncthreads();
+      if (stop)
+        return;
+      if (true_residual_verified) {
+        for (int i = lane; i < n; i += kPcgBlockThreads) {
           x[i] *= rhs_scale;
-          if (!isfinite(x[i])) {
-            info->status = Status::kNumericalNonfinite;
-            return;
+        }
+        __syncthreads();
+        if (lane == 0) {
+          for (int i = 0; i < n; ++i) {
+            if (!isfinite(x[i])) {
+              info->status = Status::kNumericalNonfinite;
+              stop = 1;
+              break;
+            }
+          }
+          if (!stop) {
+            info->residual_l2 *= rhs_scale;
+            if (!isfinite(info->residual_l2)) {
+              info->status = Status::kNumericalNonfinite;
+              stop = 1;
+            } else {
+              info->status = Status::kOk;
+            }
           }
         }
-        info->residual_l2 *= rhs_scale;
-        if (!isfinite(info->residual_l2)) {
-          info->status = Status::kNumericalNonfinite;
+        __syncthreads();
+        if (stop)
           return;
-        }
-        info->status = Status::kOk;
         return;
       }
-      rho = 0.0;
-      for (int i = 0; i < n; ++i) {
+      for (int i = lane; i < n; i += kPcgBlockThreads) {
         preconditioned[i] = residual[i] / diagonal[i];
         direction[i] = preconditioned[i];
-        rho += residual[i] * preconditioned[i];
       }
-      if (!isfinite(rho) || !(rho > 0.0)) {
-        info->status = Status::kLinearSolveBreakdown;
+      __syncthreads();
+      if (lane == 0) {
+        rho = 0.0;
+        for (int i = 0; i < n; ++i)
+          rho += residual[i] * preconditioned[i];
+        if (!isfinite(rho) || !(rho > 0.0)) {
+          // Historical behavior maps a failed restart rho to BREAKDOWN.
+          info->status = Status::kLinearSolveBreakdown;
+          stop = 1;
+        } else {
+          scalar_b = rho;
+        }
+      }
+      __syncthreads();
+      if (stop)
         return;
-      }
+      rho = scalar_b;
       continue;
     }
 
-    double next_rho = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (int i = lane; i < n; i += kPcgBlockThreads) {
       preconditioned[i] = residual[i] / diagonal[i];
-      next_rho += residual[i] * preconditioned[i];
     }
-    if (!isfinite(next_rho) || !(next_rho > 0.0)) {
-      info->status = Status::kLinearSolveBreakdown;
+    __syncthreads();
+    if (lane == 0) {
+      scalar_a = 0.0;
+      for (int i = 0; i < n; ++i)
+        scalar_a += residual[i] * preconditioned[i];
+      if (!isfinite(scalar_a) || !(scalar_a > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        stop = 1;
+      }
+    }
+    __syncthreads();
+    if (stop)
       return;
-    }
-    const double beta = next_rho / rho;
-    for (int i = 0; i < n; ++i) {
+    const double beta = scalar_a / rho;
+    for (int i = lane; i < n; i += kPcgBlockThreads) {
       direction[i] = preconditioned[i] + beta * direction[i];
     }
-    rho = next_rho;
+    rho = scalar_a;
+    __syncthreads();
   }
 
-  double true_residual_norm_sq = 0.0;
-  for (int row = 0; row < n; ++row) {
+  for (int row = lane; row < n; row += kPcgBlockThreads) {
     double matrix_solution = 0.0;
     for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry) {
       matrix_solution += values[entry] * x[column_indices[entry]];
     }
     const double true_residual = rhs[row] / rhs_scale - matrix_solution;
-    true_residual_norm_sq += true_residual * true_residual;
+    residual[row] = true_residual;
   }
-  if (!isfinite(true_residual_norm_sq)) {
-    info->status = Status::kNumericalNonfinite;
-    return;
-  }
-  for (int i = 0; i < n; ++i) {
-    x[i] *= rhs_scale;
-    if (!isfinite(x[i])) {
+  __syncthreads();
+  if (lane == 0) {
+    scalar_a = 0.0;
+    for (int i = 0; i < n; ++i)
+      scalar_a += residual[i] * residual[i];
+    if (!isfinite(scalar_a)) {
       info->status = Status::kNumericalNonfinite;
-      return;
+      stop = 1;
     }
   }
-  info->residual_l2 = sqrt(true_residual_norm_sq) * rhs_scale;
-  if (!isfinite(info->residual_l2)) {
-    info->status = Status::kNumericalNonfinite;
+  __syncthreads();
+  if (stop)
     return;
+  for (int i = lane; i < n; i += kPcgBlockThreads) {
+    x[i] *= rhs_scale;
   }
-  info->status = Status::kLinearSolveNotConverged;
+  __syncthreads();
+  if (lane == 0) {
+    for (int i = 0; i < n; ++i) {
+      if (!isfinite(x[i])) {
+        info->status = Status::kNumericalNonfinite;
+        stop = 1;
+        break;
+      }
+    }
+    if (!stop) {
+      info->residual_l2 = sqrt(scalar_a) * rhs_scale;
+      if (!isfinite(info->residual_l2)) {
+        info->status = Status::kNumericalNonfinite;
+        stop = 1;
+      } else {
+        info->status = Status::kLinearSolveNotConverged;
+      }
+    }
+  }
 }
 
 __global__ void ComputeFieldKernel(
@@ -643,7 +761,7 @@ class GpuCsrSolver {
       result.status = copy_status;
       return result;
     }
-    DeterministicPcgKernel<<<1, 1>>>(
+    DeterministicPcgKernel<<<1, kPcgBlockThreads>>>(
         n_, row_offsets_.get(), column_indices_.get(), values_.get(), diagonal_.get(),
         rhs_.get(), solution_.get(), residual_.get(), direction_.get(),
         preconditioned_.get(), matrix_direction_.get(), relative_tolerance,
@@ -3305,11 +3423,13 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
   NonlinearOptions nonlinear_options;
   nonlinear_options.relative_tolerance = 1e-8;
   nonlinear_options.max_newton_iterations = 128;
+  nonlinear_options.max_linear_iterations = 4096;
   *solution = solver.Solve(request.circuit_currents_a, nonlinear_options);
   if (solution->info.status != Status::kOk) return solution->info.status;
   FrozenPostprocessOptions postprocess_options;
   postprocess_options.selected_group_number = request.selected_group_number;
   postprocess_options.air_group_number = request.air_group_number;
+  postprocess_options.max_mask_iterations = 4096;
   postprocess_options.airgap_radius_m = request.airgap_radius_mm * 1e-3;
   for (double angle : request.airgap_angles_deg)
     postprocess_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
