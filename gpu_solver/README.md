@@ -22,7 +22,8 @@ $env:Path = "$env:CUDA_PATH\bin;$env:Path"
 cmake -S . -B build-gpu -G 'Visual Studio 17 2022' -A x64 `
   -DBUILD_GPU_SOLVER=ON -DBUILD_TESTING=ON `
   -DGPU_SOLVER_CUDA_ARCHITECTURES=89
-cmake --build build-gpu --config Release --target gpu_linear_p1_poc
+cmake --build build-gpu --config Release `
+  --target gpu_linear_p1_poc gpu_bh_curve_poc
 ctest --test-dir build-gpu -C Release --output-on-failure
 ```
 
@@ -69,6 +70,21 @@ The fixture is deliberately limited to one planar DC, linear-mu, PM-free,
 current-driven region with a zero-A outer boundary. It does not broaden the
 solver's supported physics.
 
+## Nonlinear B-H interpolation prerequisite
+
+`gpu_bh_curve_poc` is a separate prerequisite for nonlinear assembly. It
+reproduces FEMM's DC natural cubic Hermite B-H preprocessing and evaluation,
+including the derivative-root monotonicity check, FEMM's three-point smoothing
+fallback, zero-field limit, final-slope extrapolation, and negative-B symmetry.
+Host and CUDA evaluations are compared with the frozen repository-local
+`35PN230` table and reproducible MATLAB reference samples at every knot and
+segment midpoint. This scope is raw DC, `LamType=0`, `LamFill=1`; it does not
+claim parity for FEMM's laminated or AC apparent-curve transformations.
+
+This target does not yet connect B-H data to the mesh solver. Newton assembly,
+iteration/convergence control, permanent magnets, and nonlinear field/flux
+parity remain deferred to separate validated slices.
+
 ## Status codes
 
 `0 OK`; `1 INPUT_IO`; `2 INVALID_ARGUMENT`; `3 UNSUPPORTED_FEATURE`;
@@ -79,7 +95,7 @@ solver's supported physics.
 
 ## Explicit exclusions and gate status
 
-Excluded: AC/complex solves, nonlinear B-H/Newton iteration, axisymmetry,
+Excluded from the mesh solver: AC/complex solves, nonlinear B-H/Newton iteration, axisymmetry,
 air-gap elements, periodic or anti-periodic constraints, circuit unknowns,
 remeshing/parameter sweeps, and integration into the MFC/FEMM executable.
 
