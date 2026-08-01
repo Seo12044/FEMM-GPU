@@ -18,3 +18,9 @@ map to the explicit steel, PM, coil-air, and default-air regions stored in the
 The `.m` and `.dat` files are the frozen `fkn` dump. The TSV is an independent
 `mo_getelement` export and intentionally contains geometry/group data only,
 because that API does not return material names.
+
+`nonlinear_pm_coil_planar.postprocess.txt` freezes the default FEMM-smoothed
+`mo_getb` radial samples at 1 mm and weighted-stress block-integral 18/19/22
+loads for selected PM label 1. `single_sample_request.json` is the matching
+`gpu_femm_single_sample_v1` adapter request; its source FEM SHA-256 is the
+fixture `.fem` identity and must be echoed unchanged in the response.

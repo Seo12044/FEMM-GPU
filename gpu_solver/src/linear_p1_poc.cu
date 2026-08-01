@@ -5,10 +5,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -1283,6 +1285,460 @@ constexpr double kMu0 = 4.0e-7 * 3.141592653589793238462643383279502884;
 // fkn assembles magnetics in centimetres and writes A = (100 * mu0) V.
 constexpr double kFemmInternalToPhysicalA = 100.0 * kMu0;
 
+// Package 3B frozen-scope postprocessing.  The production MATLAB path uses
+// mo_blockintegral(18/19/22) over the rotor and mo_getb() in the air gap.
+// Keep this host-side until its FEMM parity is established; it consumes the
+// same P1 solution that the CUDA linear solve produced.
+struct AirgapSample {
+  double angle_rad = 0.0;
+  double radial_b_t = std::numeric_limits<double>::quiet_NaN();
+};
+
+struct FrozenPostprocessOptions {
+  // Fixture mapping is explicit: label 1 is PM/selected rotor, label 3 is
+  // default air.  This avoids silently treating an unassigned material as air.
+  int32_t selected_material_label = 1;
+  int32_t air_material_label = 3;
+  double airgap_radius_m = 0.0;
+  std::vector<double> airgap_angles_rad;
+  int max_mask_iterations = 256;
+  double mask_relative_tolerance = 1e-12;
+};
+
+struct FrozenPostprocessResult {
+  Status status = Status::kInternalError;
+  double force_x_n = std::numeric_limits<double>::quiet_NaN();
+  double force_y_n = std::numeric_limits<double>::quiet_NaN();
+  double torque_nm = std::numeric_limits<double>::quiet_NaN();
+  std::vector<AirgapSample> airgap_samples;
+};
+
+using EdgeKey = std::pair<int32_t, int32_t>;
+
+EdgeKey CanonicalEdge(int32_t first, int32_t second)
+{
+  return { std::min(first, second), std::max(first, second) };
+}
+
+bool TriangleBarycentric(const Node p[3], double x_m, double y_m, double lambda[3])
+{
+  const double determinant = (p[1].x_m - p[0].x_m) * (p[2].y_m - p[0].y_m)
+      - (p[2].x_m - p[0].x_m) * (p[1].y_m - p[0].y_m);
+  if (!(determinant > 0.0) || !std::isfinite(determinant))
+    return false;
+  lambda[1] = ((x_m - p[0].x_m) * (p[2].y_m - p[0].y_m)
+      - (p[2].x_m - p[0].x_m) * (y_m - p[0].y_m)) / determinant;
+  lambda[2] = ((p[1].x_m - p[0].x_m) * (y_m - p[0].y_m)
+      - (x_m - p[0].x_m) * (p[1].y_m - p[0].y_m)) / determinant;
+  lambda[0] = 1.0 - lambda[1] - lambda[2];
+  return std::isfinite(lambda[0]) && std::isfinite(lambda[1]) && std::isfinite(lambda[2]);
+}
+
+Status BuildWeightedStressMask(const NonlinearModel& model,
+    const FrozenPostprocessOptions& options, std::vector<double>* mask)
+{
+  if (mask == nullptr || options.selected_material_label < 0 || options.air_material_label < 0
+      || static_cast<size_t>(options.selected_material_label) >= model.materials.size()
+      || static_cast<size_t>(options.air_material_label) >= model.materials.size()
+      || options.selected_material_label == options.air_material_label
+      || !(options.mask_relative_tolerance > 0.0) || !std::isfinite(options.mask_relative_tolerance)
+      || options.max_mask_iterations <= 0)
+    return Status::kInvalidArgument;
+
+  const Status validation = ValidateNonlinearModel(model);
+  if (validation != Status::kOk)
+    return validation;
+  const size_t node_count = model.nodes.size();
+  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
+  bool selected_seen = false;
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    selected_seen = selected_seen || triangle.material == options.selected_material_label;
+    for (int local = 0; local < 3; ++local) {
+      edge_elements[CanonicalEdge(triangle.node[local], triangle.node[(local + 1) % 3])]
+          .push_back(static_cast<int32_t>(element));
+    }
+  }
+  if (!selected_seen)
+    return Status::kInvalidMaterial;
+  // FEMM's MakeMask rejects selections that touch a non-free-space region.
+  for (const auto& edge : edge_elements) {
+    const std::vector<int32_t>& elements = edge.second;
+    bool selected = false;
+    bool other_non_air = false;
+    for (const int32_t element : elements) {
+      const int32_t material = model.triangles[element].material;
+      selected = selected || material == options.selected_material_label;
+      other_non_air = other_non_air
+          || (material != options.selected_material_label && material != options.air_material_label);
+    }
+    if (selected && other_non_air)
+      return Status::kInvalidMaterial;
+  }
+
+  std::vector<double> fixed(node_count, std::numeric_limits<double>::quiet_NaN());
+  for (const int32_t boundary : model.dirichlet_nodes)
+    fixed[boundary] = 0.0;
+  for (const NonlinearTriangle& triangle : model.triangles) {
+    if (triangle.material == options.selected_material_label) {
+      for (const int32_t node : triangle.node) {
+        if (std::isfinite(fixed[node]) && fixed[node] != 1.0)
+          return Status::kBoundaryInvalid;
+        fixed[node] = 1.0;
+      }
+    } else if (triangle.material != options.air_material_label) {
+      for (const int32_t node : triangle.node) {
+        if (!std::isfinite(fixed[node]))
+          fixed[node] = 0.0;
+      }
+    }
+  }
+
+  std::vector<double> stiffness(node_count * node_count, 0.0);
+  for (const NonlinearTriangle& triangle : model.triangles) {
+    Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
+      model.nodes[triangle.node[2]] };
+    NonlinearElementTerms terms;
+    if (!BuildElementTerms(p, &terms))
+      return Status::kMeshInvalid;
+    // FEMM default WeightingScheme=0 uses sqrt(label.MaxArea) when supplied,
+    // otherwise sqrt(element area).  The frozen fixture has MaxArea=-1 for
+    // every label; changing mm to SI only introduces a common factor and
+    // therefore leaves the Dirichlet mask solution unchanged.
+    const double mask_weight = std::sqrt(terms.area_m2);
+    for (int row = 0; row < 3; ++row) {
+      for (int column = 0; column < 3; ++column) {
+        stiffness[static_cast<size_t>(triangle.node[row]) * node_count + triangle.node[column]]
+            += mask_weight * terms.area_m2 * (terms.b_x[row] * terms.b_x[column]
+                + terms.b_y[row] * terms.b_y[column]);
+      }
+    }
+  }
+  Assembly assembly;
+  assembly.boundary_values.assign(node_count, 0.0);
+  for (size_t node = 0; node < node_count; ++node) {
+    if (std::isfinite(fixed[node]))
+      assembly.boundary_values[node] = fixed[node];
+    else
+      assembly.free_nodes.push_back(static_cast<int32_t>(node));
+  }
+  if (assembly.free_nodes.empty()) {
+    mask->assign(node_count, 0.0);
+    for (size_t node = 0; node < node_count; ++node)
+      (*mask)[node] = fixed[node] > 0.5 ? 1.0 : 0.0;
+    return Status::kOk;
+  }
+  const size_t free_count = assembly.free_nodes.size();
+  assembly.row_offsets.assign(free_count + 1, 0);
+  assembly.diagonal.assign(free_count, 0.0);
+  std::vector<double> rhs(free_count, 0.0);
+  for (size_t row = 0; row < free_count; ++row) {
+    const int32_t global_row = assembly.free_nodes[row];
+    assembly.row_offsets[row] = static_cast<int32_t>(assembly.values.size());
+    for (size_t column = 0; column < node_count; ++column) {
+      const double value = stiffness[static_cast<size_t>(global_row) * node_count + column];
+      if (!std::isfinite(value))
+        return Status::kNumericalNonfinite;
+      if (std::isfinite(fixed[column]))
+        rhs[row] -= value * fixed[column];
+    }
+    for (size_t column = 0; column < free_count; ++column) {
+      const double value = stiffness[static_cast<size_t>(global_row) * node_count
+          + assembly.free_nodes[column]];
+      if (value != 0.0) {
+        assembly.column_indices.push_back(static_cast<int32_t>(column));
+        assembly.values.push_back(value);
+        if (row == column)
+          assembly.diagonal[row] = value;
+      }
+    }
+    if (!(assembly.diagonal[row] > 0.0))
+      return Status::kAssemblyFailed;
+  }
+  assembly.row_offsets[free_count] = static_cast<int32_t>(assembly.values.size());
+  GpuCsrSolver solver;
+  const Status initialize = solver.Initialize(assembly);
+  if (initialize != Status::kOk)
+    return initialize;
+  std::vector<double> free_mask;
+  const SolveInfo info = solver.Solve(rhs, options.mask_relative_tolerance,
+      options.max_mask_iterations, &free_mask);
+  if (info.status != Status::kOk)
+    return info.status;
+  mask->assign(node_count, 0.0);
+  for (size_t node = 0; node < node_count; ++node)
+    (*mask)[node] = std::isfinite(fixed[node]) ? fixed[node] : 0.0;
+  for (size_t row = 0; row < free_count; ++row)
+    (*mask)[assembly.free_nodes[row]] = free_mask[row];
+  // FEMM's default WeightingScheme=0 does not use the continuous harmonic
+  // mask directly: it thresholds every solved node at V>0.5.
+  for (double& value : *mask)
+    value = value > 0.5 ? 1.0 : 0.0;
+  return Status::kOk;
+}
+
+// Exact DC subset of FEMM GetNodalB: first use inverse-centroid-distance
+// averaging in an equivalent-material patch.  Otherwise traverse CCW/CW from
+// the element around the node, preserve Bn from A and Bt from the source-side
+// element at each interface, then use FEMM's sharp-corner fallback.
+bool SmoothedElementB(const NonlinearModel& model, const std::vector<double>& a,
+    const std::vector<double>& bx, const std::vector<double>& by,
+    const std::vector<std::vector<int32_t>>& incident,
+    const std::map<EdgeKey, std::vector<int32_t>>& edge_elements, int32_t element,
+    double nodal_bx[3], double nodal_by[3])
+{
+  if (element < 0 || static_cast<size_t>(element) >= model.triangles.size()
+      || a.size() != model.nodes.size() || bx.size() != model.triangles.size()
+      || by.size() != model.triangles.size())
+    return false;
+  (void)edge_elements;
+  const NonlinearTriangle& triangle = model.triangles[element];
+  for (int local = 0; local < 3; ++local) {
+    const int32_t node = triangle.node[local];
+    bool homogeneous = true;
+    for (const int32_t near : incident[node])
+      // FEMM switches to its interface traversal at a block-label boundary,
+      // even when the two labels happen to reference equivalent materials.
+      homogeneous = homogeneous
+          && model.triangles[element].material == model.triangles[near].material;
+    if (homogeneous) {
+      double weight_sum = 0.0;
+      nodal_bx[local] = 0.0;
+      nodal_by[local] = 0.0;
+      for (const int32_t near : incident[node]) {
+        const NonlinearTriangle& candidate = model.triangles[near];
+        const Node& p0 = model.nodes[candidate.node[0]];
+        const Node& p1 = model.nodes[candidate.node[1]];
+        const Node& p2 = model.nodes[candidate.node[2]];
+        const double cx = (p0.x_m + p1.x_m + p2.x_m) / 3.0;
+        const double cy = (p0.y_m + p1.y_m + p2.y_m) / 3.0;
+        const double weight = 1.0 / std::hypot(model.nodes[node].x_m - cx,
+            model.nodes[node].y_m - cy);
+        if (!(weight > 0.0) || !std::isfinite(weight))
+          return false;
+        weight_sum += weight;
+        nodal_bx[local] += weight * bx[near];
+        nodal_by[local] += weight * by[near];
+      }
+      nodal_bx[local] /= weight_sum;
+      nodal_by[local] /= weight_sum;
+      continue;
+    }
+
+    auto local_index = [&model, node](int32_t candidate) {
+      for (int index = 0; index < 3; ++index)
+        if (model.triangles[candidate].node[index] == node)
+          return index;
+      return -1;
+    };
+    auto next_across = [&model, &incident, node](int32_t current, int32_t other) {
+      for (const int32_t candidate : incident[node]) {
+        if (candidate == current)
+          continue;
+        for (int index = 0; index < 3; ++index)
+          if (model.triangles[candidate].node[index] == other)
+            return candidate;
+      }
+      return static_cast<int32_t>(-1);
+    };
+    double weight_sum = 0.0;
+    nodal_bx[local] = 0.0;
+    nodal_by[local] = 0.0;
+    double v1x = 0.0, v1y = 0.0, v2x = 0.0, v2y = 0.0;
+    bool special_case = false;
+    auto add_interface = [&](int32_t source, int32_t other) {
+      const double dx = model.nodes[other].x_m - model.nodes[node].x_m;
+      const double dy = model.nodes[other].y_m - model.nodes[node].y_m;
+      const double length = std::hypot(dx, dy);
+      if (!(length > 0.0))
+        return false;
+      const double tx = dx / length;
+      const double ty = dy / length;
+      const double bt = bx[source] * tx + by[source] * ty;
+      const double bn = (a[other] - a[node]) / length;
+      const double weight = 0.5 / length;
+      nodal_bx[local] += weight * (tx * bt + ty * bn);
+      nodal_by[local] += weight * (ty * bt - tx * bn);
+      weight_sum += weight;
+      return true;
+    };
+    int32_t current = element;
+    for (size_t scan = 0; scan < incident[node].size(); ++scan) {
+      const int index = local_index(current);
+      if (index < 0)
+        return false;
+      const int32_t other = model.triangles[current].node[(index + 2) % 3];
+      const int32_t next = next_across(current, other);
+      if (next < 0) {
+        nodal_bx[local] = bx[current];
+        nodal_by[local] = by[current];
+        special_case = true;
+        break;
+      }
+      if (model.triangles[element].material != model.triangles[next].material) {
+        if (!add_interface(current, other))
+          return false;
+        const double length = std::hypot(model.nodes[other].x_m - model.nodes[node].x_m,
+            model.nodes[other].y_m - model.nodes[node].y_m);
+        v1x = (model.nodes[other].x_m - model.nodes[node].x_m) / length;
+        v1y = (model.nodes[other].y_m - model.nodes[node].y_m) / length;
+        break;
+      }
+      current = next;
+    }
+    if (!special_case) {
+      current = element;
+      for (size_t scan = 0; scan < incident[node].size(); ++scan) {
+        const int index = local_index(current);
+        if (index < 0)
+          return false;
+        const int32_t other = model.triangles[current].node[(index + 1) % 3];
+        const int32_t next = next_across(current, other);
+        if (next < 0) {
+          nodal_bx[local] = bx[current];
+          nodal_by[local] = by[current];
+          special_case = true;
+          break;
+        }
+        if (model.triangles[element].material != model.triangles[next].material) {
+          if (!add_interface(current, other))
+            return false;
+          const double length = std::hypot(model.nodes[other].x_m - model.nodes[node].x_m,
+              model.nodes[other].y_m - model.nodes[node].y_m);
+          v2x = (model.nodes[other].x_m - model.nodes[node].x_m) / length;
+          v2y = (model.nodes[other].y_m - model.nodes[node].y_m) / length;
+          break;
+        }
+        current = next;
+      }
+    }
+    if (!special_case) {
+      if (!(weight_sum > 0.0))
+        return false;
+      nodal_bx[local] /= weight_sum;
+      nodal_by[local] /= weight_sum;
+      const bool simple_corner = std::hypot(v1x, v1y) < 0.9 || std::hypot(v2x, v2y) < 0.9
+          || (-v1x * v2x - v1y * v2y) > 0.985;
+      if (!simple_corner) {
+        double magnitude = 0.0;
+        for (const int32_t near : incident[node]) {
+          if (model.triangles[near].material == triangle.material)
+            magnitude = std::max(magnitude, std::hypot(bx[near], by[near]));
+        }
+        const double own_magnitude = std::hypot(bx[element], by[element]);
+        if (own_magnitude > 0.0) {
+          nodal_bx[local] = magnitude * bx[element] / own_magnitude;
+          nodal_by[local] = magnitude * by[element] / own_magnitude;
+        } else {
+          nodal_bx[local] = 0.0;
+          nodal_by[local] = 0.0;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
+    const NonlinearSolveResult& solution, const FrozenPostprocessOptions& options)
+{
+  FrozenPostprocessResult result;
+  result.force_x_n = 0.0;
+  result.force_y_n = 0.0;
+  result.torque_nm = 0.0;
+  if (solution.a_wb_per_m.size() != model.nodes.size()
+      || solution.bx_t.size() != model.triangles.size()
+      || solution.by_t.size() != model.triangles.size() || !(model.depth_m > 0.0)) {
+    result.status = Status::kInvalidArgument;
+    return result;
+  }
+  std::vector<double> mask;
+  result.status = BuildWeightedStressMask(model, options, &mask);
+  if (result.status != Status::kOk)
+    return result;
+  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
+  std::vector<std::vector<int32_t>> incident(model.nodes.size());
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    for (int local = 0; local < 3; ++local) {
+      incident[triangle.node[local]].push_back(static_cast<int32_t>(element));
+      edge_elements[CanonicalEdge(triangle.node[local], triangle.node[(local + 1) % 3])]
+          .push_back(static_cast<int32_t>(element));
+    }
+  }
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
+      model.nodes[triangle.node[2]] };
+    NonlinearElementTerms terms;
+    if (!BuildElementTerms(p, &terms)) {
+      result.status = Status::kMeshInvalid;
+      return result;
+    }
+    double hx = 0.0, hy = 0.0;
+    for (int local = 0; local < 3; ++local) {
+      // HenrotteVector is -grad(mask).  b=(dN/dy,-dN/dx), hence
+      // -grad(m)=(sum m*b_y, -sum m*b_x).
+      hx += mask[triangle.node[local]] * terms.b_y[local];
+      hy -= mask[triangle.node[local]] * terms.b_x[local];
+    }
+    const double bx = solution.bx_t[element], by = solution.by_t[element];
+    const double fx_density = ((bx * bx - by * by) * hx + 2.0 * bx * by * hy)
+        / (2.0 * kMu0);
+    const double fy_density = (2.0 * bx * by * hx + (by * by - bx * bx) * hy)
+        / (2.0 * kMu0);
+    const double weight = terms.area_m2 * model.depth_m;
+    result.force_x_n += weight * fx_density;
+    result.force_y_n += weight * fy_density;
+    const double cx = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
+    const double cy = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
+    result.torque_nm += weight * (cx * fy_density - cy * fx_density);
+  }
+  for (const double angle : options.airgap_angles_rad) {
+    if (!std::isfinite(angle) || !(options.airgap_radius_m >= 0.0)
+        || !std::isfinite(options.airgap_radius_m)) {
+      result.status = Status::kInvalidArgument;
+      return result;
+    }
+    const double x = options.airgap_radius_m * std::cos(angle);
+    const double y = options.airgap_radius_m * std::sin(angle);
+    int32_t containing = -1;
+    double lambda[3] = {};
+    for (size_t element = 0; element < model.triangles.size(); ++element) {
+      const NonlinearTriangle& triangle = model.triangles[element];
+      Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
+        model.nodes[triangle.node[2]] };
+      double candidate[3] = {};
+      if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
+          && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
+        containing = static_cast<int32_t>(element);
+        std::copy(candidate, candidate + 3, lambda);
+        break;
+      }
+    }
+    if (containing < 0 || model.triangles[containing].material != options.air_material_label) {
+      result.status = Status::kInvalidArgument;
+      return result;
+    }
+    double nodal_bx[3] = {}, nodal_by[3] = {};
+    if (!SmoothedElementB(model, solution.a_wb_per_m, solution.bx_t, solution.by_t,
+            incident, edge_elements, containing, nodal_bx, nodal_by)) {
+      result.status = Status::kMeshInvalid;
+      return result;
+    }
+    double bx = 0.0, by = 0.0;
+    for (int local = 0; local < 3; ++local) {
+      bx += lambda[local] * nodal_bx[local];
+      by += lambda[local] * nodal_by[local];
+    }
+    result.airgap_samples.push_back({ angle, bx * std::cos(angle) + by * std::sin(angle) });
+  }
+  if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n)
+      || !std::isfinite(result.torque_nm))
+    result.status = Status::kNumericalNonfinite;
+  return result;
+}
+
 struct FemmReference {
   Model model;
   std::vector<double> expected_a;
@@ -1438,6 +1894,108 @@ struct NonlinearFemmReference {
   double current_a = 0.0;
   double flux_linkage_wb = 0.0;
 };
+
+struct FrozenPostprocessReference {
+  FrozenPostprocessOptions options;
+  int32_t expected_node_count = 0;
+  int32_t expected_element_count = 0;
+  double expected_current_a = std::numeric_limits<double>::quiet_NaN();
+  double expected_flux_linkage_wb = std::numeric_limits<double>::quiet_NaN();
+  double expected_force_x_n = std::numeric_limits<double>::quiet_NaN();
+  double expected_force_y_n = std::numeric_limits<double>::quiet_NaN();
+  double expected_torque_nm = std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> expected_radial_b_t;
+};
+
+bool ParseKeyValueDouble(const std::string& line, const std::string& key, double* value)
+{
+  const size_t position = line.find(key + "=");
+  if (position == std::string::npos)
+    return false;
+  try {
+    size_t parsed = 0;
+    *value = std::stod(line.substr(position + key.size() + 1), &parsed);
+    return parsed > 0 && std::isfinite(*value);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ReadFrozenPostprocessReference(const std::string& stem,
+    FrozenPostprocessReference* reference, std::string* error)
+{
+  std::ifstream input(stem + ".postprocess.txt");
+  if (!input) {
+    *error = "cannot open " + stem + ".postprocess.txt";
+    return false;
+  }
+  std::string line;
+  bool have_selected = false, have_nodes = false, have_elements = false;
+  bool have_current = false, have_flux = false, have_fx = false, have_fy = false;
+  bool have_torque = false, have_radius = false;
+  while (std::getline(input, line)) {
+    double value = 0.0;
+    if (ParseKeyValueDouble(line, "selected_material_label", &value)) {
+      const int32_t label = static_cast<int32_t>(value);
+      if (value != static_cast<double>(label)) {
+        *error = "non-integral selected material label";
+        return false;
+      }
+      reference->options.selected_material_label = label;
+      have_selected = true;
+    } else if (ParseKeyValueDouble(line, "node_count", &value)) {
+      reference->expected_node_count = static_cast<int32_t>(value);
+      have_nodes = value == static_cast<double>(reference->expected_node_count)
+          && reference->expected_node_count > 0;
+    } else if (ParseKeyValueDouble(line, "element_count", &value)) {
+      reference->expected_element_count = static_cast<int32_t>(value);
+      have_elements = value == static_cast<double>(reference->expected_element_count)
+          && reference->expected_element_count > 0;
+    } else if (ParseKeyValueDouble(line, "circuit_current_A", &value)) {
+      reference->expected_current_a = value;
+      have_current = true;
+    } else if (ParseKeyValueDouble(line, "flux_linkage_Wb", &value)) {
+      reference->expected_flux_linkage_wb = value;
+      have_flux = true;
+    } else if (ParseKeyValueDouble(line, "air_material_label", &value)) {
+      const int32_t label = static_cast<int32_t>(value);
+      if (value != static_cast<double>(label)) {
+        *error = "non-integral air material label";
+        return false;
+      }
+      reference->options.air_material_label = label;
+    } else if (ParseKeyValueDouble(line, "Fx_N", &value)) {
+      reference->expected_force_x_n = value;
+      have_fx = true;
+    } else if (ParseKeyValueDouble(line, "Fy_N", &value)) {
+      reference->expected_force_y_n = value;
+      have_fy = true;
+    } else if (ParseKeyValueDouble(line, "torque_Nm", &value)) {
+      reference->expected_torque_nm = value;
+      have_torque = true;
+    } else if (ParseKeyValueDouble(line, "airgap_radius_mm", &value)) {
+      reference->options.airgap_radius_m = value * 1e-3;
+      have_radius = true;
+    } else if (line.find("airgap_sample_deg=") != std::string::npos) {
+      double angle_deg = 0.0, radial_b = 0.0;
+      if (!ParseKeyValueDouble(line, "airgap_sample_deg", &angle_deg)
+          || !ParseKeyValueDouble(line, "radial_B_T", &radial_b)) {
+        *error = "invalid airgap sample line";
+        return false;
+      }
+      reference->options.airgap_angles_rad.push_back(angle_deg * 3.141592653589793238462643383279502884 / 180.0);
+      reference->expected_radial_b_t.push_back(radial_b);
+    }
+  }
+  if (!have_selected || !have_nodes || !have_elements || !have_current || !have_flux
+      || !have_fx || !have_fy || !have_torque || !have_radius
+      || reference->options.airgap_angles_rad.empty()
+      || reference->options.airgap_angles_rad.size() != reference->expected_radial_b_t.size()) {
+    *error = "incomplete frozen postprocess reference";
+    return false;
+  }
+  return true;
+}
 
 bool ReadNonlinearFemmReference(const std::string& stem, const std::string& curve_directory,
     NonlinearFemmReference* reference, std::string* error)
@@ -1821,6 +2379,289 @@ int NonlinearFemmReferenceTest(const std::string& stem, const std::string& curve
   return 0;
 }
 
+int FrozenPostprocessReferenceTest(const std::string& stem, const std::string& curve_directory)
+{
+  NonlinearFemmReference nonlinear_reference;
+  FrozenPostprocessReference postprocess_reference;
+  std::string error;
+  if (!ReadNonlinearFemmReference(stem, curve_directory, &nonlinear_reference, &error)
+      || !ReadFrozenPostprocessReference(stem, &postprocess_reference, &error)) {
+    std::cerr << "FAIL postprocess FEMM reference input: " << error << '\n';
+    return 1;
+  }
+  NonlinearP1FixtureSolver solver;
+  const Status initialize = solver.Initialize(nonlinear_reference.model);
+  if (initialize != Status::kOk) {
+    std::cerr << "FAIL postprocess FEMM initialization: " << StatusName(initialize) << '\n';
+    return 1;
+  }
+  NonlinearOptions nonlinear_options;
+  nonlinear_options.relative_tolerance = 1e-8;
+  nonlinear_options.max_newton_iterations = 128;
+  const NonlinearSolveResult solution = solver.Solve(nonlinear_reference.current_a, nonlinear_options);
+  if (solution.info.status != Status::kOk) {
+    std::cerr << "FAIL postprocess FEMM solve: " << StatusName(solution.info.status) << '\n';
+    return 1;
+  }
+  const FrozenPostprocessResult actual = ComputeFrozenPostprocess(
+      nonlinear_reference.model, solution, postprocess_reference.options);
+  if (actual.status != Status::kOk) {
+    std::cerr << "FAIL postprocess calculation: " << StatusName(actual.status) << '\n';
+    return 1;
+  }
+  bool pass = NearMixed(actual.force_x_n, postprocess_reference.expected_force_x_n, 1e-8, 1e-5)
+      && NearMixed(actual.force_y_n, postprocess_reference.expected_force_y_n, 1e-8, 1e-5)
+      && NearMixed(actual.torque_nm, postprocess_reference.expected_torque_nm, 1e-10, 1e-5)
+      && nonlinear_reference.model.nodes.size()
+          == static_cast<size_t>(postprocess_reference.expected_node_count)
+      && nonlinear_reference.model.triangles.size()
+          == static_cast<size_t>(postprocess_reference.expected_element_count)
+      && NearMixed(nonlinear_reference.current_a,
+          postprocess_reference.expected_current_a, 1e-12, 1e-12)
+      && NearMixed(solution.flux_linkage_wb,
+          postprocess_reference.expected_flux_linkage_wb, 1e-10, 1e-6)
+      && actual.airgap_samples.size() == postprocess_reference.expected_radial_b_t.size();
+  double max_airgap_error = 0.0;
+  if (actual.airgap_samples.size() == postprocess_reference.expected_radial_b_t.size()) {
+    for (size_t index = 0; index < actual.airgap_samples.size(); ++index) {
+      max_airgap_error = std::max(max_airgap_error,
+          std::abs(actual.airgap_samples[index].radial_b_t
+              - postprocess_reference.expected_radial_b_t[index]));
+      pass = pass && NearMixed(actual.airgap_samples[index].radial_b_t,
+          postprocess_reference.expected_radial_b_t[index], 1e-9, 1e-5);
+    }
+  }
+  if (!pass) {
+    std::cerr << "FAIL postprocess FEMM parity Fx=" << actual.force_x_n
+              << " Fy=" << actual.force_y_n << " T=" << actual.torque_nm
+              << " max_airgap_B=" << max_airgap_error << '\n';
+    return 1;
+  }
+  std::cout << "PASS gpu_nonlinear_p1_postprocess_reference\n"
+            << "  Fx_N=" << actual.force_x_n << " Fy_N=" << actual.force_y_n
+            << " torque_Nm=" << actual.torque_nm
+            << " max_airgap_B_error=" << max_airgap_error << '\n';
+  return 0;
+}
+
+// Deliberately small JSON protocol for the MATLAB adapter.  It only accepts
+// the fixed single-circuit fixture schema; batch/cache policy remains owned by
+// MATLAB and is not inferred here.
+bool JsonValueStart(const std::string& json, const std::string& key, size_t* position)
+{
+  const std::string quoted = "\"" + key + "\"";
+  const size_t key_position = json.find(quoted);
+  if (key_position == std::string::npos)
+    return false;
+  const size_t colon = json.find(':', key_position + quoted.size());
+  if (colon == std::string::npos)
+    return false;
+  *position = colon + 1;
+  while (*position < json.size() && std::isspace(static_cast<unsigned char>(json[*position])))
+    ++*position;
+  return *position < json.size();
+}
+
+bool JsonString(const std::string& json, const std::string& key, std::string* value)
+{
+  size_t position = 0;
+  if (!JsonValueStart(json, key, &position) || json[position] != '\"')
+    return false;
+  const size_t end = json.find('\"', position + 1);
+  if (end == std::string::npos)
+    return false;
+  *value = json.substr(position + 1, end - position - 1);
+  return value->find('\\') == std::string::npos;
+}
+
+bool JsonDouble(const std::string& json, const std::string& key, double* value)
+{
+  size_t position = 0;
+  if (!JsonValueStart(json, key, &position))
+    return false;
+  try {
+    size_t parsed = 0;
+    *value = std::stod(json.substr(position), &parsed);
+    return parsed > 0 && std::isfinite(*value);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool JsonDoubleArray(const std::string& json, const std::string& key, std::vector<double>* values)
+{
+  size_t position = 0;
+  if (!JsonValueStart(json, key, &position) || json[position] != '[')
+    return false;
+  ++position;
+  values->clear();
+  while (position < json.size()) {
+    while (position < json.size() && std::isspace(static_cast<unsigned char>(json[position])))
+      ++position;
+    if (position >= json.size())
+      return false;
+    if (json[position] == ']')
+      return true;
+    try {
+      size_t parsed = 0;
+      const double value = std::stod(json.substr(position), &parsed);
+      if (parsed == 0 || !std::isfinite(value))
+        return false;
+      values->push_back(value);
+      position += parsed;
+    } catch (...) {
+      return false;
+    }
+    while (position < json.size() && std::isspace(static_cast<unsigned char>(json[position])))
+      ++position;
+    if (position >= json.size() || (json[position] != ',' && json[position] != ']'))
+      return false;
+    if (json[position] == ']')
+      return true;
+    ++position;
+  }
+  return false;
+}
+
+struct SingleSampleRequest {
+  std::string stem;
+  std::string curve_directory;
+  std::string source_motor_fem_sha256;
+  double current_a = 0.0;
+  int32_t selected_material_label = -1;
+  double airgap_radius_mm = 0.0;
+  std::vector<double> airgap_angles_deg;
+};
+
+bool ReadSingleSampleRequest(const std::string& path, SingleSampleRequest* request, std::string* error)
+{
+  std::ifstream input(path);
+  std::stringstream contents;
+  contents << input.rdbuf();
+  const std::string json = contents.str();
+  std::string protocol;
+  double selected = 0.0;
+  if (!input || !JsonString(json, "protocol", &protocol)
+      || protocol != "gpu_femm_single_sample_v1" || !JsonString(json, "stem", &request->stem)
+      || !JsonString(json, "curve_directory", &request->curve_directory)
+      || !JsonString(json, "source_motor_fem_sha256", &request->source_motor_fem_sha256)
+      || !JsonDouble(json, "current_A", &request->current_a)
+      || !JsonDouble(json, "selected_material_label", &selected)
+      || !JsonDouble(json, "airgap_radius_mm", &request->airgap_radius_mm)
+      || !JsonDoubleArray(json, "airgap_angles_deg", &request->airgap_angles_deg)
+      || request->stem.empty() || request->curve_directory.empty()
+      || request->source_motor_fem_sha256.size() != 64
+      || !(request->airgap_radius_mm >= 0.0)
+      || (!request->airgap_angles_deg.empty() && !(request->airgap_radius_mm > 0.0))) {
+    *error = "invalid gpu_femm_single_sample_v1 request";
+    return false;
+  }
+  request->selected_material_label = static_cast<int32_t>(selected);
+  if (selected != static_cast<double>(request->selected_material_label)
+      || request->selected_material_label != 1) {
+    *error = "frozen adapter requires selected_material_label=1";
+    return false;
+  }
+  if (!std::all_of(request->source_motor_fem_sha256.begin(),
+          request->source_motor_fem_sha256.end(), [](unsigned char c) { return std::isxdigit(c); })) {
+    *error = "source_motor_fem_sha256 must be hexadecimal";
+    return false;
+  }
+  return true;
+}
+
+bool WriteSingleSampleResponse(const std::string& path, Status status,
+    const SingleSampleRequest* request, const NonlinearSolveResult* solution,
+    const FrozenPostprocessResult* postprocess)
+{
+  std::ofstream output(path, std::ios::trunc);
+  if (!output)
+    return false;
+  output << std::setprecision(17) << "{\n"
+         << "  \"protocol\": \"gpu_femm_single_sample_v1\",\n"
+         << "  \"source_motor_fem_sha256\": \""
+         << (request == nullptr ? "" : request->source_motor_fem_sha256) << "\",\n"
+         << "  \"status\": \"" << (status == Status::kOk ? "PASS" : "FAIL") << "\",\n"
+         << "  \"solve_status\": \"" << (status == Status::kOk ? "PASS" : "FAIL") << "\",\n"
+         << "  \"error_identifier\": \""
+         << (status == Status::kOk ? "" : std::string("GPU_FEMM_") + StatusName(status)) << "\",\n"
+         << "  \"error_message\": \"" << (status == Status::kOk ? "" : StatusName(status)) << "\",\n";
+  if (status == Status::kOk && request != nullptr && solution != nullptr && postprocess != nullptr) {
+    output << "  \"Fx_N\": " << postprocess->force_x_n << ",\n"
+           << "  \"Fy_N\": " << postprocess->force_y_n << ",\n"
+           << "  \"torque_Nm\": " << postprocess->torque_nm << ",\n"
+           << "  \"actual_circuit_currents_A\": [" << request->current_a << "],\n"
+           << "  \"circuit_flux_linkage_Wb\": [" << solution->flux_linkage_wb << "],\n"
+           << "  \"airgap_sample_angles_deg\": [";
+    for (size_t index = 0; index < request->airgap_angles_deg.size(); ++index)
+      output << (index == 0 ? "" : ", ") << request->airgap_angles_deg[index];
+    output << "],\n  \"airgap_radial_flux_density_T\": [";
+    for (size_t index = 0; index < postprocess->airgap_samples.size(); ++index)
+      output << (index == 0 ? "" : ", ") << postprocess->airgap_samples[index].radial_b_t;
+    output << "],\n  \"mesh_element_count\": " << solution->bx_t.size() << ",\n"
+           << "  \"convergence\": {\"iterations\": " << solution->info.iterations
+           << ", \"residual_l2\": " << solution->info.residual_l2 << "}\n";
+  } else {
+    output << "  \"Fx_N\": null,\n  \"Fy_N\": null,\n  \"torque_Nm\": null,\n"
+           << "  \"actual_circuit_currents_A\": [],\n"
+           << "  \"circuit_flux_linkage_Wb\": [],\n"
+           << "  \"airgap_sample_angles_deg\": [],\n"
+           << "  \"airgap_radial_flux_density_T\": [],\n"
+           << "  \"mesh_element_count\": 0,\n"
+           << "  \"convergence\": {\"iterations\": 0, \"residual_l2\": null}\n";
+  }
+  output << "}\n";
+  return static_cast<bool>(output);
+}
+
+int SingleSampleAdapter(const std::string& request_path, const std::string& response_path)
+{
+  SingleSampleRequest request;
+  std::string error;
+  if (!ReadSingleSampleRequest(request_path, &request, &error)) {
+    WriteSingleSampleResponse(response_path, Status::kInvalidArgument, nullptr, nullptr, nullptr);
+    std::cerr << "FAIL single-sample request: " << error << '\n';
+    return 1;
+  }
+  NonlinearFemmReference reference;
+  if (!ReadNonlinearFemmReference(request.stem, request.curve_directory, &reference, &error)) {
+    WriteSingleSampleResponse(response_path, Status::kInputIo, &request, nullptr, nullptr);
+    std::cerr << "FAIL single-sample reference: " << error << '\n';
+    return 1;
+  }
+  NonlinearP1FixtureSolver solver;
+  Status status = solver.Initialize(reference.model);
+  NonlinearSolveResult solution;
+  if (status == Status::kOk) {
+    NonlinearOptions options;
+    options.relative_tolerance = 1e-8;
+    options.max_newton_iterations = 128;
+    solution = solver.Solve(request.current_a, options);
+    status = solution.info.status;
+  }
+  FrozenPostprocessResult postprocess;
+  if (status == Status::kOk) {
+    FrozenPostprocessOptions options;
+    options.selected_material_label = request.selected_material_label;
+    options.airgap_radius_m = request.airgap_radius_mm * 1e-3;
+    for (const double angle_deg : request.airgap_angles_deg)
+      options.airgap_angles_rad.push_back(angle_deg * 3.141592653589793238462643383279502884 / 180.0);
+    postprocess = ComputeFrozenPostprocess(reference.model, solution, options);
+    status = postprocess.status;
+  }
+  if (!WriteSingleSampleResponse(response_path, status, &request,
+          status == Status::kOk ? &solution : nullptr,
+          status == Status::kOk ? &postprocess : nullptr)) {
+    std::cerr << "FAIL single-sample response: cannot write " << response_path << '\n';
+    return 1;
+  }
+  if (status != Status::kOk) {
+    std::cerr << "FAIL single-sample: " << StatusName(status) << '\n';
+    return 1;
+  }
+  return 0;
+}
+
 Model UnitSquareFixture()
 {
   Model model;
@@ -1853,6 +2694,25 @@ NonlinearModel NonlinearThreeRegionFixture()
     { { 2, 3, 4 }, 2 }, { { 3, 0, 4 }, 2 } };
   model.dirichlet_nodes = { 0, 1, 2, 3 };
   model.dirichlet_a_wb_per_m = { 0.0, 0.0, 0.0, 0.0 };
+  model.depth_m = 1.0;
+  return model;
+}
+
+NonlinearModel PostprocessRingFixture()
+{
+  NonlinearModel model;
+  model.nodes = { { -1.0, -1.0 }, { 1.0, -1.0 }, { 1.0, 1.0 }, { -1.0, 1.0 },
+    { -0.5, -0.5 }, { 0.5, -0.5 }, { 0.5, 0.5 }, { -0.5, 0.5 } };
+  model.materials = {
+    { 1.0 / kMu0, 0.0, 0.0, 0.0, 0.0 }, { 1.0 / kMu0, 0.0, 0.0, 0.0, 0.0 },
+    { 1.0 / kMu0, 0.0, 0.0, 0.0, 0.0 }, { 1.0 / kMu0, 0.0, 0.0, 0.0, 0.0 }
+  };
+  model.triangles = { { { 0, 1, 5 }, 3 }, { { 0, 5, 4 }, 3 },
+    { { 1, 2, 6 }, 3 }, { { 1, 6, 5 }, 3 }, { { 2, 3, 7 }, 3 },
+    { { 2, 7, 6 }, 3 }, { { 3, 0, 4 }, 3 }, { { 3, 4, 7 }, 3 },
+    { { 4, 5, 6 }, 1 }, { { 4, 6, 7 }, 1 } };
+  model.dirichlet_nodes = { 0, 1, 2, 3 };
+  model.dirichlet_a_wb_per_m = { -1.0, 1.0, 1.0, -1.0 };
   model.depth_m = 1.0;
   return model;
 }
@@ -1931,6 +2791,53 @@ int SelfTest()
   missing_material.triangles[0].material = -1;
   expect(ValidateNonlinearModel(missing_material) == Status::kInvalidMaterial,
       "unassigned nonlinear material is rejected");
+
+  // DC weighted-stress primitive: T*h in free space, in SI units.
+  const double primitive_bx = 2.0, primitive_by = 3.0;
+  const double primitive_hx = 0.25, primitive_hy = -0.5;
+  const double primitive_fx = ((primitive_bx * primitive_bx - primitive_by * primitive_by)
+      * primitive_hx + 2.0 * primitive_bx * primitive_by * primitive_hy) / (2.0 * kMu0);
+  const double primitive_fy = (2.0 * primitive_bx * primitive_by * primitive_hx
+      + (primitive_by * primitive_by - primitive_bx * primitive_bx) * primitive_hy) / (2.0 * kMu0);
+  expect(Near(primitive_fx, -7.25 / (2.0 * kMu0)), "weighted-stress Fx primitive");
+  expect(Near(primitive_fy, 0.5 / (2.0 * kMu0)), "weighted-stress Fy primitive");
+
+  // A=x gives B=(0,-1) in every P1 triangle.  The selected inner PM square
+  // is surrounded by air, so FEMM's WeightingScheme=0 mask is valid and its
+  // net load must vanish in a uniform field.  Polar air samples exercise the
+  // default-smoothed point field and B dot e_r projection.
+  const NonlinearModel postprocess_model = PostprocessRingFixture();
+  NonlinearSolveResult postprocess_solution;
+  postprocess_solution.a_wb_per_m.resize(postprocess_model.nodes.size());
+  for (size_t node = 0; node < postprocess_model.nodes.size(); ++node)
+    postprocess_solution.a_wb_per_m[node] = postprocess_model.nodes[node].x_m;
+  postprocess_solution.bx_t.assign(postprocess_model.triangles.size(), 0.0);
+  postprocess_solution.by_t.assign(postprocess_model.triangles.size(), -1.0);
+  FrozenPostprocessOptions postprocess_options;
+  postprocess_options.airgap_radius_m = 0.75;
+  postprocess_options.airgap_angles_rad = { 0.0, 0.5 * 3.141592653589793238462643383279502884 };
+  const FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(
+      postprocess_model, postprocess_solution, postprocess_options);
+  expect(postprocess.status == Status::kOk,
+      std::string("weighted-stress mask postprocess: ") + StatusName(postprocess.status));
+  if (postprocess.status == Status::kOk) {
+    expect(Near(postprocess.force_x_n, 0.0, 1e-8), "uniform-field weighted Fx cancellation");
+    expect(Near(postprocess.force_y_n, 0.0, 1e-8), "uniform-field weighted Fy cancellation");
+    expect(Near(postprocess.torque_nm, 0.0, 1e-8), "uniform-field weighted torque cancellation");
+    expect(postprocess.airgap_samples.size() == 2, "airgap sample count");
+    if (postprocess.airgap_samples.size() == 2) {
+      expect(Near(postprocess.airgap_samples[0].radial_b_t, 0.0, 1e-12),
+          "airgap radial B at zero degrees");
+      expect(Near(postprocess.airgap_samples[1].radial_b_t, -1.0, 1e-12),
+          "airgap radial B at ninety degrees");
+    }
+  }
+  FrozenPostprocessOptions invalid_selection = postprocess_options;
+  invalid_selection.selected_material_label = 2;
+  const FrozenPostprocessResult no_selection = ComputeFrozenPostprocess(
+      postprocess_model, postprocess_solution, invalid_selection);
+  expect(no_selection.status == Status::kInvalidMaterial,
+      "missing selected material is rejected");
 
   Assembly three_by_three;
   three_by_three.row_offsets = { 0, 2, 5, 7 };
@@ -2095,7 +3002,15 @@ int main(int argc, char** argv)
   if (argc == 4 && std::string(argv[1]) == "--nonlinear-reference") {
     return gpu_femm::NonlinearFemmReferenceTest(argv[2], argv[3]);
   }
+  if (argc == 4 && std::string(argv[1]) == "--postprocess-reference") {
+    return gpu_femm::FrozenPostprocessReferenceTest(argv[2], argv[3]);
+  }
+  if (argc == 4 && std::string(argv[1]) == "--single-sample") {
+    return gpu_femm::SingleSampleAdapter(argv[2], argv[3]);
+  }
   std::cerr << "Usage: gpu_linear_p1_poc --self-test | --femm-reference <stem>"
-            << " | --nonlinear-reference <stem> <curve_dir>\n";
+            << " | --nonlinear-reference <stem> <curve_dir>"
+            << " | --postprocess-reference <stem> <curve_dir>"
+            << " | --single-sample <request.json> <response.json>\n";
   return 2;
 }

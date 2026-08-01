@@ -63,6 +63,19 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
   )
+  add_test(NAME gpu_nonlinear_p1_postprocess_reference
+    COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --postprocess-reference
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
+  )
+  add_test(NAME gpu_nonlinear_p1_single_sample_adapter
+    COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --single-sample
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/single_sample_request.json"
+      "${CMAKE_CURRENT_BINARY_DIR}/nonlinear_pm_coil_single_sample_response.json"
+  )
+  set_tests_properties(gpu_nonlinear_p1_single_sample_adapter PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  )
   add_test(NAME gpu_bh_curve_35pn230
     COMMAND $<TARGET_FILE:gpu_bh_curve_poc> --fixture
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
@@ -77,6 +90,11 @@ if(BUILD_TESTING)
   )
   set_tests_properties(gpu_nonlinear_p1_femm_reference PROPERTIES
     LABELS "gpu;requires_cuda;femm_fixture;nonlinear"
+    TIMEOUT 30
+  )
+  set_tests_properties(gpu_nonlinear_p1_postprocess_reference
+    gpu_nonlinear_p1_single_sample_adapter PROPERTIES
+    LABELS "gpu;requires_cuda;femm_fixture;nonlinear;postprocess"
     TIMEOUT 30
   )
   set_tests_properties(gpu_bh_curve_35pn230 PROPERTIES

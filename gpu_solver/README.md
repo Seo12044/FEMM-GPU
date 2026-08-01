@@ -93,6 +93,37 @@ default air. Its CTest compares nodal A, element B, and circuit flux against
 portable stock FEMM. The current reference converges in four Newton iterations
 with maximum A error `2.41682e-11 Wb/m` and maximum B error `4.23215e-9 T`.
 
+## Package 3B frozen postprocess and single-sample protocol
+
+The same frozen nonlinear fixture now verifies the CPU FEMM planar DC
+postprocessor contract used by MATLAB: selected PM label `1`, default-air label
+`3`, default `WeightingScheme=0` mask solve, weighted-stress block integrals
+18/19/22 (`Fx`, `Fy`, `torque`), and default-smoothed `mo_getb` radial samples.
+The mask preserves FEMM's `sqrt(element area)` default weighting and final
+`V > 0.5` threshold. Point sampling implements the DC P1 `GetNodalB` patch,
+including its block-label interface traversal and sharp-corner fallback.
+
+`gpu_linear_p1_poc --postprocess-reference <stem> <curve_dir>` checks the
+frozen `*.postprocess.txt` force/torque and air-gap values. The separate
+single-sample adapter is intentionally file-protocol only:
+
+```text
+gpu_linear_p1_poc --single-sample request.json response.json
+```
+
+The JSON reader is a narrow trusted-file boundary for adapter-generated input,
+not a general JSON service. Request protocol is `gpu_femm_single_sample_v1`
+with `stem`,
+`curve_directory`, `source_motor_fem_sha256` (64 hexadecimal characters),
+`current_A`, `selected_material_label`, `airgap_radius_mm`, and
+`airgap_angles_deg`. The response echoes the source FEM hash and returns
+`status`, `Fx_N`, `Fy_N`, `torque_Nm`, one circuit current/flux entry, air-gap
+samples, mesh count, convergence metadata, and stable error fields. It does
+not alter MATLAB cache/resume policy or implement CPU fallback; MATLAB owns
+those decisions. Before launching the executable, the MATLAB adapter hashes
+`<stem>.fem` and requires it to equal `source_motor_fem_sha256`; a mismatched
+frozen reference cannot be accepted as the requested motor result.
+
 ## Status codes
 
 `0 OK`; `1 INPUT_IO`; `2 INVALID_ARGUMENT`; `3 UNSUPPORTED_FEATURE`;
@@ -109,9 +140,9 @@ AC apparent B-H conversion, air-gap elements, periodic or anti-periodic
 constraints, circuit unknowns,
 remeshing/parameter sweeps, and integration into the MFC/FEMM executable.
 
-The frozen tests demonstrate linear Gate 2 and nonlinear Package 3A
-single-sample field/flux parity. They are not evidence for force/torque,
-batch, or MATLAB integration support.
+The frozen tests demonstrate linear Gate 2 and nonlinear Package 3A field/flux
+parity plus Package 3B frozen force/torque/air-gap and file-adapter parity.
+They are not evidence for batch, full MATLAB workflow, or CPU fallback support.
 
 The current deterministic PCG kernel intentionally uses one CUDA thread.
 It is an accuracy and contract PoC, not a performance result; parallel sparse
