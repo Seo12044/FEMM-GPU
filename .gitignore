@@ -15,6 +15,7 @@ Thumbs.db
 
 build/
 build_*/
+/build-gpu/
 bin/
 .vs/
 .vscode/
