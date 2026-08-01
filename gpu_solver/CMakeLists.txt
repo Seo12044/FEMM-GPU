@@ -37,8 +37,16 @@ if(BUILD_TESTING)
   add_test(NAME gpu_linear_p1_selftest
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --self-test
   )
+  add_test(NAME gpu_linear_p1_femm_reference
+    COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --femm-reference
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/linear_square_v1/linear_square"
+  )
   set_tests_properties(gpu_linear_p1_selftest PROPERTIES
     LABELS "gpu;requires_cuda"
+    TIMEOUT 30
+  )
+  set_tests_properties(gpu_linear_p1_femm_reference PROPERTIES
+    LABELS "gpu;requires_cuda;femm_fixture"
     TIMEOUT 30
   )
 endif()

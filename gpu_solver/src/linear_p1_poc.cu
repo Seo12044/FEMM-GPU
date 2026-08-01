@@ -8,8 +8,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -729,6 +732,343 @@ class LinearP1FixtureSolver {
   DeviceBuffer<double> flux_linkage_;
 };
 
+constexpr double kMu0 = 4.0e-7 * 3.141592653589793238462643383279502884;
+// fkn assembles magnetics in centimetres and writes A = (100 * mu0) V.
+constexpr double kFemmInternalToPhysicalA = 100.0 * kMu0;
+
+struct FemmReference {
+  Model model;
+  std::vector<double> expected_a;
+  std::vector<double> expected_bx;
+  std::vector<double> expected_by;
+  double current_a = 0.0;
+  double flux_linkage_wb = 0.0;
+  Assembly dump;
+  std::vector<double> dump_rhs;
+};
+
+bool NearMixed(double actual, double expected, double absolute_tolerance,
+    double relative_tolerance)
+{
+  return std::isfinite(actual) && std::isfinite(expected)
+      && std::abs(actual - expected)
+          <= absolute_tolerance + relative_tolerance * std::abs(expected);
+}
+
+bool ReadFemmAns(const std::string& path, FemmReference* reference,
+    std::string* error)
+{
+  std::ifstream input(path);
+  if (!input) {
+    *error = "cannot open " + path;
+    return false;
+  }
+  std::string line;
+  bool found_solution = false;
+  while (std::getline(input, line)) {
+    if (line == "[Solution]" || line == "[Solution]\r") {
+      found_solution = true;
+      break;
+    }
+  }
+  int node_count = 0;
+  if (!found_solution || !(input >> node_count) || node_count <= 0) {
+    *error = "invalid [Solution] node count";
+    return false;
+  }
+  reference->model.nodes.resize(node_count);
+  reference->expected_a.resize(node_count);
+  for (int node = 0; node < node_count; ++node) {
+    int boundary_code = 0;
+    if (!(input >> reference->model.nodes[node].x_m
+              >> reference->model.nodes[node].y_m
+              >> reference->expected_a[node] >> boundary_code)
+        || !std::isfinite(reference->expected_a[node])) {
+      *error = "invalid FEMM solution node";
+      return false;
+    }
+  }
+  int element_count = 0;
+  if (!(input >> element_count) || element_count <= 0) {
+    *error = "invalid FEMM solution element count";
+    return false;
+  }
+  reference->model.triangles.resize(element_count);
+  std::vector<bool> boundary(node_count, false);
+  for (int element = 0; element < element_count; ++element) {
+    int label = 0;
+    int edge[3] = { -1, -1, -1 };
+    double element_current = 0.0;
+    Triangle& triangle = reference->model.triangles[element];
+    if (!(input >> triangle.node[0] >> triangle.node[1] >> triangle.node[2]
+              >> label >> edge[0] >> edge[1] >> edge[2] >> element_current)
+        || label != 0 || !std::isfinite(element_current)) {
+      *error = "invalid or unsupported FEMM solution element";
+      return false;
+    }
+    triangle.reluctivity_m_per_h = 1.0 / kMu0;
+    triangle.source_j_per_a = 1.0;
+    for (int side = 0; side < 3; ++side) {
+      if (edge[side] >= 0) {
+        const int first = triangle.node[side];
+        const int second = triangle.node[(side + 1) % 3];
+        if (first < 0 || first >= node_count || second < 0 || second >= node_count) {
+          *error = "FEMM boundary node out of range";
+          return false;
+        }
+        boundary[first] = true;
+        boundary[second] = true;
+      }
+    }
+  }
+  for (int node = 0; node < node_count; ++node) {
+    if (boundary[node]) {
+      if (reference->expected_a[node] != 0.0) {
+        *error = "fixture requires zero-A outer boundary";
+        return false;
+      }
+      reference->model.dirichlet_nodes.push_back(node);
+      reference->model.dirichlet_a_wb_per_m.push_back(0.0);
+    }
+  }
+  reference->model.depth_m = 1.0;
+  if (ValidateModel(reference->model) != Status::kOk) {
+    *error = "FEMM mesh failed frozen-scope validation";
+    return false;
+  }
+
+  reference->expected_bx.resize(element_count);
+  reference->expected_by.resize(element_count);
+  double area_sum = 0.0;
+  for (int element = 0; element < element_count; ++element) {
+    const Triangle& triangle = reference->model.triangles[element];
+    const Node p0 = reference->model.nodes[triangle.node[0]];
+    const Node p1 = reference->model.nodes[triangle.node[1]];
+    const Node p2 = reference->model.nodes[triangle.node[2]];
+    const double determinant = (p1.x_m - p0.x_m) * (p2.y_m - p0.y_m)
+        - (p2.x_m - p0.x_m) * (p1.y_m - p0.y_m);
+    area_sum += 0.5 * determinant;
+    const double a0 = reference->expected_a[triangle.node[0]];
+    const double a1 = reference->expected_a[triangle.node[1]];
+    const double a2 = reference->expected_a[triangle.node[2]];
+    reference->expected_bx[element] = (a0 * (p2.x_m - p1.x_m)
+        + a1 * (p0.x_m - p2.x_m) + a2 * (p1.x_m - p0.x_m)) / determinant;
+    reference->expected_by[element] = -(a0 * (p1.y_m - p2.y_m)
+        + a1 * (p2.y_m - p0.y_m) + a2 * (p0.y_m - p1.y_m)) / determinant;
+  }
+  if (!NearMixed(area_sum, 1.0, 1e-12, 1e-12)) {
+    *error = "fixture source normalization requires one square metre";
+    return false;
+  }
+  return true;
+}
+
+bool ReadCircuitReference(const std::string& path, FemmReference* reference,
+    std::string* error)
+{
+  std::ifstream input(path);
+  std::string current_name;
+  std::string voltage_name;
+  std::string flux_name;
+  double voltage = 0.0;
+  if (!input || !(input >> current_name >> reference->current_a
+                    >> voltage_name >> voltage
+                    >> flux_name >> reference->flux_linkage_wb)
+      || current_name != "current_A" || voltage_name != "voltage_drop_V"
+      || flux_name != "flux_linkage_Wb" || reference->current_a != 12.0
+      || voltage != 0.0 || !std::isfinite(reference->flux_linkage_wb)) {
+    *error = "invalid frozen circuit reference";
+    return false;
+  }
+  return true;
+}
+
+bool ReadDumpRhs(const std::string& path, std::vector<double>* rhs,
+    std::string* error)
+{
+  std::ifstream input(path);
+  if (!input) {
+    *error = "cannot open " + path;
+    return false;
+  }
+  std::string line;
+  bool reading = false;
+  while (std::getline(input, line)) {
+    if (!reading) {
+      const size_t start = line.find("b = [");
+      if (start == std::string::npos)
+        continue;
+      line = line.substr(start + 5);
+      reading = true;
+    }
+    const bool end = line.find("];") != std::string::npos;
+    line.erase(std::remove(line.begin(), line.end(), ';'), line.end());
+    line.erase(std::remove(line.begin(), line.end(), ']'), line.end());
+    std::istringstream value_input(line);
+    double value = 0.0;
+    if (value_input >> value)
+      rhs->push_back(value);
+    if (end)
+      break;
+  }
+  if (!reading || rhs->empty()) {
+    *error = "invalid FEMM dump RHS";
+    return false;
+  }
+  return true;
+}
+
+bool ReadDumpMatrix(const std::string& path, size_t dimension, Assembly* dump,
+    std::string* error)
+{
+  std::ifstream input(path);
+  if (!input) {
+    *error = "cannot open " + path;
+    return false;
+  }
+  std::map<std::pair<int, int>, std::vector<double>> entries;
+  int one_based_row = 0;
+  int one_based_column = 0;
+  double value = 0.0;
+  while (input >> one_based_row >> one_based_column >> value) {
+    const int row = one_based_row - 1;
+    const int column = one_based_column - 1;
+    if (row < 0 || column < 0 || static_cast<size_t>(row) >= dimension
+        || static_cast<size_t>(column) >= dimension || !std::isfinite(value)) {
+      *error = "invalid FEMM dump matrix entry";
+      return false;
+    }
+    entries[{ std::min(row, column), std::max(row, column) }].push_back(value);
+  }
+  std::vector<std::map<int, double>> rows(dimension);
+  for (const auto& item : entries) {
+    const std::vector<double>& duplicates = item.second;
+    if (duplicates.size() != 2 || duplicates[0] != duplicates[1]) {
+      *error = "FEMM dump duplicate/mirror invariant failed";
+      return false;
+    }
+    const int row = item.first.first;
+    const int column = item.first.second;
+    rows[row][column] = duplicates[0];
+    if (row != column)
+      rows[column][row] = duplicates[0];
+  }
+  dump->row_offsets.assign(dimension + 1, 0);
+  dump->diagonal.assign(dimension, 0.0);
+  dump->free_nodes.resize(dimension);
+  for (size_t row = 0; row < dimension; ++row) {
+    dump->free_nodes[row] = static_cast<int32_t>(row);
+    dump->row_offsets[row] = static_cast<int32_t>(dump->values.size());
+    for (const auto& entry : rows[row]) {
+      dump->column_indices.push_back(entry.first);
+      dump->values.push_back(entry.second);
+      if (entry.first == static_cast<int>(row))
+        dump->diagonal[row] = entry.second;
+    }
+    if (!(dump->diagonal[row] > 0.0)) {
+      *error = "FEMM dump missing positive diagonal";
+      return false;
+    }
+  }
+  dump->row_offsets[dimension] = static_cast<int32_t>(dump->values.size());
+  return true;
+}
+
+bool LoadFemmReference(const std::string& stem, FemmReference* reference,
+    std::string* error)
+{
+  return ReadFemmAns(stem + ".ans", reference, error)
+      && ReadCircuitReference(stem + ".circuit.txt", reference, error)
+      && ReadDumpRhs(stem + ".m", &reference->dump_rhs, error)
+      && reference->dump_rhs.size() == reference->expected_a.size()
+      && ReadDumpMatrix(stem + ".dat", reference->dump_rhs.size(),
+          &reference->dump, error);
+}
+
+int FemmReferenceTest(const std::string& stem)
+{
+  FemmReference reference;
+  std::string error;
+  if (!LoadFemmReference(stem, &reference, &error)) {
+    std::cerr << "FAIL: " << (error.empty() ? "reference dimension mismatch" : error) << '\n';
+    return 1;
+  }
+  int failures = 0;
+  double max_a_error = 0.0;
+  double max_b_error = 0.0;
+  auto expect = [&failures](bool condition, const std::string& message) {
+    if (!condition) {
+      std::cerr << "FAIL: " << message << '\n';
+      ++failures;
+    }
+  };
+
+  LinearP1FixtureSolver physical_solver;
+  const Status initialize_status = physical_solver.Initialize(reference.model);
+  expect(initialize_status == Status::kOk,
+      std::string("FEMM physical fixture initialization: ") + StatusName(initialize_status));
+  if (initialize_status == Status::kOk) {
+    const SolveResult result = physical_solver.Solve(reference.current_a, 1e-13, 256);
+    expect(result.info.status == Status::kOk,
+        std::string("FEMM physical fixture solve: ") + StatusName(result.info.status));
+    expect(result.a_wb_per_m.size() == reference.expected_a.size(), "FEMM nodal A dimension");
+    expect(result.bx_t.size() == reference.expected_bx.size(), "FEMM Bx dimension");
+    expect(result.by_t.size() == reference.expected_by.size(), "FEMM By dimension");
+    if (result.a_wb_per_m.size() == reference.expected_a.size()) {
+      for (size_t i = 0; i < result.a_wb_per_m.size(); ++i) {
+        max_a_error = std::max(max_a_error,
+            std::abs(result.a_wb_per_m[i] - reference.expected_a[i]));
+        expect(NearMixed(result.a_wb_per_m[i], reference.expected_a[i], 1e-12, 1e-4),
+            "FEMM nodal A parity");
+      }
+    }
+    if (result.bx_t.size() == reference.expected_bx.size()
+        && result.by_t.size() == reference.expected_by.size()) {
+      for (size_t i = 0; i < result.bx_t.size(); ++i) {
+        max_b_error = std::max(max_b_error,
+            std::max(std::abs(result.bx_t[i] - reference.expected_bx[i]),
+                std::abs(result.by_t[i] - reference.expected_by[i])));
+        expect(NearMixed(result.bx_t[i], reference.expected_bx[i], 1e-9, 1e-4),
+            "FEMM Bx parity");
+        expect(NearMixed(result.by_t[i], reference.expected_by[i], 1e-9, 1e-4),
+            "FEMM By parity");
+      }
+    }
+    expect(NearMixed(result.flux_linkage_wb, reference.flux_linkage_wb, 1e-12, 1e-4),
+        "FEMM circuit flux-linkage parity");
+  }
+
+  GpuCsrSolver dump_solver;
+  const Status dump_status = dump_solver.Initialize(reference.dump);
+  expect(dump_status == Status::kOk,
+      std::string("FEMM dump initialization: ") + StatusName(dump_status));
+  if (dump_status == Status::kOk) {
+    std::vector<double> internal_solution;
+    const SolveInfo info = dump_solver.Solve(reference.dump_rhs, 1e-13, 256,
+        &internal_solution);
+    expect(info.status == Status::kOk,
+        std::string("FEMM dump solve: ") + StatusName(info.status));
+    expect(internal_solution.size() == reference.expected_a.size(), "FEMM dump dimension");
+    if (internal_solution.size() == reference.expected_a.size()) {
+      for (size_t i = 0; i < internal_solution.size(); ++i) {
+        const double physical_a = kFemmInternalToPhysicalA * internal_solution[i];
+        expect(NearMixed(physical_a, reference.expected_a[i], 1e-12, 1e-4),
+            "FEMM dump-to-ans A parity");
+      }
+    }
+  }
+
+  if (failures == 0) {
+    std::cout << "PASS gpu_linear_p1_femm_reference\n"
+              << "  nodes=" << reference.model.nodes.size()
+              << " triangles=" << reference.model.triangles.size()
+              << " max_A_error=" << max_a_error
+              << " max_B_error=" << max_b_error << '\n'
+              << "  flux_reference_Wb=" << reference.flux_linkage_wb << '\n';
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 Model UnitSquareFixture()
 {
   Model model;
@@ -913,6 +1253,9 @@ int main(int argc, char** argv)
   if (argc == 2 && std::string(argv[1]) == "--self-test") {
     return gpu_femm::SelfTest();
   }
-  std::cerr << "Usage: gpu_linear_p1_poc --self-test\n";
+  if (argc == 3 && std::string(argv[1]) == "--femm-reference") {
+    return gpu_femm::FemmReferenceTest(argv[2]);
+  }
+  std::cerr << "Usage: gpu_linear_p1_poc --self-test | --femm-reference <stem>\n";
   return 2;
 }

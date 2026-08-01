@@ -54,8 +54,20 @@ the centre. With depth 1 m, reluctivity 1 m/H, and current 12 A, it must return:
 
 The test also verifies sign reversal at -12 A, residual <= `1e-13`, a forced
 iteration-limit failure, 100-run bitwise determinism, and no material GPU-memory
-growth. Future FEMM fixtures must preserve this SI contract when converting
-FEMM mesh/material/current/boundary data.
+growth.
+
+The second CTest uses the frozen `tests/fixtures/linear_square_v1` CPU FEMM
+reference. It independently exercises both paths below:
+
+- reassembly in SI units followed by nodal A, element B, and circuit flux
+  comparison against the frozen `.ans` and postprocessor export;
+- direct solution of fkn's `.m`/`.dat` algebraic dump, including strict
+  duplicate/mirror canonicalization, followed by fkn's centimetre-unit
+  conversion `A = 100 mu0 V`.
+
+The fixture is deliberately limited to one planar DC, linear-mu, PM-free,
+current-driven region with a zero-A outer boundary. It does not broaden the
+solver's supported physics.
 
 ## Status codes
 
@@ -71,8 +83,9 @@ Excluded: AC/complex solves, nonlinear B-H/Newton iteration, axisymmetry,
 air-gap elements, periodic or anti-periodic constraints, circuit unknowns,
 remeshing/parameter sweeps, and integration into the MFC/FEMM executable.
 
-This is not Gate 2. FEMM-derived matrix/solution and flux-field parity have not
-yet been demonstrated.
+The frozen test demonstrates the linear Gate 2 field/flux parity slice. It is
+not evidence for nonlinear, permanent-magnet, force/torque, batch, or MATLAB
+integration support.
 
 The current deterministic PCG kernel intentionally uses one CUDA thread.
 It is an accuracy and contract PoC, not a performance result; parallel sparse
