@@ -6,10 +6,12 @@ set(GPU_SOLVER_CUDA_ARCHITECTURES "" CACHE STRING
     "CUDA architectures for gpu_linear_p1_poc (empty uses toolchain default)")
 
 enable_language(CUDA)
+find_package(Threads REQUIRED)
 
 add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
 )
+target_link_libraries(gpu_linear_p1_poc PRIVATE Threads::Threads)
 
 add_executable(gpu_bh_curve_poc
   src/bh_curve_poc.cu

@@ -3,6 +3,7 @@
 #endif
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -15,6 +16,8 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1657,10 +1660,36 @@ class NonlinearP1FixtureSolver {
       const ProfileClock::time_point assembly_start = ProfileClock::now();
       std::vector<size_t> slots; std::vector<Assembly> assemblies; std::vector<std::vector<double>> rhs_values;
       const bool symbolic_preexisting = csr_initialized_;
-      for (size_t item = 0; item < currents.size(); ++item) if (active[item]) {
-        Assembly assembly;
-        const Status status = AssembleNonlinearNewton(model_, states[item], currents[item], iteration > 0, &assembly);
+      std::vector<size_t> active_slots;
+      for (size_t item = 0; item < currents.size(); ++item)
+        if (active[item]) active_slots.push_back(item);
+      std::vector<Assembly> iteration_assemblies(active_slots.size());
+      std::vector<Status> assembly_status(active_slots.size(), Status::kInternalError);
+      std::atomic<size_t> next_assembly { 0 };
+      const size_t worker_count = std::min<size_t>(active_slots.size(),
+          std::min<size_t>(6, std::max(1u, std::thread::hardware_concurrency())));
+      auto assemble = [&]() {
+        for (;;) {
+          const size_t local = next_assembly.fetch_add(1, std::memory_order_relaxed);
+          if (local >= active_slots.size()) return;
+          const size_t item = active_slots[local];
+          assembly_status[local] = AssembleNonlinearNewton(model_, states[item],
+              currents[item], iteration > 0, &iteration_assemblies[local]);
+        }
+      };
+      std::vector<std::thread> workers;
+      workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+      for (size_t worker = 1; worker < worker_count; ++worker) {
+        try { workers.emplace_back(assemble); }
+        catch (const std::system_error&) { break; }
+      }
+      assemble();
+      for (std::thread& worker : workers) worker.join();
+      for (size_t local = 0; local < active_slots.size(); ++local) {
+        const size_t item = active_slots[local];
+        const Status status = assembly_status[local];
         if (status != Status::kOk) { results[item].info.status = status; active[item] = false; continue; }
+        Assembly& assembly = iteration_assemblies[local];
         if (!csr_initialized_) {
           const Status initialize = csr_solver_.Initialize(assembly);
           if (initialize != Status::kOk) { results[item].info.status = initialize; active[item] = false; continue; }
@@ -4086,27 +4115,58 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     std::vector<size_t> chunk_slots;
     std::vector<GpuFemmMeshArtifact> chunk_artifacts;
     std::vector<std::vector<double>> chunk_currents;
-    for (size_t index = first; index < end; ++index) {
-      const ProfileClock::time_point artifact_start = ProfileClock::now();
+    const ProfileClock::time_point artifact_start = ProfileClock::now();
+    const size_t candidate_count = end - first;
+    std::vector<GpuFemmMeshArtifact> candidate_artifacts(candidate_count);
+    std::vector<std::string> candidate_fingerprints(candidate_count);
+    std::vector<Status> candidate_status(candidate_count, Status::kInternalError);
+    std::atomic<size_t> next_artifact { 0 };
+    const size_t artifact_worker_count = std::min<size_t>(candidate_count,
+        std::min<size_t>(6, std::max(1u, std::thread::hardware_concurrency())));
+    auto load_artifact = [&]() {
+      for (;;) {
+        const size_t local = next_artifact.fetch_add(1, std::memory_order_relaxed);
+        if (local >= candidate_count) return;
+        const size_t index = first + local;
+        const MotorSampleRequest& item = request.items[index].request;
+        std::ifstream artifact_file(item.mesh_artifact_path, std::ios::binary);
+        std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
+        if (!artifact_file) {
+          candidate_status[local] = Status::kInputIo;
+          continue;
+        }
+        const std::string bytes = artifact_bytes.str();
+        std::string item_error;
+        if (Sha256Hex(bytes) != item.mesh_artifact_sha256
+            || !ParseGpuFemmMeshArtifactJson(
+                bytes, &candidate_artifacts[local], &item_error)
+            || !RequestMatchesArtifact(item, candidate_artifacts[local])) {
+          candidate_status[local] = Status::kInvalidArgument;
+          continue;
+        }
+        candidate_fingerprints[local] =
+            NonlinearModelFingerprint(candidate_artifacts[local].model);
+        candidate_status[local] = Status::kOk;
+      }
+    };
+    std::vector<std::thread> artifact_workers;
+    artifact_workers.reserve(artifact_worker_count > 0 ? artifact_worker_count - 1 : 0);
+    for (size_t worker = 1; worker < artifact_worker_count; ++worker) {
+      try { artifact_workers.emplace_back(load_artifact); }
+      catch (const std::system_error&) { break; }
+    }
+    load_artifact();
+    for (std::thread& worker : artifact_workers) worker.join();
+    timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+    for (size_t local = 0; local < candidate_count; ++local) {
+      const size_t index = first + local;
       const MotorSampleRequest& item = request.items[index].request;
-      std::ifstream artifact_file(item.mesh_artifact_path, std::ios::binary);
-      std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
-      GpuFemmMeshArtifact artifact;
-      if (!artifact_file) {
-        responses[index].status = Status::kInputIo;
-        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+      responses[index].status = candidate_status[local];
+      if (responses[index].status != Status::kOk)
         continue;
-      }
-      if (Sha256Hex(artifact_bytes.str()) != item.mesh_artifact_sha256
-          || !ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)
-          || !RequestMatchesArtifact(item, artifact)) {
-        responses[index].status = Status::kInvalidArgument;
-        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
-        continue;
-      }
-      const std::string fingerprint = NonlinearModelFingerprint(artifact.model);
+      GpuFemmMeshArtifact& artifact = candidate_artifacts[local];
+      const std::string& fingerprint = candidate_fingerprints[local];
       if (cached_fingerprint.empty()) {
-        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
         const ProfileClock::time_point initialize_start = ProfileClock::now();
         responses[index].status = cached_solver.Initialize(artifact.model);
         timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
@@ -4114,11 +4174,9 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         cached_fingerprint = fingerprint;
       } else if (fingerprint != cached_fingerprint) {
         responses[index].status = Status::kInvalidArgument;
-        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
         continue; // caller mixed geometry groups
       } else {
         ++cache_hits;
-        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
       }
       chunk_slots.push_back(index);
       chunk_currents.push_back(item.circuit_currents_a);
