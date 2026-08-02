@@ -1,149 +1,166 @@
-# GPU planar P1 solver PoC
+# GPU solver CLI and file formats
 
-This is an independent CUDA FP64 proof of concept, not a replacement for the
-FEMM solvers. It solves planar magnetic-vector-potential P1 models with
-zero/nonzero Dirichlet `A` boundaries, element current density, and element
-`B = (dA/dy, -dA/dx)`. Linear and raw-DC nonlinear single-sample paths use a
-deterministic GPU-resident CSR Jacobi-PCG backend.
+`gpu_linear_p1_poc` is a CUDA FP64 planar P1 magnetostatic solver. Its command
+line interface uses files for both input and output. It does not modify an
+installed FEMM directory.
 
-It requires CUDA Toolkit 13.x, CMake, a CUDA-capable NVIDIA GPU, and an MSVC
-x64 host toolchain. All field values and solver storage are `double` (FP64).
+See the repository [README](../README.md) for build instructions and a quick
+start.
 
-## Build and test on Windows
+## Commands
 
-In PowerShell, choose an architecture appropriate for the target GPU. If `nvcc`
-is already on `PATH`, no environment setup is required. `CUDA_PATH` is an
-optional convenience for a conventional CUDA installation:
+| Command | Purpose |
+|---|---|
+| `--self-test` | Test the analytic models, parsers, batch path, and determinism |
+| `--mesh-artifact <file>` | Validate a `gpu_femm_mesh_v1` artifact |
+| `--motor-single-sample <request> <response>` | Solve one motor operating point |
+| `--motor-batch <request> <response>` | Solve a batch of operating points |
+| `--motor-batch-profile <request> <response>` | Solve a batch and record stage timings |
+| `--femm-reference <stem>` | Check the frozen linear reference |
+| `--nonlinear-reference <stem> <curve_dir>` | Check the frozen nonlinear field and flux reference |
+| `--postprocess-reference <stem> <curve_dir>` | Check the frozen force, torque, and air-gap reference |
+| `--single-sample <request> <response>` | Run the frozen fixture file protocol |
 
-```powershell
-# Optional when nvcc is not already discoverable on PATH.
-$env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3'
-$env:Path = "$env:CUDA_PATH\bin;$env:Path"
-cmake -S . -B build-gpu -G 'Visual Studio 17 2022' -A x64 `
-  -DBUILD_GPU_SOLVER=ON -DBUILD_TESTING=ON `
-  -DGPU_SOLVER_CUDA_ARCHITECTURES=89
-cmake --build build-gpu --config Release `
-  --target gpu_linear_p1_poc gpu_bh_curve_poc
-ctest --test-dir build-gpu -C Release --output-on-failure
-```
+`gpu_bh_curve_poc --fixture <directory>` tests B-H preprocessing and
+interpolation separately.
 
-For a Visual Studio generator without `CUDA_PATH`, select the installed CUDA
-toolset directory explicitly:
+## `gpu_femm_mesh_v1`
 
-```powershell
-cmake -S . -B build-gpu -G 'Visual Studio 17 2022' -A x64 `
-  -T 'cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3' `
-  -DBUILD_GPU_SOLVER=ON -DBUILD_TESTING=ON `
-  -DGPU_SOLVER_CUDA_ARCHITECTURES=89
-```
-
-Alternatively, leave `GPU_SOLVER_CUDA_ARCHITECTURES` empty and set the standard
-`-DCMAKE_CUDA_ARCHITECTURES=<arch>` override. No architecture is hard-coded.
-The target locally forwards `/utf-8` to the MSVC host compiler through NVCC, so
-NVIDIA header C4819 warnings do not alter legacy FEMM target flags.
-
-## Fixture and expected contract
-
-The built-in linear self-test is a counter-clockwise, four-triangle unit square in SI
-units: coordinates and depth are metres, reluctivity is m/H, `J/I` is 1/m^2,
-`A` is Wb/m, and `B` is tesla. Nodes 0--3 are zero-`A` boundaries; node 4 is
-the centre. With depth 1 m, reluctivity 1 m/H, and current 12 A, it must return:
-
-- `A = [0, 0, 0, 0, 1]` Wb/m;
-- triangle `Bx = [2, 0, -2, 0]` T and `By = [0, 2, 0, -2]` T;
-- flux linkage `1/3` Wb.
-
-The test also verifies sign reversal at -12 A, residual <= `1e-13`, a forced
-iteration-limit failure, 100-run bitwise determinism, and no material GPU-memory
-growth.
-
-The second CTest uses the frozen `tests/fixtures/linear_square_v1` CPU FEMM
-reference. It independently exercises both paths below:
-
-- reassembly in SI units followed by nodal A, element B, and circuit flux
-  comparison against the frozen `.ans` and postprocessor export;
-- direct solution of fkn's `.m`/`.dat` algebraic dump, including strict
-  duplicate/mirror canonicalization, followed by fkn's centimetre-unit
-  conversion `A = 100 mu0 V`.
-
-The fixture is deliberately limited to one planar DC, linear-mu, PM-free,
-current-driven region with a zero-A outer boundary. It does not broaden the
-solver's supported physics.
-
-## Nonlinear single-sample contract
-
-`gpu_bh_curve_poc` independently validates the B-H evaluator used by nonlinear
-assembly. It reproduces FEMM's DC natural cubic Hermite B-H preprocessing and evaluation,
-including the derivative-root monotonicity check, FEMM's three-point smoothing
-fallback, zero-field limit, final-slope extrapolation, and negative-B symmetry.
-Host and CUDA evaluations are compared with the frozen repository-local
-`35PN230` table and reproducible MATLAB reference samples at every knot and
-segment midpoint. This scope is raw DC, `LamType=0`, `LamFill=1`; it does not
-claim parity for FEMM's laminated or AC apparent-curve transformations.
-
-`gpu_linear_p1_poc` connects that raw DC curve to planar P1 Newton assembly.
-It includes the FEMM cold secant first iteration, analytic `K+C` Jacobian and
-correction RHS, relaxation/history/iteration cap, explicit initial-A warm
-start, permanent-magnet coercivity, driven-coil source, and circuit flux
-linkage. Every triangle must have an explicit valid material/region index.
-
-The frozen `tests/fixtures/nonlinear_pm_coil_v1` reference contains 506 nodes
-and 890 triangles spanning 35PN230 steel, a nonzero-Hc PM, coil-air, and
-default air. Its CTest compares nodal A, element B, and circuit flux against
-portable stock FEMM. The current reference converges in four Newton iterations
-with maximum A error `2.41682e-11 Wb/m` and maximum B error `4.23215e-9 T`.
-
-## Package 3B frozen postprocess and single-sample protocol
-
-The same frozen nonlinear fixture now verifies the CPU FEMM planar DC
-postprocessor contract used by MATLAB: selected PM label `1`, default-air label
-`3`, default `WeightingScheme=0` mask solve, weighted-stress block integrals
-18/19/22 (`Fx`, `Fy`, `torque`), and default-smoothed `mo_getb` radial samples.
-The mask preserves FEMM's `sqrt(element area)` default weighting and final
-`V > 0.5` threshold. Point sampling implements the DC P1 `GetNodalB` patch,
-including its block-label interface traversal and sharp-corner fallback.
-
-`gpu_linear_p1_poc --postprocess-reference <stem> <curve_dir>` checks the
-frozen `*.postprocess.txt` force/torque and air-gap values. The separate
-single-sample adapter is intentionally file-protocol only:
+Normal motor solves use a preprocessed mesh artifact. The top-level object has
+exactly these fields:
 
 ```text
-gpu_linear_p1_poc --single-sample request.json response.json
+schema_version
+base_motor_fem_sha256
+source_fem_sha256
+canonical_identity_sha256
+resolved
 ```
 
-The JSON reader is a narrow trusted-file boundary for adapter-generated input,
-not a general JSON service. Request protocol is `gpu_femm_single_sample_v1`
-with `stem`,
-`curve_directory`, `source_motor_fem_sha256` (64 hexadecimal characters),
-`current_A`, `selected_material_label`, `airgap_radius_mm`, and
-`airgap_angles_deg`. The response echoes the source FEM hash and returns
-`status`, `Fx_N`, `Fy_N`, `torque_Nm`, one circuit current/flux entry, air-gap
-samples, mesh count, convergence metadata, and stable error fields. It does
-not alter MATLAB cache/resume policy or implement CPU fallback; MATLAB owns
-those decisions. Before launching the executable, the MATLAB adapter hashes
-`<stem>.fem` and requires it to equal `source_motor_fem_sha256`; a mismatched
-frozen reference cannot be accepted as the requested motor result.
+The `resolved` object contains:
+
+```text
+source_fem_sha256
+base_motor_fem_sha256
+model
+pose
+nodes_mm
+triangles
+regions
+materials
+circuits
+outer_dirichlet
+```
+
+Artifact requirements:
+
+- `model.problem_type` must be `planar` and `frequency_hz` must be `0`.
+- Node coordinates and model depth use millimetres.
+- Triangle node indices are zero-based and counter-clockwise.
+- Every triangle has a valid region and material.
+- Materials are isotropic and use `lam_type=0`, `lam_fill=1`.
+- Circuit indices, region turns, and PM magnetization angles are explicit.
+- Outer Dirichlet nodes and their `A_Wb_per_m` values are explicit.
+- Source and base SHA-256 values match at the top level and in `resolved`.
+
+Unknown fields, duplicate JSON keys, invalid indices, and unsupported physics
+are rejected.
+
+```powershell
+gpu_linear_p1_poc.exe --mesh-artifact model.gpu_femm_mesh_v1.json
+```
+
+This command prints the node, triangle, and circuit counts together with the
+source and base hashes. It validates the artifact but does not solve it.
+
+## `gpu_femm_motor_sample_v1`
+
+A single-sample request contains:
+
+| Field | Description |
+|---|---|
+| `mesh_artifact_path` | Path to the mesh artifact |
+| `mesh_artifact_sha256` | SHA-256 of the complete artifact file |
+| `base_motor_fem_sha256` | Base-model hash stored in the artifact |
+| `source_fem_sha256` | Posed-model hash stored in the artifact |
+| `circuit_currents_A` | Current vector in artifact circuit order |
+| `selected_group_number` | Group used for force and torque integration |
+| `air_group_number` | Air group used by the weighted-stress mask |
+| `airgap_radius_mm` | Air-gap sample radius; may be zero when sampling is disabled |
+| `airgap_angles_deg` | Angles for radial B samples |
+| `rotor_angle_deg` | Rotor angle stored in the artifact pose |
+| `displacement_mm` | `[x,y]` displacement stored in the artifact pose |
+
+The solve does not start if the artifact file hash, model identity, pose, or
+circuit count does not match.
+
+A successful response contains:
+
+- `Fx_N`, `Fy_N`, and `torque_Nm`
+- `actual_circuit_currents_A`
+- `circuit_flux_linkage_Wb`
+- `airgap_sample_angles_deg`
+- `airgap_radial_flux_density_T`
+- `mesh_element_count`
+- Newton iteration count and residual
+
+## `gpu_femm_motor_batch_v1`
+
+A batch request contains `max_items_per_chunk` and `items`. Each item has a
+unique `task_id` and one complete `gpu_femm_motor_sample_v1` request.
+
+- Responses preserve input order.
+- Each shared artifact is read and validated once.
+- CSR symbolic data is reused for matching geometry.
+- `max_items_per_chunk` must be between 1 and 4096.
+- The effective chunk size also accounts for available VRAM.
+- Duplicate task IDs and mismatched artifact identities are rejected.
+
+`--motor-batch-profile` returns the same numerical results as `--motor-batch`
+and adds timing for artifact loading, assembly, GPU solve, and postprocessing.
+
+## Numerical implementation
+
+- Field values and solver storage use `double`.
+- Nonlinear materials use FEMM's DC natural cubic Hermite B-H preprocessing.
+- The first Newton iteration uses the cold secant; later iterations use the
+  analytic Jacobian.
+- Linear systems use a GPU-resident CSR Jacobi-PCG solver.
+- Supported GPUs can use cooperative multi-block PCG for small batches on
+  large meshes. Other cases use the deterministic fallback kernel.
+- Force and torque use a default weighted-stress mask.
+- Radial air-gap B uses smoothed nodal values from the P1 element field.
 
 ## Status codes
 
-`0 OK`; `1 INPUT_IO`; `2 INVALID_ARGUMENT`; `3 UNSUPPORTED_FEATURE`;
-`4 MESH_INVALID`; `5 BOUNDARY_INVALID`; `6 GPU_UNAVAILABLE`;
-`7 GPU_ALLOCATION_FAILED`; `8 ASSEMBLY_FAILED`; `9 LINEAR_SOLVE_NOT_CONVERGED`;
-`10 LINEAR_SOLVE_BREAKDOWN`; `11 NUMERICAL_NONFINITE`; `12 OUTPUT_IO`;
-`13 INTERNAL_ERROR`; `14 NONLINEAR_SOLVE_NOT_CONVERGED`;
-`15 INVALID_MATERIAL`.
+The process returns 0 on success and a nonzero value for input, solve, or
+output failure. The JSON `solve_status` uses these stable names:
 
-## Explicit exclusions and gate status
+| Code | Name | Meaning |
+|---:|---|---|
+| 0 | `OK` | Success |
+| 1 | `INPUT_IO` | Input file could not be read |
+| 2 | `INVALID_ARGUMENT` | Invalid schema, hash, or argument |
+| 3 | `UNSUPPORTED_FEATURE` | Unsupported physics |
+| 4 | `MESH_INVALID` | Invalid mesh structure |
+| 5 | `BOUNDARY_INVALID` | Invalid boundary conditions |
+| 6 | `GPU_UNAVAILABLE` | No usable CUDA device |
+| 7 | `GPU_ALLOCATION_FAILED` | GPU allocation failed |
+| 8 | `ASSEMBLY_FAILED` | Matrix assembly failed |
+| 9 | `LINEAR_SOLVE_NOT_CONVERGED` | PCG iteration limit reached |
+| 10 | `LINEAR_SOLVE_BREAKDOWN` | PCG breakdown |
+| 11 | `NUMERICAL_NONFINITE` | NaN or Inf encountered |
+| 12 | `OUTPUT_IO` | Response file could not be written |
+| 13 | `INTERNAL_ERROR` | Internal error |
+| 14 | `NONLINEAR_SOLVE_NOT_CONVERGED` | Newton iteration limit reached |
+| 15 | `INVALID_MATERIAL` | Invalid material or B-H curve |
 
-Excluded from the mesh solver: AC/complex solves, axisymmetry, laminated or
-AC apparent B-H conversion, air-gap elements, periodic or anti-periodic
-constraints, circuit unknowns,
-remeshing/parameter sweeps, and integration into the MFC/FEMM executable.
+## Test fixtures
 
-The frozen tests demonstrate linear Gate 2 and nonlinear Package 3A field/flux
-parity plus Package 3B frozen force/torque/air-gap and file-adapter parity.
-They are not evidence for batch, full MATLAB workflow, or CPU fallback support.
+`tests/fixtures` contains three fixed references:
 
-The current deterministic PCG kernel intentionally uses one CUDA thread.
-It is an accuracy and contract PoC, not a performance result; parallel sparse
-kernels are deferred until FEMM-derived parity passes.
+- `linear_square_v1`: linear field and flux
+- `nonlinear_pm_coil_v1`: nonlinear steel, PM, coil, force, torque, and air-gap field
+- `35PN230_v1`: B-H preprocessing and interpolation
+
+All CTest cases, including the analytic self-test, execute CUDA kernels.
