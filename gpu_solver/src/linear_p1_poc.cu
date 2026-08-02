@@ -4287,12 +4287,6 @@ bool ReadMotorSampleRequestJson(const std::string& json, MotorSampleRequest* req
       && ReadMotorSampleRequestValue(root, request, error);
 }
 
-bool SameDoubleVector(const std::vector<double>& left, const std::vector<double>& right)
-{
-  return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
-      [](double a, double b) { return a == b; });
-}
-
 bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact)
 {
   return request.base_motor_fem_sha256 == artifact.base_motor_fem_sha256
@@ -4300,7 +4294,7 @@ bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMesh
       && request.rotor_angle_deg == artifact.rotor_angle_deg
       && request.displacement_mm[0] == artifact.displacement_mm[0]
       && request.displacement_mm[1] == artifact.displacement_mm[1]
-      && SameDoubleVector(request.circuit_currents_a, artifact.circuit_currents_a);
+      && request.circuit_currents_a.size() == static_cast<size_t>(artifact.model.circuit_count);
 }
 
 Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
@@ -4392,7 +4386,7 @@ int MotorSingleSampleAdapter(const std::string& request_path, const std::string&
   if (!artifact_file) { status = Status::kInputIo; error = "cannot open mesh artifact"; }
   else if (Sha256Hex(artifact_bytes.str()) != request.mesh_artifact_sha256) { status = Status::kInvalidArgument; error = "mesh artifact SHA mismatch"; }
   else if (!ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)) status = Status::kInvalidArgument;
-  else if (!RequestMatchesArtifact(request, artifact)) { status = Status::kInvalidArgument; error = "artifact identity, pose, or circuit current mismatch"; }
+  else if (!RequestMatchesArtifact(request, artifact)) { status = Status::kInvalidArgument; error = "artifact identity, pose, or circuit-count mismatch"; }
   NonlinearSolveResult solution; FrozenPostprocessResult postprocess;
   const bool solve_attempted = status == Status::kOk;
   if (solve_attempted)
@@ -5110,7 +5104,14 @@ int SelfTest()
   MotorSampleRequest parsed_request;
   expect(ReadMotorSampleRequestJson(motor_request_json, &parsed_request, &parser_error)
           && RequestMatchesArtifact(parsed_request, parsed_artifact),
-      "motor request binds artifact identities, pose, and circuit vector");
+      "motor request binds artifact identities and pose");
+  parsed_request.circuit_currents_a = { 3.0, -3.0 };
+  expect(RequestMatchesArtifact(parsed_request, parsed_artifact),
+      "motor request accepts a new circuit vector for one immutable geometry artifact");
+  parsed_request.circuit_currents_a = { 3.0 };
+  expect(!RequestMatchesArtifact(parsed_request, parsed_artifact),
+      "motor request rejects a circuit-count mismatch for its geometry artifact");
+  parsed_request.circuit_currents_a = { 3.0, -3.0 };
   parsed_request.base_motor_fem_sha256[0] = '0';
   expect(!RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request rejects artifact identity hash mismatch");
