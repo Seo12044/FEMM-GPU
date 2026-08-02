@@ -1,0 +1,10 @@
+{
+  "protocol": "gpu_femm_single_sample_v1",
+  "stem": "gpu_solver/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar",
+  "curve_directory": "gpu_solver/tests/fixtures/35PN230_v1",
+  "source_motor_fem_sha256": "f95e0c8f73850e3534117eac9a0988fdbcb37a73fe80b41fe0d8e3e18cb7d09c",
+  "current_A": 5,
+  "selected_material_label": 1,
+  "airgap_radius_mm": 1,
+  "airgap_angles_deg": [0, 90, 180, 270]
+}

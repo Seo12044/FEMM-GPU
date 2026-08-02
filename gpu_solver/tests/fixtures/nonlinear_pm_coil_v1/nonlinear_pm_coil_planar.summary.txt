@@ -1,0 +1,15 @@
+portable_femm=femm42_x64_22Oct2023
+problem=planar_dc_depth_mm 20
+smartmesh=0
+outer_boundary=A0
+steel=Steel35PN230
+steel_bh_point_count=29
+steel_initial_relative_mu=4605.0978018869846
+pm=PM_linear_Hc900kApm
+pm_Hc_A_per_m=900000
+circuit=coil_5A
+turns=50
+circuit_current_A=5
+circuit_voltage_drop_V=0
+flux_linkage_Wb=0.00083345179912279173
+element_count=890

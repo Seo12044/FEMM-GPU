@@ -1,0 +1,15 @@
+format_version 1
+source_repo FEMM_Matlab_Inventor
+source_path materials/35PN230/35PN230.tab
+source_sha256 e38e0c2453451e24e9874a96cda2c6363debd8b1a4ac792d4cc932c642f5572d
+point_count 29
+input_columns H_A_per_m B_T
+frequency_hz 0
+lamination_type 0
+lamination_fill 1
+conductivity_MS_per_m 0
+hysteresis_angle_deg 0
+femm_matprop_source_commit 51fff0f60ab3ac996a18fb1ad6db865e01006b36
+reference_generator generate_reference.m
+reference_generator_runtime MATLAB_R2025a
+external_supplier_provenance unavailable

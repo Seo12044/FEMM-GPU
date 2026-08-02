@@ -1,0 +1,17 @@
+source=frozen_original_ans_no_reanalysis
+selected_material_label=1
+selected_material_coordinate_mm=6,0
+node_count=506
+element_count=890
+Fx_N=-7.6799913871662699
+Fy_N=-1.39915483064456
+torque_Nm=0.0054151955763548599
+circuit_current_A=5
+circuit_voltage_drop_V=0
+flux_linkage_Wb=0.00083345179912279173
+airgap_sampling=ordinary_air_default_smoothed_mo_getb
+airgap_radius_mm=1
+airgap_sample_deg=0 radial_B_T=0.34107843476203442 Bx_T=0.34107843476203442 By_T=-0.022652315392266739 x_mm=1 y_mm=0
+airgap_sample_deg=90 radial_B_T=-0.0037492763086268699 Bx_T=0.31151052653774902 By_T=-0.0037492763086268699 x_mm=0 y_mm=1
+airgap_sample_deg=180 radial_B_T=-0.2839610741675318 Bx_T=0.2839610741675318 By_T=0.028975070400153329 x_mm=-1 y_mm=0
+airgap_sample_deg=270 radial_B_T=-0.01007203131651346 Bx_T=0.3135289823918172 By_T=0.01007203131651346 x_mm=0 y_mm=-1
