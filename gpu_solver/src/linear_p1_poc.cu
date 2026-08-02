@@ -10,11 +10,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -4478,6 +4480,79 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
   return Sha256Hex(bytes.str());
 }
 
+// Keep artifact parsing and SHA verification tied to a resolved filesystem
+// identity, rather than to the spelling used by an individual request.  The
+// original request path is retained as the read path so failed opens preserve
+// the established per-request INPUT_IO behavior.
+std::string CanonicalArtifactPathKey(const std::string& path)
+{
+  std::error_code error;
+  const std::filesystem::path resolved =
+      std::filesystem::weakly_canonical(std::filesystem::path(path), error);
+  std::string key = error ? path : resolved.generic_string();
+#ifdef _WIN32
+  std::transform(key.begin(), key.end(), key.begin(),
+      [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+#endif
+  return key;
+}
+
+struct MotorBatchArtifactLoadPlan {
+  std::vector<std::string> canonical_paths;
+  std::vector<std::string> representative_paths;
+  std::vector<size_t> item_slots;
+  std::vector<size_t> slot_use_counts;
+};
+
+MotorBatchArtifactLoadPlan MakeMotorBatchArtifactLoadPlan(const MotorBatchRequest& request)
+{
+  MotorBatchArtifactLoadPlan plan;
+  plan.item_slots.reserve(request.items.size());
+  std::map<std::string, size_t> slot_by_path;
+  for (const MotorBatchItem& item : request.items) {
+    const std::string canonical_path = CanonicalArtifactPathKey(item.request.mesh_artifact_path);
+    const auto found = slot_by_path.find(canonical_path);
+    if (found != slot_by_path.end()) {
+      plan.item_slots.push_back(found->second);
+      ++plan.slot_use_counts[found->second];
+      continue;
+    }
+    const size_t slot = plan.canonical_paths.size();
+    slot_by_path.emplace(canonical_path, slot);
+    plan.canonical_paths.push_back(canonical_path);
+    plan.representative_paths.push_back(item.request.mesh_artifact_path);
+    plan.slot_use_counts.push_back(1);
+    plan.item_slots.push_back(slot);
+  }
+  return plan;
+}
+
+struct MotorBatchArtifactLoad {
+  Status status = Status::kInternalError;
+  std::string artifact_sha256;
+  std::string fingerprint;
+  GpuFemmMeshArtifact artifact;
+};
+
+void LoadMotorBatchArtifact(const std::string& path, MotorBatchArtifactLoad* load)
+{
+  std::ifstream artifact_file(path, std::ios::binary);
+  std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
+  if (!artifact_file) {
+    load->status = Status::kInputIo;
+    return;
+  }
+  const std::string bytes = artifact_bytes.str();
+  load->artifact_sha256 = Sha256Hex(bytes);
+  std::string error;
+  if (!ParseGpuFemmMeshArtifactJson(bytes, &load->artifact, &error)) {
+    load->status = Status::kInvalidArgument;
+    return;
+  }
+  load->fingerprint = NonlinearModelFingerprint(load->artifact.model);
+  load->status = Status::kOk;
+}
+
 // Keep only protocol output after each item/chunk.  In particular, do not
 // retain the nodal A or per-element B vectors for a whole batch.
 struct MotorBatchResponseDto {
@@ -4619,25 +4694,33 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     return 1; // No trusted item identity exists to write a resumable response.
   }
   timing.request_read_parse_seconds = ProfileSecondsSince(total_start);
+  const ProfileClock::time_point preflight_start = ProfileClock::now();
+  const MotorBatchArtifactLoadPlan artifact_load_plan =
+      MakeMotorBatchArtifactLoadPlan(request);
+  std::vector<std::unique_ptr<MotorBatchArtifactLoad>> cached_artifact_loads(
+      artifact_load_plan.canonical_paths.size());
+  const size_t preflight_slot = artifact_load_plan.item_slots.front();
+  cached_artifact_loads[preflight_slot] = std::make_unique<MotorBatchArtifactLoad>();
+  LoadMotorBatchArtifact(artifact_load_plan.representative_paths[preflight_slot],
+      cached_artifact_loads[preflight_slot].get());
   // Derive the batch cap from the real CSR footprint, not a sample-count
   // heuristic.  The preflight is read-only and repeats the normal strict
-  // artifact checks before any CUDA allocation.
+  // request validation before any CUDA allocation, while reusing the parsed
+  // artifact during the actual batch execution.
   size_t values_per_item = 0;
   size_t nodes_per_item = 0;
-  const ProfileClock::time_point preflight_start = ProfileClock::now();
   {
     const MotorSampleRequest& first = request.items.front().request;
-    std::ifstream artifact_file(first.mesh_artifact_path, std::ios::binary);
-    std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
-    GpuFemmMeshArtifact artifact;
-    if (artifact_file && Sha256Hex(artifact_bytes.str()) == first.mesh_artifact_sha256
-        && ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)
-        && RequestMatchesArtifact(first, artifact)) {
-      std::vector<double> initial_a(artifact.model.nodes.size(), 0.0);
-      for (size_t boundary = 0; boundary < artifact.model.dirichlet_nodes.size(); ++boundary)
-        initial_a[artifact.model.dirichlet_nodes[boundary]] = artifact.model.dirichlet_a_wb_per_m[boundary];
+    const MotorBatchArtifactLoad& load = *cached_artifact_loads[preflight_slot];
+    if (load.status == Status::kOk
+        && load.artifact_sha256 == first.mesh_artifact_sha256
+        && RequestMatchesArtifact(first, load.artifact)) {
+      std::vector<double> initial_a(load.artifact.model.nodes.size(), 0.0);
+      for (size_t boundary = 0; boundary < load.artifact.model.dirichlet_nodes.size(); ++boundary)
+        initial_a[load.artifact.model.dirichlet_nodes[boundary]] =
+            load.artifact.model.dirichlet_a_wb_per_m[boundary];
       Assembly estimate;
-      if (AssembleNonlinearNewton(artifact.model, initial_a, first.circuit_currents_a, false, &estimate) == Status::kOk) {
+      if (AssembleNonlinearNewton(load.artifact.model, initial_a, first.circuit_currents_a, false, &estimate) == Status::kOk) {
         values_per_item = estimate.values.size();
         nodes_per_item = estimate.free_nodes.size();
       }
@@ -4662,6 +4745,11 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
               ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1))) : 1;
   const int32_t effective_chunk = std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
       kMotorBatchMaxParallelWidth }));
+  // Only paths that recur across chunks (plus the already-required preflight
+  // path) remain resident.  A mixed request with thousands of distinct
+  // artifacts therefore retains bounded host-memory behavior, while one
+  // geometry artifact is parsed once for the whole batch regardless of CUDA
+  // chunk width.
   std::vector<MotorBatchResponseDto> responses(request.items.size());
   NonlinearP1FixtureSolver cached_solver;
   std::string cached_fingerprint;
@@ -4673,40 +4761,40 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     ++chunk_count;
     const size_t end = std::min(request.items.size(), first + static_cast<size_t>(effective_chunk));
     std::vector<size_t> chunk_slots;
-    std::vector<GpuFemmMeshArtifact> chunk_artifacts;
+    std::vector<const GpuFemmMeshArtifact*> chunk_artifacts;
     std::vector<std::vector<double>> chunk_currents;
     const ProfileClock::time_point artifact_start = ProfileClock::now();
     const size_t candidate_count = end - first;
-    std::vector<GpuFemmMeshArtifact> candidate_artifacts(candidate_count);
-    std::vector<std::string> candidate_fingerprints(candidate_count);
-    std::vector<Status> candidate_status(candidate_count, Status::kInternalError);
+    std::vector<MotorBatchArtifactLoad*> artifact_by_slot(
+        artifact_load_plan.canonical_paths.size(), nullptr);
+    std::vector<size_t> load_slots;
+    std::vector<size_t> load_index_by_slot(artifact_load_plan.canonical_paths.size(),
+        std::numeric_limits<size_t>::max());
+    for (size_t local = 0; local < candidate_count; ++local) {
+      const size_t slot = artifact_load_plan.item_slots[first + local];
+      if (cached_artifact_loads[slot] != nullptr) {
+        artifact_by_slot[slot] = cached_artifact_loads[slot].get();
+      } else if (load_index_by_slot[slot] == std::numeric_limits<size_t>::max()) {
+        load_index_by_slot[slot] = load_slots.size();
+        load_slots.push_back(slot);
+      }
+    }
+    std::vector<std::unique_ptr<MotorBatchArtifactLoad>> loaded_artifacts;
+    loaded_artifacts.reserve(load_slots.size());
+    for (size_t ignored : load_slots) {
+      (void)ignored;
+      loaded_artifacts.push_back(std::make_unique<MotorBatchArtifactLoad>());
+    }
     std::atomic<size_t> next_artifact { 0 };
-    const size_t artifact_worker_count = std::min<size_t>(candidate_count,
+    const size_t artifact_worker_count = std::min<size_t>(load_slots.size(),
         std::min<size_t>(6, std::max(1u, std::thread::hardware_concurrency())));
     auto load_artifact = [&]() {
       for (;;) {
-        const size_t local = next_artifact.fetch_add(1, std::memory_order_relaxed);
-        if (local >= candidate_count) return;
-        const size_t index = first + local;
-        const MotorSampleRequest& item = request.items[index].request;
-        std::ifstream artifact_file(item.mesh_artifact_path, std::ios::binary);
-        std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
-        if (!artifact_file) {
-          candidate_status[local] = Status::kInputIo;
-          continue;
-        }
-        const std::string bytes = artifact_bytes.str();
-        std::string item_error;
-        if (Sha256Hex(bytes) != item.mesh_artifact_sha256
-            || !ParseGpuFemmMeshArtifactJson(
-                bytes, &candidate_artifacts[local], &item_error)
-            || !RequestMatchesArtifact(item, candidate_artifacts[local])) {
-          candidate_status[local] = Status::kInvalidArgument;
-          continue;
-        }
-        candidate_fingerprints[local] =
-            NonlinearModelFingerprint(candidate_artifacts[local].model);
-        candidate_status[local] = Status::kOk;
+        const size_t load_index = next_artifact.fetch_add(1, std::memory_order_relaxed);
+        if (load_index >= load_slots.size()) return;
+        const size_t slot = load_slots[load_index];
+        LoadMotorBatchArtifact(artifact_load_plan.representative_paths[slot],
+            loaded_artifacts[load_index].get());
       }
     };
     std::vector<std::thread> artifact_workers;
@@ -4717,15 +4805,31 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     }
     load_artifact();
     for (std::thread& worker : artifact_workers) worker.join();
+    for (size_t load_index = 0; load_index < load_slots.size(); ++load_index) {
+      const size_t slot = load_slots[load_index];
+      if (artifact_load_plan.slot_use_counts[slot] > 1) {
+        cached_artifact_loads[slot] = std::move(loaded_artifacts[load_index]);
+        artifact_by_slot[slot] = cached_artifact_loads[slot].get();
+      } else {
+        artifact_by_slot[slot] = loaded_artifacts[load_index].get();
+      }
+    }
     timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
     for (size_t local = 0; local < candidate_count; ++local) {
       const size_t index = first + local;
       const MotorSampleRequest& item = request.items[index].request;
-      responses[index].status = candidate_status[local];
+      MotorBatchArtifactLoad* load = artifact_by_slot[
+          artifact_load_plan.item_slots[index]];
+      responses[index].status = load == nullptr ? Status::kInternalError : load->status;
       if (responses[index].status != Status::kOk)
         continue;
-      GpuFemmMeshArtifact& artifact = candidate_artifacts[local];
-      const std::string& fingerprint = candidate_fingerprints[local];
+      if (load->artifact_sha256 != item.mesh_artifact_sha256
+          || !RequestMatchesArtifact(item, load->artifact)) {
+        responses[index].status = Status::kInvalidArgument;
+        continue;
+      }
+      const GpuFemmMeshArtifact& artifact = load->artifact;
+      const std::string& fingerprint = load->fingerprint;
       if (cached_fingerprint.empty()) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
         responses[index].status = cached_solver.Initialize(artifact.model);
@@ -4740,7 +4844,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       }
       chunk_slots.push_back(index);
       chunk_currents.push_back(item.circuit_currents_a);
-      chunk_artifacts.push_back(std::move(artifact));
+      chunk_artifacts.push_back(&artifact);
     }
     if (!chunk_slots.empty()) {
       actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(chunk_slots.size()));
@@ -4769,7 +4873,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       for (double angle : item.airgap_angles_deg)
         post_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
         const ProfileClock::time_point postprocess_start = ProfileClock::now();
-        FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(chunk_artifacts[local].model, solution, post_options);
+        FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(chunk_artifacts[local]->model, solution, post_options);
       timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
       responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
           postprocess.status == Status::kOk ? &postprocess : nullptr);
@@ -5164,6 +5268,9 @@ int SelfTest()
     std::string bad_hash_request = selftest_motor_request;
     const size_t hash_at = bad_hash_request.find(artifact_sha);
     if (hash_at != std::string::npos) bad_hash_request.replace(hash_at, artifact_sha.size(), std::string(64, '0'));
+    const size_t bad_path_at = bad_hash_request.find(batch_artifact_path);
+    if (bad_path_at != std::string::npos)
+      bad_hash_request.replace(bad_path_at, batch_artifact_path.size(), "./" + batch_artifact_path);
     std::ofstream mixed_request_output(mixed_request_path, std::ios::trunc);
     mixed_request_output << "{\"protocol\":\"gpu_femm_motor_batch_v1\",\"max_items_per_chunk\":4,\"items\":["
                          << "{\"task_id\":\"good_one\",\"request\":" << selftest_motor_request << "},"
@@ -5171,6 +5278,23 @@ int SelfTest()
                          << "{\"task_id\":\"good_two\",\"request\":" << selftest_motor_request << "},"
                          << "{\"task_id\":\"good_three\",\"request\":" << selftest_motor_request << "}]}";
   }
+  MotorSampleRequest selftest_batch_request;
+  MotorBatchRequest alias_batch_request;
+  const bool selftest_batch_request_valid = ReadMotorSampleRequestJson(
+      selftest_motor_request, &selftest_batch_request, &parser_error);
+  if (selftest_batch_request_valid) {
+    MotorSampleRequest dot_alias_request = selftest_batch_request;
+    dot_alias_request.mesh_artifact_path = "./" + batch_artifact_path;
+    alias_batch_request.items.push_back({ "canonical_first", selftest_batch_request });
+    alias_batch_request.items.push_back({ "canonical_alias", dot_alias_request });
+  }
+  const MotorBatchArtifactLoadPlan alias_load_plan =
+      MakeMotorBatchArtifactLoadPlan(alias_batch_request);
+  expect(selftest_batch_request_valid && alias_load_plan.canonical_paths.size() == 1
+          && alias_load_plan.item_slots.size() == 2
+          && alias_load_plan.item_slots[0] == alias_load_plan.item_slots[1]
+          && alias_load_plan.slot_use_counts[0] == 2,
+      "motor batch deduplicates canonical artifact-path aliases before SHA and parse");
   const int single_adapter_status = MotorSingleSampleAdapter(batch_single_request_path, batch_single_response_path);
   const int batch_adapter_status = MotorBatchAdapter(batch_request_path, batch_response_path, true);
   const int batch_default_adapter_status = MotorBatchAdapter(batch_request_path, batch_default_response_path);
