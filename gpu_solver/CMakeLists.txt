@@ -12,6 +12,12 @@ add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
 )
 target_link_libraries(gpu_linear_p1_poc PRIVATE Threads::Threads)
+# This target uses CUDA cooperative groups.  The existing FEMM-derived source
+# relies on the legacy MSVC preprocessor's token handling, so acknowledge the
+# CUDA header warning without changing the compiler mode for legacy code.
+target_compile_definitions(gpu_linear_p1_poc PRIVATE
+  CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+)
 
 add_executable(gpu_bh_curve_poc
   src/bh_curve_poc.cu

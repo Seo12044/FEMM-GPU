@@ -2,6 +2,7 @@
 #pragma warning(disable : 4819)
 #endif
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -21,7 +22,15 @@
 #include <utility>
 #include <vector>
 
+// Legacy CUDA/MSVC compatibility headers reserve these otherwise ordinary
+// FEMM local-variable names.  They are not used as macros in this source.
+#undef element
+#undef near
+#undef far
+
 namespace gpu_femm {
+
+namespace cg = cooperative_groups;
 
 using ProfileClock = std::chrono::steady_clock;
 
@@ -178,10 +187,39 @@ Status CopyToHost(void* destination, const void* source, size_t bytes)
       : Status::kInternalError;
 }
 
+// Keep the original diagonal on device for the kernel's established
+// finite/positive validation.  This auxiliary buffer only removes repeated
+// Jacobi divisions when every reciprocal is representable as a normal finite
+// value; unusual diagonals retain the original division path.
+bool BuildJacobiInverseDiagonal(const std::vector<double>& diagonal,
+    std::vector<double>* inverse_diagonal)
+{
+  if (inverse_diagonal == nullptr) return false;
+  inverse_diagonal->resize(diagonal.size());
+  bool usable = true;
+  for (size_t index = 0; index < diagonal.size(); ++index) {
+    const double value = diagonal[index];
+    if (!std::isfinite(value) || !(value > 0.0)) {
+      (*inverse_diagonal)[index] = 0.0;
+      usable = false;
+      continue;
+    }
+    const double inverse = 1.0 / value;
+    if (!std::isnormal(inverse)) {
+      (*inverse_diagonal)[index] = 0.0;
+      usable = false;
+      continue;
+    }
+    (*inverse_diagonal)[index] = inverse;
+  }
+  return usable;
+}
+
 // One fixed block keeps every CSR-row ownership fixed from solve to solve.
 // Row/vector work and scalar reductions are parallel.  The fixed tree avoids
 // atomics and keeps one deterministic reduction order for every batch width.
 constexpr int kPcgBlockThreads = 512;
+constexpr int kPcgCooperativeShardsPerItem = 8;
 
 // Every lane owns the same strided index sequence for every batch width.  The
 // fixed pairwise tree is deterministic; its warp tail preserves the same
@@ -224,9 +262,11 @@ __device__ double DeterministicBlockMax(double local, double* scratch)
   return scratch[0];
 }
 
+template <bool kUseInverseDiagonal>
 __global__ void DeterministicPcgKernel(
     int n, const int32_t* row_offsets, const int32_t* column_indices,
-    const double* values, const double* diagonal, const double* rhs, double* x,
+    const double* values, const double* diagonal, const double* inverse_diagonal,
+    const double* rhs, double* x,
     double* residual, double* direction, double* preconditioned,
     double* matrix_direction, double relative_tolerance, int max_iterations,
     SolveInfo* info, int values_per_item)
@@ -237,6 +277,7 @@ __global__ void DeterministicPcgKernel(
   const int item = blockIdx.x;
   values += static_cast<size_t>(item) * values_per_item;
   diagonal += static_cast<size_t>(item) * n;
+  inverse_diagonal += static_cast<size_t>(item) * n;
   rhs += static_cast<size_t>(item) * n;
   x += static_cast<size_t>(item) * n;
   residual += static_cast<size_t>(item) * n;
@@ -304,7 +345,10 @@ __global__ void DeterministicPcgKernel(
 
   for (int i = lane; i < n; i += kPcgBlockThreads) {
     residual[i] = rhs[i] / rhs_scale;
-    preconditioned[i] = residual[i] / diagonal[i];
+    if constexpr (kUseInverseDiagonal)
+      preconditioned[i] = residual[i] * inverse_diagonal[i];
+    else
+      preconditioned[i] = residual[i] / diagonal[i];
     direction[i] = preconditioned[i];
   }
   __syncthreads();
@@ -445,7 +489,10 @@ __global__ void DeterministicPcgKernel(
         return;
       }
       for (int i = lane; i < n; i += kPcgBlockThreads) {
-        preconditioned[i] = residual[i] / diagonal[i];
+        if constexpr (kUseInverseDiagonal)
+          preconditioned[i] = residual[i] * inverse_diagonal[i];
+        else
+          preconditioned[i] = residual[i] / diagonal[i];
         direction[i] = preconditioned[i];
       }
       __syncthreads();
@@ -471,7 +518,10 @@ __global__ void DeterministicPcgKernel(
     }
 
     for (int i = lane; i < n; i += kPcgBlockThreads) {
-      preconditioned[i] = residual[i] / diagonal[i];
+      if constexpr (kUseInverseDiagonal)
+        preconditioned[i] = residual[i] * inverse_diagonal[i];
+      else
+        preconditioned[i] = residual[i] / diagonal[i];
     }
     __syncthreads();
     double preconditioned_local = 0.0;
@@ -540,6 +590,390 @@ __global__ void DeterministicPcgKernel(
         info->status = Status::kLinearSolveNotConverged;
       }
     }
+  }
+}
+
+// The regular PCG kernel deliberately keeps a one-block-per-item mapping for
+// large batches.  Small batches underfill this GPU, so this cooperative path
+// partitions one item into a fixed number of shards.  It is launched only
+// when every block is known to be resident; every grid-wide synchronization is
+// therefore a cooperative-groups barrier, never an unsafe software barrier.
+__device__ double CooperativeItemSum(double local, double* reduction_scratch,
+    double* partials, double* scalars, int item, int shard, int shard_count,
+    int scalar_slot, cg::grid_group grid)
+{
+  const double block_sum = DeterministicBlockSum(local, reduction_scratch);
+  if (threadIdx.x == 0)
+    partials[static_cast<size_t>(item) * shard_count + shard] =
+        block_sum;
+  grid.sync();
+  if (shard == 0 && threadIdx.x == 0) {
+    double sum = 0.0;
+    const size_t first = static_cast<size_t>(item) * shard_count;
+    for (int other = 0; other < shard_count; ++other)
+      sum += partials[first + other];
+    scalars[static_cast<size_t>(item) * 3 + scalar_slot] = sum;
+  }
+  grid.sync();
+  return scalars[static_cast<size_t>(item) * 3 + scalar_slot];
+}
+
+__device__ double CooperativeItemMax(double local, double* reduction_scratch,
+    double* partials, double* scalars, int item, int shard, int shard_count,
+    int scalar_slot, cg::grid_group grid)
+{
+  const double block_max = DeterministicBlockMax(local, reduction_scratch);
+  if (threadIdx.x == 0)
+    partials[static_cast<size_t>(item) * shard_count + shard] =
+        block_max;
+  grid.sync();
+  if (shard == 0 && threadIdx.x == 0) {
+    double maximum = 0.0;
+    const size_t first = static_cast<size_t>(item) * shard_count;
+    for (int other = 0; other < shard_count; ++other)
+      maximum = fmax(maximum, partials[first + other]);
+    scalars[static_cast<size_t>(item) * 3 + scalar_slot] = maximum;
+  }
+  grid.sync();
+  return scalars[static_cast<size_t>(item) * 3 + scalar_slot];
+}
+
+template <bool kUseInverseDiagonal>
+__global__ void CooperativeDeterministicPcgKernel(
+    int n, const int32_t* row_offsets, const int32_t* column_indices,
+    const double* values, const double* diagonal, const double* inverse_diagonal,
+    const double* rhs, double* x, double* residual, double* direction,
+    double* preconditioned, double* matrix_direction, double relative_tolerance,
+    int max_iterations, SolveInfo* info, int values_per_item, int item_count,
+    int shards_per_item, double* partials, double* scalars, int* controls)
+{
+  cg::grid_group grid = cg::this_grid();
+  const int block = static_cast<int>(blockIdx.x);
+  const int item = block / shards_per_item;
+  const int shard = block % shards_per_item;
+  const int lane = threadIdx.x;
+  const int begin = static_cast<int>(static_cast<int64_t>(n) * shard / shards_per_item);
+  const int end = static_cast<int>(static_cast<int64_t>(n) * (shard + 1) / shards_per_item);
+  constexpr int kActive = 0;
+  constexpr int kThreshold = 1;
+  constexpr int kRestart = 2;
+  constexpr int kVerified = 3;
+  int* item_controls = controls + static_cast<size_t>(item) * 4;
+  const int global_any_index = 4 * item_count;
+  values += static_cast<size_t>(item) * values_per_item;
+  diagonal += static_cast<size_t>(item) * n;
+  inverse_diagonal += static_cast<size_t>(item) * n;
+  rhs += static_cast<size_t>(item) * n;
+  x += static_cast<size_t>(item) * n;
+  residual += static_cast<size_t>(item) * n;
+  direction += static_cast<size_t>(item) * n;
+  preconditioned += static_cast<size_t>(item) * n;
+  matrix_direction += static_cast<size_t>(item) * n;
+  info += item;
+
+  __shared__ double reduction_scratch[kPcgBlockThreads];
+  if (shard == 0 && lane == 0) {
+    info->status = Status::kInternalError;
+    info->iterations = 0;
+    info->residual_l2 = INFINITY;
+    item_controls[kActive] = n > 0 && max_iterations >= 0
+            && relative_tolerance > 0.0 && relative_tolerance < 1.0
+            && isfinite(relative_tolerance) ? 1 : 0;
+    item_controls[kThreshold] = 0;
+    item_controls[kRestart] = 0;
+    item_controls[kVerified] = 0;
+    if (!item_controls[kActive]) info->status = Status::kInvalidArgument;
+  }
+  grid.sync();
+  // Preserve the established diagonal validation before using an optional
+  // reciprocal buffer.  One leader performs this only once per item.
+  if (item_controls[kActive] && shard == 0 && lane == 0) {
+    for (int i = 0; i < n; ++i) {
+      if (!isfinite(rhs[i]) || !isfinite(diagonal[i])) {
+        info->status = Status::kNumericalNonfinite;
+        item_controls[kActive] = 0;
+        break;
+      }
+      if (!(diagonal[i] > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        item_controls[kActive] = 0;
+        break;
+      }
+    }
+  }
+  grid.sync();
+
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+      x[i] = 0.0;
+  }
+  grid.sync();
+  double local_max = 0.0;
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+      local_max = fmax(local_max, fabs(rhs[i]));
+  }
+  const double rhs_scale = CooperativeItemMax(local_max, reduction_scratch,
+      partials, scalars, item, shard, shards_per_item, 0, grid);
+  if (item_controls[kActive] && shard == 0 && lane == 0) {
+    if (rhs_scale == 0.0) {
+      info->residual_l2 = 0.0;
+      info->status = Status::kOk;
+      item_controls[kActive] = 0;
+    }
+  }
+  grid.sync();
+
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
+      residual[i] = rhs[i] / rhs_scale;
+      if constexpr (kUseInverseDiagonal)
+        preconditioned[i] = residual[i] * inverse_diagonal[i];
+      else
+        preconditioned[i] = residual[i] / diagonal[i];
+      direction[i] = preconditioned[i];
+    }
+  }
+  grid.sync();
+  double initial_residual_local = 0.0;
+  double initial_rho_local = 0.0;
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
+      initial_residual_local += residual[i] * residual[i];
+      initial_rho_local += residual[i] * preconditioned[i];
+    }
+  }
+  const double initial_residual_sq = CooperativeItemSum(initial_residual_local,
+      reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
+  const double initial_rho = CooperativeItemSum(initial_rho_local, reduction_scratch,
+      partials, scalars, item, shard, shards_per_item, 1, grid);
+  if (item_controls[kActive] && shard == 0 && lane == 0) {
+    if (!isfinite(initial_residual_sq) || !isfinite(initial_rho)) {
+      info->status = Status::kNumericalNonfinite;
+      item_controls[kActive] = 0;
+    } else {
+      info->residual_l2 = sqrt(initial_residual_sq);
+    }
+  }
+  grid.sync();
+  const double rhs_norm = sqrt(initial_residual_sq);
+  const double threshold = relative_tolerance * rhs_norm;
+
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    // A cooperative grid may only break on a decision observed by every
+    // block.  Without this scan, an all-converged batch would keep executing
+    // grid barriers through max_iterations.
+    if (block == 0 && lane == 0) {
+      int any_active = 0;
+      for (int other = 0; other < item_count; ++other)
+        any_active |= controls[4 * other + kActive];
+      controls[global_any_index] = any_active;
+    }
+    grid.sync();
+    if (!controls[global_any_index]) break;
+    if (item_controls[kActive]) {
+      for (int row = begin + lane; row < end; row += kPcgBlockThreads) {
+        double sum = 0.0;
+        for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
+          sum += values[entry] * direction[column_indices[entry]];
+        matrix_direction[row] = sum;
+      }
+    }
+    grid.sync();
+    double direction_matrix_local = 0.0;
+    if (item_controls[kActive]) {
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+        direction_matrix_local += direction[i] * matrix_direction[i];
+    }
+    const double direction_matrix_sum = CooperativeItemSum(direction_matrix_local,
+        reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
+    if (item_controls[kActive] && shard == 0 && lane == 0) {
+      const double rho = scalars[static_cast<size_t>(item) * 3 + 1];
+      if (!isfinite(direction_matrix_sum) || !isfinite(rho)) {
+        info->status = Status::kNumericalNonfinite;
+        item_controls[kActive] = 0;
+      } else if (!(direction_matrix_sum > 0.0) || !(rho > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        item_controls[kActive] = 0;
+      }
+    }
+    grid.sync();
+    if (item_controls[kActive]) {
+      const double alpha = scalars[static_cast<size_t>(item) * 3 + 1]
+          / direction_matrix_sum;
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
+        x[i] += alpha * direction[i];
+        residual[i] -= alpha * matrix_direction[i];
+      }
+    }
+    grid.sync();
+    double residual_local = 0.0;
+    if (item_controls[kActive]) {
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+        residual_local += residual[i] * residual[i];
+    }
+    const double residual_sum = CooperativeItemSum(residual_local, reduction_scratch,
+        partials, scalars, item, shard, shards_per_item, 2, grid);
+    if (item_controls[kActive] && shard == 0 && lane == 0) {
+      info->iterations = iteration + 1;
+      if (!isfinite(residual_sum)) {
+        info->status = Status::kNumericalNonfinite;
+        item_controls[kActive] = 0;
+      } else {
+        info->residual_l2 = sqrt(residual_sum);
+        if (!isfinite(info->residual_l2)) {
+          info->status = Status::kNumericalNonfinite;
+          item_controls[kActive] = 0;
+        } else {
+          item_controls[kThreshold] = info->residual_l2 <= threshold ? 1 : 0;
+        }
+      }
+    }
+    grid.sync();
+    if (block == 0 && lane == 0) {
+      int any_threshold = 0;
+      for (int other = 0; other < item_count; ++other)
+        any_threshold |= controls[4 * other + kThreshold];
+      controls[global_any_index] = any_threshold;
+    }
+    grid.sync();
+    if (controls[global_any_index]) {
+      if (item_controls[kActive] && item_controls[kThreshold]) {
+        for (int row = begin + lane; row < end; row += kPcgBlockThreads) {
+          double matrix_solution = 0.0;
+          for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
+            matrix_solution += values[entry] * x[column_indices[entry]];
+          residual[row] = rhs[row] / rhs_scale - matrix_solution;
+        }
+      }
+      grid.sync();
+      double true_residual_local = 0.0;
+      if (item_controls[kActive] && item_controls[kThreshold]) {
+        for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+          true_residual_local += residual[i] * residual[i];
+      }
+      const double true_residual_sum = CooperativeItemSum(true_residual_local,
+          reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
+      if (item_controls[kActive] && item_controls[kThreshold] && shard == 0 && lane == 0) {
+        if (!isfinite(true_residual_sum)) {
+          info->status = Status::kNumericalNonfinite;
+          item_controls[kActive] = 0;
+        } else {
+          info->residual_l2 = sqrt(true_residual_sum);
+          item_controls[kVerified] = info->residual_l2 <= threshold ? 1 : 0;
+          item_controls[kRestart] = item_controls[kVerified] ? 0 : 1;
+        }
+      }
+      grid.sync();
+      if (item_controls[kActive] && item_controls[kVerified]) {
+        for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+          x[i] *= rhs_scale;
+      }
+      grid.sync();
+      double nonfinite_local = 0.0;
+      if (item_controls[kActive] && item_controls[kVerified]) {
+        for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+          nonfinite_local = fmax(nonfinite_local, isfinite(x[i]) ? 0.0 : 1.0);
+      }
+      const double nonfinite = CooperativeItemMax(nonfinite_local, reduction_scratch,
+          partials, scalars, item, shard, shards_per_item, 2, grid);
+      if (item_controls[kActive] && item_controls[kVerified] && shard == 0 && lane == 0) {
+        if (nonfinite != 0.0) {
+          info->status = Status::kNumericalNonfinite;
+        } else {
+          info->residual_l2 *= rhs_scale;
+          info->status = isfinite(info->residual_l2) ? Status::kOk : Status::kNumericalNonfinite;
+        }
+        item_controls[kActive] = 0;
+      }
+      grid.sync();
+    }
+
+    if (item_controls[kActive]) {
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
+        if constexpr (kUseInverseDiagonal)
+          preconditioned[i] = residual[i] * inverse_diagonal[i];
+        else
+          preconditioned[i] = residual[i] / diagonal[i];
+        if (item_controls[kRestart]) direction[i] = preconditioned[i];
+      }
+    }
+    grid.sync();
+    double preconditioned_local = 0.0;
+    if (item_controls[kActive]) {
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+        preconditioned_local += residual[i] * preconditioned[i];
+    }
+    const double new_rho = CooperativeItemSum(preconditioned_local, reduction_scratch,
+        partials, scalars, item, shard, shards_per_item, 2, grid);
+    if (item_controls[kActive] && shard == 0 && lane == 0) {
+      const double old_rho = scalars[static_cast<size_t>(item) * 3 + 1];
+      if (!isfinite(new_rho) || !(new_rho > 0.0)) {
+        info->status = Status::kLinearSolveBreakdown;
+        item_controls[kActive] = 0;
+      } else {
+        if (!item_controls[kRestart])
+          scalars[static_cast<size_t>(item) * 3 + 2] = new_rho / old_rho;
+        scalars[static_cast<size_t>(item) * 3 + 1] = new_rho;
+      }
+    }
+    grid.sync();
+    if (item_controls[kActive] && !item_controls[kRestart]) {
+      const double beta = scalars[static_cast<size_t>(item) * 3 + 2];
+      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+        direction[i] = preconditioned[i] + beta * direction[i];
+    }
+    grid.sync();
+    if (shard == 0 && lane == 0) {
+      item_controls[kThreshold] = 0;
+      item_controls[kRestart] = 0;
+      item_controls[kVerified] = 0;
+    }
+    grid.sync();
+  }
+
+  if (item_controls[kActive]) {
+    for (int row = begin + lane; row < end; row += kPcgBlockThreads) {
+      double matrix_solution = 0.0;
+      for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
+        matrix_solution += values[entry] * x[column_indices[entry]];
+      residual[row] = rhs[row] / rhs_scale - matrix_solution;
+    }
+  }
+  grid.sync();
+  double final_residual_local = 0.0;
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+      final_residual_local += residual[i] * residual[i];
+  }
+  const double final_residual_sum = CooperativeItemSum(final_residual_local,
+      reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
+  if (item_controls[kActive] && shard == 0 && lane == 0 && !isfinite(final_residual_sum)) {
+    info->status = Status::kNumericalNonfinite;
+    item_controls[kActive] = 0;
+  }
+  grid.sync();
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+      x[i] *= rhs_scale;
+  }
+  grid.sync();
+  double final_nonfinite_local = 0.0;
+  if (item_controls[kActive]) {
+    for (int i = begin + lane; i < end; i += kPcgBlockThreads)
+      final_nonfinite_local = fmax(final_nonfinite_local, isfinite(x[i]) ? 0.0 : 1.0);
+  }
+  const double final_nonfinite = CooperativeItemMax(final_nonfinite_local,
+      reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
+  if (item_controls[kActive] && shard == 0 && lane == 0) {
+    if (final_nonfinite != 0.0) {
+      info->status = Status::kNumericalNonfinite;
+    } else {
+      info->residual_l2 = sqrt(final_residual_sum) * rhs_scale;
+      info->status = isfinite(info->residual_l2)
+          ? Status::kLinearSolveNotConverged : Status::kNumericalNonfinite;
+    }
+    item_controls[kActive] = 0;
   }
 }
 
@@ -810,8 +1244,11 @@ class GpuCsrSolver {
         return Status::kInvalidArgument;
       }
     }
+    std::vector<double> inverse_diagonal;
+    inverse_diagonal_usable_ = BuildJacobiInverseDiagonal(
+        assembly.diagonal, &inverse_diagonal);
     Status status = Status::kOk;
-    if ((status = row_offsets_.allocate(assembly.row_offsets.size())) != Status::kOk || (status = column_indices_.allocate(assembly.column_indices.size())) != Status::kOk || (status = values_.allocate(assembly.values.size())) != Status::kOk || (status = diagonal_.allocate(assembly.diagonal.size())) != Status::kOk || (status = rhs_.allocate(n_)) != Status::kOk || (status = solution_.allocate(n_)) != Status::kOk || (status = residual_.allocate(n_)) != Status::kOk || (status = direction_.allocate(n_)) != Status::kOk || (status = preconditioned_.allocate(n_)) != Status::kOk || (status = matrix_direction_.allocate(n_)) != Status::kOk || (status = info_.allocate(1)) != Status::kOk) {
+    if ((status = row_offsets_.allocate(assembly.row_offsets.size())) != Status::kOk || (status = column_indices_.allocate(assembly.column_indices.size())) != Status::kOk || (status = values_.allocate(assembly.values.size())) != Status::kOk || (status = diagonal_.allocate(assembly.diagonal.size())) != Status::kOk || (status = inverse_diagonal_.allocate(assembly.diagonal.size())) != Status::kOk || (status = rhs_.allocate(n_)) != Status::kOk || (status = solution_.allocate(n_)) != Status::kOk || (status = residual_.allocate(n_)) != Status::kOk || (status = direction_.allocate(n_)) != Status::kOk || (status = preconditioned_.allocate(n_)) != Status::kOk || (status = matrix_direction_.allocate(n_)) != Status::kOk || (status = info_.allocate(1)) != Status::kOk) {
       return status;
     }
     if ((status = CopyToDevice(row_offsets_.get(), assembly.row_offsets.data(),
@@ -825,6 +1262,9 @@ class GpuCsrSolver {
             != Status::kOk
         || (status = CopyToDevice(diagonal_.get(), assembly.diagonal.data(),
                 assembly.diagonal.size() * sizeof(double)))
+            != Status::kOk
+        || (status = CopyToDevice(inverse_diagonal_.get(), inverse_diagonal.data(),
+                inverse_diagonal.size() * sizeof(double)))
             != Status::kOk) {
       return status;
     }
@@ -847,9 +1287,15 @@ class GpuCsrSolver {
         || assembly.diagonal.size() != static_cast<size_t>(n_)) return Status::kInvalidArgument;
     for (double value : assembly.values) if (!std::isfinite(value)) return Status::kInvalidArgument;
     for (double value : assembly.diagonal) if (!std::isfinite(value)) return Status::kInvalidArgument;
+    std::vector<double> inverse_diagonal;
+    inverse_diagonal_usable_ = BuildJacobiInverseDiagonal(
+        assembly.diagonal, &inverse_diagonal);
     Status status = CopyToDevice(values_.get(), assembly.values.data(), assembly.values.size() * sizeof(double));
     if (status != Status::kOk) return status;
-    return CopyToDevice(diagonal_.get(), assembly.diagonal.data(), assembly.diagonal.size() * sizeof(double));
+    if ((status = CopyToDevice(diagonal_.get(), assembly.diagonal.data(),
+             assembly.diagonal.size() * sizeof(double))) != Status::kOk) return status;
+    return CopyToDevice(inverse_diagonal_.get(), inverse_diagonal.data(),
+        inverse_diagonal.size() * sizeof(double));
   }
 
   SolveInfo Solve(const std::vector<double>& rhs, double relative_tolerance,
@@ -864,11 +1310,19 @@ class GpuCsrSolver {
       result.status = copy_status;
       return result;
     }
-    DeterministicPcgKernel<<<1, kPcgBlockThreads>>>(
-        n_, row_offsets_.get(), column_indices_.get(), values_.get(), diagonal_.get(),
-        rhs_.get(), solution_.get(), residual_.get(), direction_.get(),
-        preconditioned_.get(), matrix_direction_.get(), relative_tolerance,
-        max_iterations, info_.get(), static_cast<int>(host_column_indices_.size()));
+    if (inverse_diagonal_usable_) {
+      DeterministicPcgKernel<true><<<1, kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), values_.get(), diagonal_.get(),
+          inverse_diagonal_.get(), rhs_.get(), solution_.get(), residual_.get(), direction_.get(),
+          preconditioned_.get(), matrix_direction_.get(), relative_tolerance,
+          max_iterations, info_.get(), static_cast<int>(host_column_indices_.size()));
+    } else {
+      DeterministicPcgKernel<false><<<1, kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), values_.get(), diagonal_.get(),
+          inverse_diagonal_.get(), rhs_.get(), solution_.get(), residual_.get(), direction_.get(),
+          preconditioned_.get(), matrix_direction_.get(), relative_tolerance,
+          max_iterations, info_.get(), static_cast<int>(host_column_indices_.size()));
+    }
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
       result.status = Status::kInternalError;
       return result;
@@ -903,30 +1357,57 @@ class GpuCsrSolver {
       Status status = Status::kOk;
       if ((status = batch_values_.allocate(count * nnz)) != Status::kOk
           || (status = batch_diagonal_.allocate(count * n_)) != Status::kOk
+          || (status = batch_inverse_diagonal_.allocate(count * n_)) != Status::kOk
           || (status = batch_rhs_.allocate(count * n_)) != Status::kOk
           || (status = batch_solution_.allocate(count * n_)) != Status::kOk
           || (status = batch_residual_.allocate(count * n_)) != Status::kOk
           || (status = batch_direction_.allocate(count * n_)) != Status::kOk
           || (status = batch_preconditioned_.allocate(count * n_)) != Status::kOk
           || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
-          || (status = batch_info_.allocate(count)) != Status::kOk) return status;
+          || (status = batch_info_.allocate(count)) != Status::kOk
+          || (status = batch_cooperative_partials_.allocate(
+                  count * kPcgCooperativeShardsPerItem)) != Status::kOk
+          || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
+          || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk) return status;
       batch_capacity_ = count;
     }
+    std::vector<double> inverse_diagonal;
+    bool batch_inverse_diagonal_usable = true;
     for (size_t item = 0; item < count; ++item) {
+      batch_inverse_diagonal_usable = BuildJacobiInverseDiagonal(
+          assemblies[item].diagonal, &inverse_diagonal) && batch_inverse_diagonal_usable;
       Status status = CopyToDevice(batch_values_.get() + item * nnz, assemblies[item].values.data(), nnz * sizeof(double));
       if (status != Status::kOk) return status;
       if ((status = CopyToDevice(batch_diagonal_.get() + item * n_, assemblies[item].diagonal.data(), n_ * sizeof(double))) != Status::kOk
+          || (status = CopyToDevice(batch_inverse_diagonal_.get() + item * n_, inverse_diagonal.data(), n_ * sizeof(double))) != Status::kOk
           || (status = CopyToDevice(batch_rhs_.get() + item * n_, rhs_values[item].data(), n_ * sizeof(double))) != Status::kOk) return status;
     }
     if (timing != nullptr) timing->upload_seconds += ProfileSecondsSince(upload_start);
     const ProfileClock::time_point kernel_start = ProfileClock::now();
-    DeterministicPcgKernel<<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
-        n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
-        batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(), batch_direction_.get(),
-        batch_preconditioned_.get(), batch_matrix_direction_.get(), relative_tolerance,
-        max_iterations, batch_info_.get(), static_cast<int>(nnz));
+    const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
+        count, nnz, relative_tolerance, max_iterations, batch_inverse_diagonal_usable);
+    if (cooperative_result == CooperativeLaunchResult::kFailed)
+      return Status::kInternalError;
+    const bool launched_cooperatively =
+        cooperative_result == CooperativeLaunchResult::kCompleted;
+    if (!launched_cooperatively && batch_inverse_diagonal_usable) {
+      DeterministicPcgKernel<true><<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
+          batch_inverse_diagonal_.get(), batch_rhs_.get(), batch_solution_.get(),
+          batch_residual_.get(), batch_direction_.get(), batch_preconditioned_.get(),
+          batch_matrix_direction_.get(), relative_tolerance, max_iterations, batch_info_.get(),
+          static_cast<int>(nnz));
+    } else if (!launched_cooperatively) {
+      DeterministicPcgKernel<false><<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
+          batch_inverse_diagonal_.get(), batch_rhs_.get(), batch_solution_.get(),
+          batch_residual_.get(), batch_direction_.get(), batch_preconditioned_.get(),
+          batch_matrix_direction_.get(), relative_tolerance, max_iterations, batch_info_.get(),
+          static_cast<int>(nnz));
+    }
     if (launches != nullptr) ++*launches;
-    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return Status::kInternalError;
+    if (!launched_cooperatively
+        && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) return Status::kInternalError;
     if (timing != nullptr) timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
     const ProfileClock::time_point download_start = ProfileClock::now();
     infos->assign(count, SolveInfo {}); solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
@@ -940,6 +1421,81 @@ class GpuCsrSolver {
   }
 
   private:
+  enum class CooperativeLaunchResult { kNotSupported, kCompleted, kFailed };
+
+  CooperativeLaunchResult TryLaunchCooperativeBatch(
+      size_t count, size_t nnz, double relative_tolerance,
+      int max_iterations, bool use_inverse_diagonal)
+  {
+    // The B=32 path already occupies almost every SM on the target GPU.  This
+    // path is deliberately limited to small batches where eight shards/item
+    // can fit resident at once and increase row-level parallelism.
+    // Keep the tiny fixture/exact-bit-parity path on the established kernel;
+    // the cooperative launch overhead cannot pay back below a real motor mesh.
+    if (count == 0 || count > 4 || n_ < 4096)
+      return CooperativeLaunchResult::kNotSupported;
+    int device = 0;
+    int cooperative_supported = 0;
+    cudaDeviceProp properties {};
+    if (cudaGetDevice(&device) != cudaSuccess
+        || cudaDeviceGetAttribute(&cooperative_supported, cudaDevAttrCooperativeLaunch,
+               device) != cudaSuccess
+        || cooperative_supported == 0
+        || cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+      cudaGetLastError();
+      return CooperativeLaunchResult::kNotSupported;
+    }
+    int active_blocks_per_sm = 0;
+    const cudaError_t occupancy_status = use_inverse_diagonal
+        ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm,
+              CooperativeDeterministicPcgKernel<true>, kPcgBlockThreads, 0)
+        : cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm,
+              CooperativeDeterministicPcgKernel<false>, kPcgBlockThreads, 0);
+    const size_t required_blocks = count * kPcgCooperativeShardsPerItem;
+    if (occupancy_status != cudaSuccess || active_blocks_per_sm <= 0
+        || required_blocks > static_cast<size_t>(active_blocks_per_sm)
+                * static_cast<size_t>(properties.multiProcessorCount)) {
+      cudaGetLastError();
+      return CooperativeLaunchResult::kNotSupported;
+    }
+    int item_count = static_cast<int>(count);
+    int shard_count = kPcgCooperativeShardsPerItem;
+    int values_per_item = static_cast<int>(nnz);
+    const int32_t* row_offsets = row_offsets_.get();
+    const int32_t* column_indices = column_indices_.get();
+    const double* values = batch_values_.get();
+    const double* diagonal = batch_diagonal_.get();
+    const double* inverse_diagonal = batch_inverse_diagonal_.get();
+    const double* rhs = batch_rhs_.get();
+    double* solution = batch_solution_.get();
+    double* residual = batch_residual_.get();
+    double* direction = batch_direction_.get();
+    double* preconditioned = batch_preconditioned_.get();
+    double* matrix_direction = batch_matrix_direction_.get();
+    SolveInfo* info = batch_info_.get();
+    double* partials = batch_cooperative_partials_.get();
+    double* scalars = batch_cooperative_scalars_.get();
+    int* controls = batch_cooperative_controls_.get();
+    void* arguments[] = { &n_, &row_offsets, &column_indices, &values, &diagonal,
+      &inverse_diagonal, &rhs, &solution, &residual, &direction, &preconditioned,
+      &matrix_direction, &relative_tolerance, &max_iterations, &info, &values_per_item,
+      &item_count, &shard_count, &partials, &scalars, &controls };
+    const dim3 grid(static_cast<unsigned int>(required_blocks));
+    const dim3 block(kPcgBlockThreads);
+    const cudaError_t launch_status = use_inverse_diagonal
+        ? cudaLaunchCooperativeKernel(
+              reinterpret_cast<void*>(CooperativeDeterministicPcgKernel<true>),
+              grid, block, arguments)
+        : cudaLaunchCooperativeKernel(
+              reinterpret_cast<void*>(CooperativeDeterministicPcgKernel<false>),
+              grid, block, arguments);
+    if (launch_status != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+      cudaGetLastError();
+      return CooperativeLaunchResult::kFailed;
+    }
+    return CooperativeLaunchResult::kCompleted;
+  }
+
   int n_ = 0;
   bool initialized_ = false;
   std::vector<int32_t> host_row_offsets_;
@@ -947,7 +1503,10 @@ class GpuCsrSolver {
   DeviceBuffer<int32_t> row_offsets_;
   DeviceBuffer<int32_t> column_indices_;
   DeviceBuffer<double> values_;
+  // Original diagonal remains available to the kernel's validation path.
   DeviceBuffer<double> diagonal_;
+  DeviceBuffer<double> inverse_diagonal_;
+  bool inverse_diagonal_usable_ = false;
   DeviceBuffer<double> rhs_;
   DeviceBuffer<double> solution_;
   DeviceBuffer<double> residual_;
@@ -956,8 +1515,10 @@ class GpuCsrSolver {
   DeviceBuffer<double> matrix_direction_;
   DeviceBuffer<SolveInfo> info_;
   size_t batch_capacity_ = 0;
-  DeviceBuffer<double> batch_values_, batch_diagonal_, batch_rhs_, batch_solution_, batch_residual_, batch_direction_, batch_preconditioned_, batch_matrix_direction_;
+  DeviceBuffer<double> batch_values_, batch_diagonal_, batch_inverse_diagonal_, batch_rhs_, batch_solution_, batch_residual_, batch_direction_, batch_preconditioned_, batch_matrix_direction_;
   DeviceBuffer<SolveInfo> batch_info_;
+  DeviceBuffer<double> batch_cooperative_partials_, batch_cooperative_scalars_;
+  DeviceBuffer<int> batch_cooperative_controls_;
 };
 
 class LinearP1FixtureSolver {
@@ -4093,9 +4654,14 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   const bool memory_known = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
   constexpr size_t kMotorBatchSafetyReserveBytes = 512ULL * 1024ULL * 1024ULL;
   constexpr int32_t kMotorBatchMaxParallelWidth = 32;
-  // values plus diagonal/RHS and six PCG state vectors: 8*(nnz + 7*n).
+  // values plus original/inverse diagonal, RHS, and five PCG state vectors.
+  // The inverse is extra workspace; keep the original diagonal for validation.
+  // Reserve the largest small-batch cooperative reduction/control workspace
+  // as well, even though B>4 remains on the regular one-block path.
   const size_t bytes_per_item = values_per_item == 0 || nodes_per_item == 0 ? 0
-      : sizeof(double) * (values_per_item + 7 * nodes_per_item);
+      : sizeof(double) * (values_per_item + 8 * nodes_per_item
+          + kPcgCooperativeShardsPerItem + 3)
+          + sizeof(int) * 5;
   const int32_t vram_limit = memory_known && bytes_per_item > 0
       ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth,
           free_bytes > kMotorBatchSafetyReserveBytes
