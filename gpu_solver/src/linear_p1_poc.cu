@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,13 @@
 #include <vector>
 
 namespace gpu_femm {
+
+using ProfileClock = std::chrono::steady_clock;
+
+double ProfileSecondsSince(const ProfileClock::time_point& start)
+{
+  return std::chrono::duration<double>(ProfileClock::now() - start).count();
+}
 
 enum class Status : int {
   kOk = 0,
@@ -757,6 +765,12 @@ Status Assemble(const Model& model, Assembly* assembly)
   return Status::kOk;
 }
 
+struct GpuBatchSolveTiming {
+  double upload_seconds = 0.0;
+  double kernel_sync_seconds = 0.0;
+  double download_seconds = 0.0;
+};
+
 class GpuCsrSolver {
   public:
   Status Initialize(const Assembly& assembly)
@@ -856,7 +870,8 @@ class GpuCsrSolver {
   Status SolveBatch(const std::vector<Assembly>& assemblies,
       const std::vector<std::vector<double>>& rhs_values, double relative_tolerance,
       int max_iterations, std::vector<SolveInfo>* infos,
-      std::vector<std::vector<double>>* solutions, int* launches)
+      std::vector<std::vector<double>>* solutions, int* launches,
+      GpuBatchSolveTiming* timing = nullptr)
   {
     if (infos == nullptr || solutions == nullptr || assemblies.empty()
         || assemblies.size() != rhs_values.size()) return Status::kInvalidArgument;
@@ -866,6 +881,7 @@ class GpuCsrSolver {
         return Status::kInvalidArgument;
     }
     const size_t nnz = host_column_indices_.size();
+    const ProfileClock::time_point upload_start = ProfileClock::now();
     if (batch_capacity_ < count) {
       Status status = Status::kOk;
       if ((status = batch_values_.allocate(count * nnz)) != Status::kOk
@@ -885,6 +901,8 @@ class GpuCsrSolver {
       if ((status = CopyToDevice(batch_diagonal_.get() + item * n_, assemblies[item].diagonal.data(), n_ * sizeof(double))) != Status::kOk
           || (status = CopyToDevice(batch_rhs_.get() + item * n_, rhs_values[item].data(), n_ * sizeof(double))) != Status::kOk) return status;
     }
+    if (timing != nullptr) timing->upload_seconds += ProfileSecondsSince(upload_start);
+    const ProfileClock::time_point kernel_start = ProfileClock::now();
     DeterministicPcgKernel<<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
         n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
         batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(), batch_direction_.get(),
@@ -892,12 +910,15 @@ class GpuCsrSolver {
         max_iterations, batch_info_.get(), static_cast<int>(nnz));
     if (launches != nullptr) ++*launches;
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return Status::kInternalError;
+    if (timing != nullptr) timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
+    const ProfileClock::time_point download_start = ProfileClock::now();
     infos->assign(count, SolveInfo {}); solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
     for (size_t item = 0; item < count; ++item) {
       Status status = CopyToHost(&(*infos)[item], batch_info_.get() + item, sizeof(SolveInfo));
       if (status != Status::kOk) return status;
       if ((status = CopyToHost((*solutions)[item].data(), batch_solution_.get() + item * n_, n_ * sizeof(double))) != Status::kOk) return status;
     }
+    if (timing != nullptr) timing->download_seconds += ProfileSecondsSince(download_start);
     return Status::kOk;
   }
 
@@ -1463,6 +1484,15 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
       use_newton, assembly);
 }
 
+struct NonlinearBatchTiming {
+  double host_assembly_seconds = 0.0;
+  double gpu_upload_seconds = 0.0;
+  double gpu_kernel_sync_seconds = 0.0;
+  double gpu_download_seconds = 0.0;
+  double state_update_seconds = 0.0;
+  double finalize_seconds = 0.0;
+};
+
 class NonlinearP1FixtureSolver {
   public:
   Status Initialize(NonlinearModel model)
@@ -1590,7 +1620,7 @@ class NonlinearP1FixtureSolver {
   // then dispatched as one CUDA block in a single PCG launch.
   std::vector<NonlinearSolveResult> SolveBatch(
       const std::vector<std::vector<double>>& currents, const NonlinearOptions& options,
-      int* batched_pcg_launches = nullptr)
+      int* batched_pcg_launches = nullptr, NonlinearBatchTiming* timing = nullptr)
   {
     std::vector<NonlinearSolveResult> results(currents.size());
     if (!initialized_ || currents.empty() || !(options.relative_tolerance > 0.0)
@@ -1610,6 +1640,7 @@ class NonlinearP1FixtureSolver {
         states[item][model_.dirichlet_nodes[boundary]] = model_.dirichlet_a_wb_per_m[boundary];
     }
     for (int iteration = 0; iteration < options.max_newton_iterations; ++iteration) {
+      const ProfileClock::time_point assembly_start = ProfileClock::now();
       std::vector<size_t> slots; std::vector<Assembly> assemblies; std::vector<std::vector<double>> rhs_values;
       const bool symbolic_preexisting = csr_initialized_;
       for (size_t item = 0; item < currents.size(); ++item) if (active[item]) {
@@ -1628,17 +1659,26 @@ class NonlinearP1FixtureSolver {
         for (size_t row = 0; row < rhs.size(); ++row) rhs[row] = assembly.rhs_per_amp[row] + assembly.rhs_offset[row];
         slots.push_back(item); assemblies.push_back(std::move(assembly)); rhs_values.push_back(std::move(rhs));
       }
+      if (timing != nullptr) timing->host_assembly_seconds += ProfileSecondsSince(assembly_start);
       if (slots.empty()) break;
       std::vector<SolveInfo> infos; std::vector<std::vector<double>> free_solutions;
+      GpuBatchSolveTiming gpu_timing;
       const Status batch_status = csr_solver_.SolveBatch(assemblies, rhs_values,
           options.linear_relative_tolerance, options.max_linear_iterations, &infos, &free_solutions,
-          batched_pcg_launches);
+          batched_pcg_launches, &gpu_timing);
+      if (timing != nullptr) {
+        timing->gpu_upload_seconds += gpu_timing.upload_seconds;
+        timing->gpu_kernel_sync_seconds += gpu_timing.kernel_sync_seconds;
+        timing->gpu_download_seconds += gpu_timing.download_seconds;
+      }
       if (batch_status != Status::kOk) {
         for (size_t item : slots) { results[item].info.status = batch_status; active[item] = false; }
         break;
       }
       csr_symbolic_reuse_count_ += symbolic_preexisting ? slots.size()
           : (slots.empty() ? 0 : slots.size() - 1);
+      const ProfileClock::time_point update_start = ProfileClock::now();
+      double iteration_finalize_seconds = 0.0;
       for (size_t local = 0; local < slots.size(); ++local) {
         const size_t item = slots[local];
         if (infos[local].status != Status::kOk) { results[item].info = infos[local]; active[item] = false; continue; }
@@ -1663,13 +1703,23 @@ class NonlinearP1FixtureSolver {
           states[item][node] += relaxations[item] * (candidate[node] - states[item][node]);
         if (iteration > 0 && residual < 100.0 * options.relative_tolerance) {
           results[item].info.status = Status::kOk; results[item].a_wb_per_m = std::move(states[item]);
+          const ProfileClock::time_point finalize_start = ProfileClock::now();
           results[item] = FinalizeResult(&results[item]); active[item] = false;
+          iteration_finalize_seconds += ProfileSecondsSince(finalize_start);
         } else previous_residuals[item] = residual;
+      }
+      if (timing != nullptr) {
+        timing->finalize_seconds += iteration_finalize_seconds;
+        timing->state_update_seconds +=
+            std::max(0.0, ProfileSecondsSince(update_start) - iteration_finalize_seconds);
       }
     }
     for (size_t item = 0; item < results.size(); ++item) if (active[item]) {
       results[item].info.status = Status::kNonlinearSolveNotConverged;
-      results[item].a_wb_per_m = std::move(states[item]); results[item] = FinalizeResult(&results[item]);
+      results[item].a_wb_per_m = std::move(states[item]);
+      const ProfileClock::time_point finalize_start = ProfileClock::now();
+      results[item] = FinalizeResult(&results[item]);
+      if (timing != nullptr) timing->finalize_seconds += ProfileSecondsSince(finalize_start);
     }
     return results;
   }
@@ -3846,6 +3896,16 @@ struct MotorBatchResponseDto {
   double residual_l2 = std::numeric_limits<double>::infinity();
 };
 
+struct MotorBatchTiming {
+  double request_read_parse_seconds = 0.0;
+  double preflight_seconds = 0.0;
+  double artifact_read_validate_seconds = 0.0;
+  double solver_initialize_seconds = 0.0;
+  NonlinearBatchTiming nonlinear;
+  double postprocess_seconds = 0.0;
+  double measured_before_response_write_seconds = 0.0;
+};
+
 MotorBatchResponseDto MakeMotorBatchResponseDto(Status status, const MotorSampleRequest& request,
     const NonlinearSolveResult* solution, const FrozenPostprocessResult* postprocess)
 {
@@ -3906,7 +3966,7 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
 bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* request,
     const std::vector<MotorBatchResponseDto>& responses, int32_t requested_chunk,
     int32_t effective_chunk, int32_t cache_hits, int32_t chunk_count, size_t csr_symbolic_cache_hits,
-    int actual_parallel_width, int batched_pcg_launches)
+    int actual_parallel_width, int batched_pcg_launches, const MotorBatchTiming* timing)
 {
   std::ofstream output(path, std::ios::trunc);
   if (!output) return false;
@@ -3922,7 +3982,24 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
          << ", \"effective_chunk_size\": " << effective_chunk
          << ", \"actual_parallel_width\": " << actual_parallel_width
          << ", \"csr_symbolic_cache_hits\": " << csr_symbolic_cache_hits
-         << ", \"batched_pcg_launches\": " << batched_pcg_launches << "},\n  \"items\": [\n";
+         << ", \"batched_pcg_launches\": " << batched_pcg_launches << "},\n";
+  if (timing != nullptr) {
+    output << "  \"timing\": {\"schema_version\": \"gpu_femm_motor_batch_timing_v1\""
+           << ", \"request_read_parse_seconds\": " << timing->request_read_parse_seconds
+           << ", \"preflight_seconds\": " << timing->preflight_seconds
+           << ", \"artifact_read_validate_seconds\": " << timing->artifact_read_validate_seconds
+           << ", \"solver_initialize_seconds\": " << timing->solver_initialize_seconds
+           << ", \"host_assembly_seconds\": " << timing->nonlinear.host_assembly_seconds
+           << ", \"gpu_upload_seconds\": " << timing->nonlinear.gpu_upload_seconds
+           << ", \"gpu_kernel_sync_seconds\": " << timing->nonlinear.gpu_kernel_sync_seconds
+           << ", \"gpu_download_seconds\": " << timing->nonlinear.gpu_download_seconds
+           << ", \"state_update_seconds\": " << timing->nonlinear.state_update_seconds
+           << ", \"finalize_seconds\": " << timing->nonlinear.finalize_seconds
+           << ", \"postprocess_seconds\": " << timing->postprocess_seconds
+           << ", \"measured_before_response_write_seconds\": "
+           << timing->measured_before_response_write_seconds << "},\n";
+  }
+  output << "  \"items\": [\n";
   if (request != nullptr) for (size_t index = 0; index < request->items.size(); ++index) {
     output << "    {\"task_id\": \"" << request->items[index].task_id << "\", \"response\": ";
     WriteMotorBatchItemResponseJson(output, request->items[index].request, responses[index]);
@@ -3932,19 +4009,24 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
   return static_cast<bool>(output);
 }
 
-int MotorBatchAdapter(const std::string& request_path, const std::string& response_path)
+int MotorBatchAdapter(const std::string& request_path, const std::string& response_path,
+    bool include_timing = false)
 {
+  const ProfileClock::time_point total_start = ProfileClock::now();
+  MotorBatchTiming timing;
   std::ifstream input(request_path); std::stringstream bytes; bytes << input.rdbuf();
   MotorBatchRequest request; std::string error;
   if (!input || !ReadMotorBatchRequestJson(bytes.str(), &request, &error)) {
     std::cerr << "FAIL motor batch request: " << error << '\n';
     return 1; // No trusted item identity exists to write a resumable response.
   }
+  timing.request_read_parse_seconds = ProfileSecondsSince(total_start);
   // Derive the batch cap from the real CSR footprint, not a sample-count
   // heuristic.  The preflight is read-only and repeats the normal strict
   // artifact checks before any CUDA allocation.
   size_t values_per_item = 0;
   size_t nodes_per_item = 0;
+  const ProfileClock::time_point preflight_start = ProfileClock::now();
   {
     const MotorSampleRequest& first = request.items.front().request;
     std::ifstream artifact_file(first.mesh_artifact_path, std::ios::binary);
@@ -3963,6 +4045,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       }
     }
   }
+  timing.preflight_seconds = ProfileSecondsSince(preflight_start);
   size_t free_bytes = 0, total_bytes = 0;
   const bool memory_known = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
   constexpr size_t kMotorBatchSafetyReserveBytes = 512ULL * 1024ULL * 1024ULL;
@@ -3990,23 +4073,38 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     std::vector<GpuFemmMeshArtifact> chunk_artifacts;
     std::vector<std::vector<double>> chunk_currents;
     for (size_t index = first; index < end; ++index) {
+      const ProfileClock::time_point artifact_start = ProfileClock::now();
       const MotorSampleRequest& item = request.items[index].request;
       std::ifstream artifact_file(item.mesh_artifact_path, std::ios::binary);
       std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
       GpuFemmMeshArtifact artifact;
-      if (!artifact_file) { responses[index].status = Status::kInputIo; continue; }
+      if (!artifact_file) {
+        responses[index].status = Status::kInputIo;
+        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+        continue;
+      }
       if (Sha256Hex(artifact_bytes.str()) != item.mesh_artifact_sha256
           || !ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)
-          || !RequestMatchesArtifact(item, artifact)) { responses[index].status = Status::kInvalidArgument; continue; }
+          || !RequestMatchesArtifact(item, artifact)) {
+        responses[index].status = Status::kInvalidArgument;
+        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+        continue;
+      }
       const std::string fingerprint = NonlinearModelFingerprint(artifact.model);
       if (cached_fingerprint.empty()) {
+        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+        const ProfileClock::time_point initialize_start = ProfileClock::now();
         responses[index].status = cached_solver.Initialize(artifact.model);
+        timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
         if (responses[index].status != Status::kOk) continue;
         cached_fingerprint = fingerprint;
       } else if (fingerprint != cached_fingerprint) {
-        responses[index].status = Status::kInvalidArgument; continue; // caller mixed geometry groups
+        responses[index].status = Status::kInvalidArgument;
+        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
+        continue; // caller mixed geometry groups
       } else {
         ++cache_hits;
+        timing.artifact_read_validate_seconds += ProfileSecondsSince(artifact_start);
       }
       chunk_slots.push_back(index);
       chunk_currents.push_back(item.circuit_currents_a);
@@ -4016,8 +4114,15 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(chunk_slots.size()));
       NonlinearOptions options; options.relative_tolerance = 1e-8; options.max_newton_iterations = 128;
       options.max_linear_iterations = 4096;
+      NonlinearBatchTiming chunk_timing;
       std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
-          chunk_currents, options, &batched_pcg_launches);
+          chunk_currents, options, &batched_pcg_launches, &chunk_timing);
+      timing.nonlinear.host_assembly_seconds += chunk_timing.host_assembly_seconds;
+      timing.nonlinear.gpu_upload_seconds += chunk_timing.gpu_upload_seconds;
+      timing.nonlinear.gpu_kernel_sync_seconds += chunk_timing.gpu_kernel_sync_seconds;
+      timing.nonlinear.gpu_download_seconds += chunk_timing.gpu_download_seconds;
+      timing.nonlinear.state_update_seconds += chunk_timing.state_update_seconds;
+      timing.nonlinear.finalize_seconds += chunk_timing.finalize_seconds;
       for (size_t local = 0; local < chunk_slots.size(); ++local) {
         const size_t index = chunk_slots[local];
         const MotorSampleRequest& item = request.items[index].request;
@@ -4031,15 +4136,19 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       post_options.max_mask_iterations = 4096; post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
       for (double angle : item.airgap_angles_deg)
         post_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
+        const ProfileClock::time_point postprocess_start = ProfileClock::now();
         FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(chunk_artifacts[local].model, solution, post_options);
+      timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
       responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
           postprocess.status == Status::kOk ? &postprocess : nullptr);
       }
     }
   }
+  timing.measured_before_response_write_seconds = ProfileSecondsSince(total_start);
   if (!WriteMotorBatchResponse(response_path, &request, responses,
           request.max_items_per_chunk, effective_chunk, cache_hits, chunk_count,
-          cached_solver.csr_symbolic_reuse_count(), actual_parallel_width, batched_pcg_launches)) return 1;
+          cached_solver.csr_symbolic_reuse_count(), actual_parallel_width, batched_pcg_launches,
+          include_timing ? &timing : nullptr)) return 1;
   return std::all_of(responses.begin(), responses.end(),
       [](const MotorBatchResponseDto& response) { return response.status == Status::kOk; }) ? 0 : 1;
 }
@@ -4387,6 +4496,7 @@ int SelfTest()
   const std::string batch_single_response_path = "gpu_femm_batch_selftest_single_response.json";
   const std::string batch_request_path = "gpu_femm_batch_selftest_request.json";
   const std::string batch_response_path = "gpu_femm_batch_selftest_response.json";
+  const std::string batch_default_response_path = "gpu_femm_batch_selftest_default_response.json";
   const std::string mixed_request_path = "gpu_femm_batch_selftest_mixed_request.json";
   const std::string mixed_response_path = "gpu_femm_batch_selftest_mixed_response.json";
   std::string batch_mesh_artifact = mesh_artifact;
@@ -4423,12 +4533,16 @@ int SelfTest()
                          << "{\"task_id\":\"good_three\",\"request\":" << selftest_motor_request << "}]}";
   }
   const int single_adapter_status = MotorSingleSampleAdapter(batch_single_request_path, batch_single_response_path);
-  const int batch_adapter_status = MotorBatchAdapter(batch_request_path, batch_response_path);
+  const int batch_adapter_status = MotorBatchAdapter(batch_request_path, batch_response_path, true);
+  const int batch_default_adapter_status = MotorBatchAdapter(batch_request_path, batch_default_response_path);
   const int mixed_adapter_status = MotorBatchAdapter(mixed_request_path, mixed_response_path);
   std::ifstream single_response_input(batch_single_response_path); std::stringstream single_response_bytes;
   single_response_bytes << single_response_input.rdbuf();
   std::ifstream batch_response_input(batch_response_path); std::stringstream batch_response_bytes;
   batch_response_bytes << batch_response_input.rdbuf();
+  std::ifstream batch_default_response_input(batch_default_response_path);
+  std::stringstream batch_default_response_bytes;
+  batch_default_response_bytes << batch_default_response_input.rdbuf();
   std::ifstream mixed_response_input(mixed_response_path); std::stringstream mixed_response_bytes;
   mixed_response_bytes << mixed_response_input.rdbuf();
   StrictJson single_response_json, batch_response_json;
@@ -4437,12 +4551,15 @@ int SelfTest()
       && StrictJsonParser(single_response_bytes.str()).Parse(&single_response_json, &parser_error);
   const bool batch_response_valid = batch_adapter_status == 0
       && StrictJsonParser(batch_response_bytes.str()).Parse(&batch_response_json, &parser_error);
+  const bool batch_default_response_valid = batch_default_adapter_status == 0
+      && batch_default_response_bytes.str().find("\"timing\"") == std::string::npos;
   const bool mixed_response_valid = mixed_adapter_status == 1
       && StrictJsonParser(mixed_response_bytes.str()).Parse(&mixed_response_json, &parser_error);
   const StrictJson* batch_status = batch_response_valid ? JsonMember(batch_response_json, "status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_solve_status = batch_response_valid ? JsonMember(batch_response_json, "solve_status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_items = batch_response_valid ? JsonMember(batch_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
-  expect(single_response_valid && batch_response_valid && batch_status != nullptr && batch_solve_status != nullptr
+  expect(single_response_valid && batch_response_valid && batch_default_response_valid
+          && batch_status != nullptr && batch_solve_status != nullptr
           && batch_status->string == "PASS" && batch_solve_status->string == "PASS"
           && batch_items != nullptr && batch_items->array.size() == 4
           && batch_items->array[0].object.at("task_id").string == "first"
@@ -4452,12 +4569,17 @@ int SelfTest()
           && batch_response_bytes.str().find("\"mesh_cache_hits\": 3") != std::string::npos
           && batch_response_bytes.str().find("\"actual_parallel_width\": 4") != std::string::npos
           && batch_response_bytes.str().find("\"batched_pcg_launches\": ") != std::string::npos
-          && batch_response_bytes.str().find("\"csr_symbolic_cache_hits\": ") != std::string::npos,
+          && batch_response_bytes.str().find("\"csr_symbolic_cache_hits\": ") != std::string::npos
+          && batch_response_bytes.str().find(
+              "\"schema_version\": \"gpu_femm_motor_batch_timing_v1\"") != std::string::npos
+          && batch_response_bytes.str().find("\"host_assembly_seconds\": ") != std::string::npos
+          && batch_response_bytes.str().find("\"postprocess_seconds\": ") != std::string::npos,
       "four-item motor batch adapter preserves PASS, order, and cache evidence");
   const StrictJson* mixed_status = mixed_response_valid ? JsonMember(mixed_response_json, "status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* mixed_items = mixed_response_valid ? JsonMember(mixed_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
   expect(mixed_status != nullptr && mixed_status->string == "FAIL" && mixed_items != nullptr
           && mixed_items->array.size() == 4
+          && mixed_response_bytes.str().find("\"timing\"") == std::string::npos
           && mixed_items->array[0].object.at("task_id").string == "good_one"
           && mixed_items->array[0].object.at("response").object.at("status").string == "PASS"
           && mixed_items->array[1].object.at("task_id").string == "bad"
@@ -4909,6 +5031,9 @@ int main(int argc, char** argv)
   if (argc == 4 && std::string(argv[1]) == "--motor-batch") {
     return gpu_femm::MotorBatchAdapter(argv[2], argv[3]);
   }
+  if (argc == 4 && std::string(argv[1]) == "--motor-batch-profile") {
+    return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true);
+  }
   if (argc == 3 && std::string(argv[1]) == "--mesh-artifact") {
     return gpu_femm::GpuFemmMeshArtifactTest(argv[2]);
   }
@@ -4918,6 +5043,7 @@ int main(int argc, char** argv)
             << " | --single-sample <request.json> <response.json>"
             << " | --motor-single-sample <request.json> <response.json>"
             << " | --motor-batch <request.json> <response.json>"
+            << " | --motor-batch-profile <request.json> <response.json>"
             << " | --mesh-artifact <gpu_femm_mesh_v1.json>\n";
   return 2;
 }
