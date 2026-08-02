@@ -1822,6 +1822,12 @@ struct NonlinearOptions {
   double linear_relative_tolerance = 1e-13;
 };
 
+// Full motor meshes can need substantially more PCG steps than the compact
+// fixtures, especially for thin V-magnet bridges.  This remains an upper
+// bound: the deterministic solver exits as soon as the unchanged 1e-13
+// relative linear tolerance is verified against the true residual.
+constexpr int kMotorMaxLinearIterations = 16384;
+
 struct NonlinearSolveResult {
   SolveInfo info;
   std::vector<double> a_wb_per_m;
@@ -4311,7 +4317,7 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
   NonlinearOptions nonlinear_options;
   nonlinear_options.relative_tolerance = 1e-8;
   nonlinear_options.max_newton_iterations = 128;
-  nonlinear_options.max_linear_iterations = 4096;
+  nonlinear_options.max_linear_iterations = kMotorMaxLinearIterations;
   *solution = solver.Solve(request.circuit_currents_a, nonlinear_options);
   if (solution->info.status != Status::kOk) return solution->info.status;
   FrozenPostprocessOptions postprocess_options;
@@ -4849,7 +4855,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     if (!chunk_slots.empty()) {
       actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(chunk_slots.size()));
       NonlinearOptions options; options.relative_tolerance = 1e-8; options.max_newton_iterations = 128;
-      options.max_linear_iterations = 4096;
+      options.max_linear_iterations = kMotorMaxLinearIterations;
       NonlinearBatchTiming chunk_timing;
       std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
           chunk_currents, options, &batched_pcg_launches, &chunk_timing);
