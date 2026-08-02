@@ -178,20 +178,27 @@ Status CopyToHost(void* destination, const void* source, size_t bytes)
 // One fixed block keeps every CSR-row ownership fixed from solve to solve.
 // Row/vector work and scalar reductions are parallel.  The fixed tree avoids
 // atomics and keeps one deterministic reduction order for every batch width.
-constexpr int kPcgBlockThreads = 256;
+constexpr int kPcgBlockThreads = 512;
 
 // Every lane owns the same strided index sequence for every batch width.  The
-// fixed shared-memory tree is deterministic (no atomics/warp scheduling
-// dependence) while removing the lane-zero O(n) bottleneck.
+// fixed pairwise tree is deterministic; its warp tail preserves the same
+// pairing while avoiding block-wide barriers once only one warp remains.
 __device__ double DeterministicBlockSum(double local, double* scratch)
 {
   const int lane = threadIdx.x;
   scratch[lane] = local;
   __syncthreads();
-  for (int stride = kPcgBlockThreads / 2; stride > 0; stride /= 2) {
+  for (int stride = kPcgBlockThreads / 2; stride >= 64; stride /= 2) {
     if (lane < stride) scratch[lane] += scratch[lane + stride];
     __syncthreads();
   }
+  if (lane < warpSize) {
+    double value = scratch[lane] + scratch[lane + warpSize];
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+      value += __shfl_down_sync(0xffffffffu, value, offset);
+    if (lane == 0) scratch[0] = value;
+  }
+  __syncthreads();
   return scratch[0];
 }
 
@@ -200,10 +207,17 @@ __device__ double DeterministicBlockMax(double local, double* scratch)
   const int lane = threadIdx.x;
   scratch[lane] = local;
   __syncthreads();
-  for (int stride = kPcgBlockThreads / 2; stride > 0; stride /= 2) {
+  for (int stride = kPcgBlockThreads / 2; stride >= 64; stride /= 2) {
     if (lane < stride) scratch[lane] = fmax(scratch[lane], scratch[lane + stride]);
     __syncthreads();
   }
+  if (lane < warpSize) {
+    double value = fmax(scratch[lane], scratch[lane + warpSize]);
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+      value = fmax(value, __shfl_down_sync(0xffffffffu, value, offset));
+    if (lane == 0) scratch[0] = value;
+  }
+  __syncthreads();
   return scratch[0];
 }
 
@@ -214,7 +228,7 @@ __global__ void DeterministicPcgKernel(
     double* matrix_direction, double relative_tolerance, int max_iterations,
     SolveInfo* info, int values_per_item)
 {
-  // One 256-thread block owns one independent current-state.  B=1 and B>1
+  // One fixed-width block owns one independent current-state.  B=1 and B>1
   // use the same fixed reduction tree; sums may differ slightly from the
   // former lane-zero order but are deterministic.
   const int item = blockIdx.x;
@@ -4806,7 +4820,7 @@ int SelfTest()
 
   // 257 exercises the strided reduction tail beyond one 256-thread block.
   Assembly reduction_tail;
-  constexpr int kReductionTailN = 257;
+  constexpr int kReductionTailN = kPcgBlockThreads + 1;
   reduction_tail.row_offsets.resize(kReductionTailN + 1);
   reduction_tail.column_indices.resize(kReductionTailN);
   reduction_tail.values.assign(kReductionTailN, 1.0);
@@ -4826,7 +4840,8 @@ int SelfTest()
   bool reduction_matches = reduction_info.status == Status::kOk && reduction_solution.size() == reduction_rhs.size();
   for (size_t index = 0; reduction_matches && index < reduction_rhs.size(); ++index)
     reduction_matches = reduction_solution[index] == reduction_rhs[index];
-  expect(reduction_matches, "deterministic reduction handles non-multiple-of-256 RHS");
+  expect(reduction_matches,
+      "deterministic reduction handles non-multiple-of-block-width RHS");
 
   Assembly indefinite;
   indefinite.row_offsets = { 0, 1 };

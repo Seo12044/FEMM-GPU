@@ -46,3 +46,4 @@ bin/matlib.dat
 bin/statlib.dat
 
 *.patch
+gpu_femm_batch_selftest_*.json
