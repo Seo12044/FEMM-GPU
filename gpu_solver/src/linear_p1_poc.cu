@@ -2066,8 +2066,6 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
     double ci = age.inner_shift, co = age.outer_shift;
     if (ci > co) { ci -= co; co = 0.0; }
     else { ci = 1.0 - co + ci; co = 1.0; }
-    ci -= std::floor(ci);
-    co -= std::floor(co);
     double matrix[10][10];
     if (!BuildNativeFemmAirGapMatrix(K, Ki, ci, co, matrix)) return Status::kMeshInvalid;
     for (size_t k = 0; k < elements; ++k) {
@@ -2953,13 +2951,26 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
   }
   if (is_sliding_band_v2) {
-    const StrictJson* ages = JsonMember(*resolved, "air_gap_elements", StrictJson::Type::kArray, error);
-    if (ages == nullptr || ages->array.empty() || parsed.displacement_mm[0] != 0.0
+    const auto ages_it = resolved->object.find("air_gap_elements");
+    if (ages_it == resolved->object.end() || (ages_it->second.type != StrictJson::Type::kArray
+            && ages_it->second.type != StrictJson::Type::kObject)
+        || parsed.displacement_mm[0] != 0.0
         || parsed.displacement_mm[1] != 0.0 || parsed.rotor_angle_deg != 0.0) {
       if (error->empty()) *error = "sliding-band artifacts require a centered zero-degree reference mesh";
       return false;
     }
-    for (const StrictJson& entry : ages->array) {
+    // MATLAB's jsonencode represents a scalar struct as an object rather
+    // than a one-element array.  Accept that canonical single-AGE spelling
+    // while retaining the array form for multi-AGE artifacts.
+    std::vector<const StrictJson*> age_entries;
+    if (ages_it->second.type == StrictJson::Type::kArray) {
+      if (ages_it->second.array.empty()) { *error = "sliding-band requires an air-gap element"; return false; }
+      for (const StrictJson& entry : ages_it->second.array) age_entries.push_back(&entry);
+    } else {
+      age_entries.push_back(&ages_it->second);
+    }
+    for (const StrictJson* entry_ptr : age_entries) {
+      const StrictJson& entry = *entry_ptr;
       if (!ExactObject(entry, { "name", "periodicity", "center_mm", "ri_mm", "ro_mm", "arc_length_deg",
             "sector_count", "inner_shift", "outer_shift", "quad_points" }, error)) return false;
       const StrictJson* name = JsonMember(entry, "name", StrictJson::Type::kString, error);
@@ -3553,10 +3564,19 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
     const NonlinearSolveResult& solution, const FrozenPostprocessOptions& options)
 {
   FrozenPostprocessResult result;
+  result.status = Status::kOk;
+  result.force_x_n = 0.0;
+  result.force_y_n = 0.0;
+  result.torque_nm = 0.0;
   if (model.air_gap_elements.empty() || solution.a_wb_per_m.size() != model.nodes.size()) {
     result.status = Status::kInvalidArgument; return result;
   }
-  struct AirGapField { const AirGapElement* age = nullptr; std::vector<double> br, bt; };
+  struct AirGapField {
+    const AirGapElement* age = nullptr;
+    std::vector<double> br, bt;
+    std::vector<int32_t> harmonic_order;
+    std::vector<double> br_cos, br_sin;
+  };
   std::vector<AirGapField> fields;
   for (const AirGapElement& age : model.air_gap_elements) {
     const size_t elements = age.quad_points.size() - 1;
@@ -3581,7 +3601,9 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
           - co * a[6] + (-2 + co) * (1 + co) * a[7] - 2 * a[8]
           + co * (a[8] + co * (a[5] - 3 * a[6] + 3 * a[8] - 2 * a[9]) + a[9]
               + co * co * (-a[5] + 2 * a[6] - 2 * a[8] + a[9]))) / (4 * dr);
-      if (!std::isfinite(field.br[k]) || !std::isfinite(field.bt[k])) { result.status = Status::kNumericalNonfinite; return result; }
+      if (!std::isfinite(field.br[k]) || !std::isfinite(field.bt[k])) {
+        result.status = Status::kNumericalNonfinite; return result;
+      }
       const double theta = (static_cast<double>(k) + 0.5) * dt;
       const double normal = field.br[k] * field.br[k] - field.bt[k] * field.bt[k];
       const double shear = 2.0 * field.br[k] * field.bt[k];
@@ -3590,21 +3612,48 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
       result.force_y_n += scale * (normal * std::sin(theta) + shear * std::cos(theta));
       result.torque_nm += model.depth_m * radius * radius * dt * field.br[k] * field.bt[k] / kMu0;
     }
+    // FEMM's mo_getgapb does not return the nearest AGE element value.  It
+    // reconstructs the radial field from the same discrete Fourier series
+    // built by femmviewDoc when it reads an .ans file.
+    const size_t harmonic_count = age.antiperiodic ? (elements + 1) / 2 : elements / 2 + 1;
+    const int32_t harmonic_base = static_cast<int32_t>(std::lround(
+        (age.antiperiodic ? 180.0 : 360.0) / age.arc_length_deg));
+    field.harmonic_order.resize(harmonic_count);
+    field.br_cos.assign(harmonic_count, 0.0);
+    field.br_sin.assign(harmonic_count, 0.0);
+    for (size_t harmonic = 0; harmonic < harmonic_count; ++harmonic) {
+      const int32_t order = age.antiperiodic
+          ? harmonic_base * static_cast<int32_t>(2 * harmonic + 1)
+          : harmonic_base * static_cast<int32_t>(harmonic);
+      field.harmonic_order[harmonic] = order;
+      for (size_t k = 0; k < elements; ++k) {
+        const double phase = (static_cast<double>(k) + 0.5) * dt * static_cast<double>(order);
+        field.br_cos[harmonic] += field.br[k] * std::cos(phase);
+        field.br_sin[harmonic] += field.br[k] * std::sin(phase);
+      }
+      const bool dc_or_nyquist = order == 0
+          || (!age.antiperiodic && harmonic + 1 == harmonic_count && (elements % 2) == 0);
+      const double normalization = dc_or_nyquist ? static_cast<double>(elements)
+                                                 : static_cast<double>(elements) / 2.0;
+      field.br_cos[harmonic] /= normalization;
+      field.br_sin[harmonic] /= normalization;
+    }
     fields.push_back(std::move(field));
   }
   for (const double angle : options.airgap_angles_rad) {
     if (!std::isfinite(angle)) { result.status = Status::kInvalidArgument; return result; }
     const AirGapField& field = fields.front();
-    const size_t elements = field.br.size();
-    const double dt = (3.141592653589793238462643383279502884 / 180.0)
-        * field.age->arc_length_deg / static_cast<double>(elements);
-    double wrapped = std::fmod(angle, 2.0 * 3.141592653589793238462643383279502884);
-    if (wrapped < 0.0) wrapped += 2.0 * 3.141592653589793238462643383279502884;
-    const size_t element = std::min(elements - 1, static_cast<size_t>(wrapped / dt));
-    result.airgap_samples.push_back({ angle, field.br[element] });
+    double radial_b_t = 0.0;
+    for (size_t harmonic = 0; harmonic < field.harmonic_order.size(); ++harmonic) {
+      const double phase = static_cast<double>(field.harmonic_order[harmonic]) * angle;
+      radial_b_t += field.br_cos[harmonic] * std::cos(phase)
+          + field.br_sin[harmonic] * std::sin(phase);
+    }
+    result.airgap_samples.push_back({ angle, radial_b_t });
   }
-  if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n) || !std::isfinite(result.torque_nm))
+  if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n) || !std::isfinite(result.torque_nm)) {
     result.status = Status::kNumericalNonfinite;
+  }
   return result;
 }
 
@@ -4542,8 +4591,31 @@ bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemm
   for (AirGapElement& age : model->air_gap_elements) {
     const size_t sectors = age.quad_points.size() - 1;
     if (sectors == 0 || !(age.arc_length_deg > 0.0)) return false;
-    age.inner_shift += delta_deg * static_cast<double>(sectors) / age.arc_length_deg;
-    age.inner_shift -= std::floor(age.inner_shift);
+    // FEMM regenerates AGE point records for every rotor angle.  Its fractional
+    // shift is only part of that operation: crossing a ring cell also rotates
+    // the inner-side node/weight sequence.  Keep the stator-side records fixed
+    // and reproduce that cyclic inner-side remap from the reference artifact.
+    const double shifted = age.inner_shift
+        + delta_deg * static_cast<double>(sectors) / age.arc_length_deg;
+    const int64_t integer_cells = static_cast<int64_t>(std::floor(shifted));
+    age.inner_shift = shifted - static_cast<double>(integer_cells);
+    std::vector<AirGapQuadPoint> source = age.quad_points;
+    const int64_t count = static_cast<int64_t>(sectors);
+    for (size_t k = 0; k < sectors; ++k) {
+      int64_t source_index = static_cast<int64_t>(k) - integer_cells;
+      source_index %= count;
+      if (source_index < 0) source_index += count;
+      for (int local = 0; local < 2; ++local) {
+        age.quad_points[k].node[local] = source[static_cast<size_t>(source_index)].node[local];
+        age.quad_points[k].weight[local] = source[static_cast<size_t>(source_index)].weight[local];
+      }
+    }
+    // The final point duplicates the first point on the inner ring while its
+    // outer-side interpolation stays the original terminal record.
+    for (int local = 0; local < 2; ++local) {
+      age.quad_points[sectors].node[local] = age.quad_points[0].node[local];
+      age.quad_points[sectors].weight[local] = age.quad_points[0].weight[local];
+    }
   }
   return true;
 }
@@ -5494,6 +5566,28 @@ int SelfTest()
   expect(ParseGpuFemmMeshArtifactJson(sliding_mesh_artifact, &sliding_artifact, &parser_error)
           && sliding_artifact.has_sliding_band && sliding_artifact.model.air_gap_elements.size() == 1,
       std::string("gpu_femm_mesh_v2 sliding-band parser: ") + parser_error);
+  std::string scalar_sliding_mesh_artifact = sliding_mesh_artifact;
+  const std::string age_array_open = "\"air_gap_elements\":[{";
+  const size_t age_array_open_at = scalar_sliding_mesh_artifact.find(age_array_open);
+  if (age_array_open_at != std::string::npos)
+    scalar_sliding_mesh_artifact.replace(age_array_open_at, age_array_open.size(), "\"air_gap_elements\":{");
+  const size_t age_array_close_at = scalar_sliding_mesh_artifact.rfind("}]\n    }");
+  if (age_array_close_at != std::string::npos) scalar_sliding_mesh_artifact.erase(age_array_close_at + 1, 1);
+  GpuFemmMeshArtifact scalar_sliding_artifact;
+  expect(ParseGpuFemmMeshArtifactJson(scalar_sliding_mesh_artifact, &scalar_sliding_artifact, &parser_error)
+          && scalar_sliding_artifact.has_sliding_band && scalar_sliding_artifact.model.air_gap_elements.size() == 1,
+      "gpu_femm_mesh_v2 parser accepts MATLAB scalar AGE object spelling");
+  NonlinearSolveResult zero_age_solution;
+  zero_age_solution.a_wb_per_m.assign(sliding_artifact.model.nodes.size(), 0.0);
+  FrozenPostprocessOptions zero_age_options;
+  zero_age_options.airgap_angles_rad = { 0.0 };
+  const FrozenPostprocessResult zero_age_postprocess = ComputeAirGapElementPostprocess(
+      sliding_artifact.model, zero_age_solution, zero_age_options);
+  expect(zero_age_postprocess.status == Status::kOk && zero_age_postprocess.force_x_n == 0.0
+          && zero_age_postprocess.force_y_n == 0.0 && zero_age_postprocess.torque_nm == 0.0
+          && zero_age_postprocess.airgap_samples.size() == 1
+          && zero_age_postprocess.airgap_samples[0].radial_b_t == 0.0,
+      "sliding AGE postprocess initializes finite zero-field outputs");
   expect(Sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
       "dependency-free SHA-256 matches known vector");
   const std::string motor_request_json = R"json({
@@ -5515,8 +5609,18 @@ int SelfTest()
       "v2 request permits a centered non-reference rotor angle");
   NonlinearModel shifted_sliding_model;
   expect(ApplySlidingBandRotorAngle(sliding_request, sliding_artifact, &shifted_sliding_model)
-          && Near(shifted_sliding_model.air_gap_elements[0].inner_shift, 3.0 / 180.0, 1e-14),
-      "v2 request shifts FEMM AGE inner ring by angle over annulus pitch");
+          && Near(shifted_sliding_model.air_gap_elements[0].inner_shift, 3.0 / 180.0, 1e-14)
+          && shifted_sliding_model.air_gap_elements[0].quad_points[0].node[0]
+              == sliding_artifact.model.air_gap_elements[0].quad_points[0].node[0],
+      "v2 request applies FEMM's positive AGE shift and inner-ring remap for rotor angle");
+  MotorSampleRequest cell_shift_request = sliding_request;
+  cell_shift_request.rotor_angle_deg = 180.0;
+  NonlinearModel cell_shift_model;
+  expect(ApplySlidingBandRotorAngle(cell_shift_request, sliding_artifact, &cell_shift_model)
+          && Near(cell_shift_model.air_gap_elements[0].inner_shift, 0.0, 1e-14)
+          && cell_shift_model.air_gap_elements[0].quad_points[0].node[0]
+              == sliding_artifact.model.air_gap_elements[0].quad_points[1].node[0],
+      "v2 request cyclically remaps inner AGE records after a whole-cell shift");
   parsed_request.circuit_currents_a = { 3.0, -3.0 };
   expect(RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request accepts a new circuit vector for one immutable geometry artifact");
