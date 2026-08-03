@@ -17,6 +17,7 @@ repository for reference and build compatibility.
 - Permanent-magnet coercivity
 - Multiple series-circuit current inputs
 - Fixed Dirichlet A boundaries
+- Native FEMM periodic air-gap elements for centered sliding-band rotation
 - Circuit flux linkage
 - Weighted-stress force and torque
 - Radial air-gap B sampling
@@ -24,9 +25,10 @@ repository for reference and build compatibility.
 - Deterministic PCG results for identical inputs
 
 The solver does not support AC or complex problems, axisymmetric models,
-laminated or AC apparent B-H conversion, periodic boundaries, air-gap elements,
-circuit unknowns, or remeshing. This repository does not include a general
-converter from arbitrary `.fem` files to the production mesh artifact.
+laminated or AC apparent B-H conversion, general periodic node constraints,
+eccentric sliding interfaces, circuit unknowns, or remeshing. This repository
+does not include a general converter from arbitrary `.fem` files to the
+production mesh artifact.
 
 ## Requirements
 
@@ -80,13 +82,12 @@ build-gpu\gpu_solver\Release\gpu_bh_curve_poc.exe
 build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe
 ```
 
-`gpu_femm_mesh_noop_solver.exe` is a mesh-preparation helper for the MATLAB
-motor adapter. The adapter stages a temporary copy of stock FEMM and places
-the helper in that copy as `fkn.exe`. FEMM then runs its normal Triangle mesh
-generation, but no CPU magnetic solve is performed. The Windows build uses the
-GUI subsystem so repeated mesh generation does not flash console windows. Keep
-the helper beside `gpu_linear_p1_poc.exe`; never copy it into a stock FEMM
-installation.
+`gpu_femm_mesh_noop_solver.exe` is a mesh-preparation helper. A caller can stage
+a temporary copy of FEMM and place the helper in that copy as `fkn.exe`. FEMM
+then runs its normal Triangle mesh generation, but no CPU magnetic solve is
+performed. The Windows build uses the GUI subsystem so repeated mesh generation
+does not flash console windows. Keep the helper beside
+`gpu_linear_p1_poc.exe`; never copy it into a stock FEMM installation.
 
 ## Test
 
@@ -115,7 +116,8 @@ Get-Content '.\build-gpu\single_sample_response.json'
 
 ## Run a motor artifact
 
-Check the structure and identity fields of a `gpu_femm_mesh_v1` artifact:
+Check the structure and identity fields of a `gpu_femm_mesh_v1` or
+`gpu_femm_mesh_v2` artifact:
 
 ```powershell
 & $solver --mesh-artifact '.\model.gpu_femm_mesh_v1.json'
@@ -128,7 +130,10 @@ Run one operating point:
 ```
 
 A single-sample request has the following form. The SHA-256 values, pose, and
-circuit count must match the mesh artifact exactly.
+circuit count must match the mesh artifact exactly. A v1 artifact represents
+one posed conforming mesh. A v2 artifact is a centered zero-degree reference
+with a native periodic air-gap element; its request may change
+`rotor_angle_deg` while `displacement_mm` remains `[0,0]`.
 
 ```json
 {
@@ -189,6 +194,10 @@ A successful response has `status: "PASS"` and process exit code 0. On failure,
 check `solve_status`, `error_identifier`, and `error_message`. See
 [gpu_solver/README.md](gpu_solver/README.md) for the file formats and status
 codes.
+
+For v2 sliding-band artifacts, the air-gap coupling and rotor mapping are
+rebuilt for each requested angle. These items currently run one at a time for
+correctness; batching still avoids repeated request setup and artifact decoding.
 
 ## License
 

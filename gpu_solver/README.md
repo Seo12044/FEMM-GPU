@@ -12,7 +12,7 @@ start.
 | Command | Purpose |
 |---|---|
 | `--self-test` | Test the analytic models, parsers, batch path, and determinism |
-| `--mesh-artifact <file>` | Validate a `gpu_femm_mesh_v1` artifact |
+| `--mesh-artifact <file>` | Validate a `gpu_femm_mesh_v1` or `gpu_femm_mesh_v2` artifact |
 | `--motor-single-sample <request> <response>` | Solve one motor operating point |
 | `--motor-batch <request> <response>` | Solve a batch of operating points |
 | `--motor-batch-profile <request> <response>` | Solve a batch and record stage timings |
@@ -73,6 +73,20 @@ gpu_linear_p1_poc.exe --mesh-artifact model.gpu_femm_mesh_v1.json
 This command prints the node, triangle, and circuit counts together with the
 source and base hashes. It validates the artifact but does not solve it.
 
+## `gpu_femm_mesh_v2`
+
+Version 2 keeps the v1 fields and adds `resolved.air_gap_elements`. Each entry
+contains the native FEMM periodic air-gap geometry, sector count, reference
+inner/outer shifts, and quadrature node indices and weights. The artifact is a
+centered zero-degree reference mesh. At solve time the GPU path applies the
+requested rotor angle by cyclically remapping the inner ring and evaluating the
+native 10-by-10 air-gap element matrix; the stator mesh remains fixed.
+
+V2 validation is strict: the preserved boundary name, periodicity, center,
+radii, arc length, sector count, indices, and weights must be internally
+consistent. Unknown fields and identity mismatches are rejected just as in v1.
+Eccentric displacement is not supported by this interface.
+
 ## `gpu_femm_motor_sample_v1`
 
 A single-sample request contains:
@@ -88,8 +102,8 @@ A single-sample request contains:
 | `air_group_number` | Air group used by the weighted-stress mask |
 | `airgap_radius_mm` | Air-gap sample radius; may be zero when sampling is disabled |
 | `airgap_angles_deg` | Angles for radial B samples |
-| `rotor_angle_deg` | Rotor angle stored in the artifact pose |
-| `displacement_mm` | `[x,y]` displacement stored in the artifact pose |
+| `rotor_angle_deg` | V1: angle stored in the pose. V2: runtime sliding-band angle |
+| `displacement_mm` | V1: displacement stored in the pose. V2: must be `[0,0]` |
 
 The solve does not start if the artifact file hash, model identity, pose, or
 circuit count does not match.
@@ -114,6 +128,7 @@ unique `task_id` and one complete `gpu_femm_motor_sample_v1` request.
 - CSR symbolic data is reused for matching geometry.
 - `max_items_per_chunk` must be between 1 and 4096.
 - The effective chunk size also accounts for available VRAM.
+- V2 angle-dependent operators currently use an effective chunk size of one.
 - Duplicate task IDs and mismatched artifact identities are rejected.
 
 `--motor-batch-profile` returns the same numerical results as `--motor-batch`
@@ -128,8 +143,10 @@ and adds timing for artifact loading, assembly, GPU solve, and postprocessing.
 - Linear systems use a GPU-resident CSR Jacobi-PCG solver.
 - Supported GPUs can use cooperative multi-block PCG for small batches on
   large meshes. Other cases use the deterministic fallback kernel.
-- Force and torque use a default weighted-stress mask.
-- Radial air-gap B uses smoothed nodal values from the P1 element field.
+- V1 force and torque use a default weighted-stress mask; radial air-gap B uses
+  smoothed nodal values from the P1 element field.
+- V2 force, torque, and radial air-gap B use the native air-gap element Fourier
+  reconstruction.
 
 ## Status codes
 
