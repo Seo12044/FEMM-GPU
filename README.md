@@ -59,7 +59,7 @@ cmake -S . -B build-gpu -G 'Visual Studio 17 2022' -A x64 `
   -DGPU_SOLVER_CUDA_ARCHITECTURES=89
 
 cmake --build build-gpu --config Release `
-  --target gpu_linear_p1_poc gpu_bh_curve_poc
+  --target gpu_linear_p1_poc gpu_bh_curve_poc gpu_femm_mesh_noop_solver
 ```
 
 If `nvcc` is not on `PATH`, the CUDA toolset can instead be selected directly:
@@ -77,7 +77,14 @@ The executables are written to:
 ```text
 build-gpu\gpu_solver\Release\gpu_linear_p1_poc.exe
 build-gpu\gpu_solver\Release\gpu_bh_curve_poc.exe
+build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe
 ```
+
+`gpu_femm_mesh_noop_solver.exe` is a mesh-preparation helper for the MATLAB
+motor adapter. The adapter stages a temporary copy of stock FEMM and places
+the helper in that copy as `fkn.exe`. FEMM then runs its normal Triangle mesh
+generation, but no CPU magnetic solve is performed. Keep the helper beside
+`gpu_linear_p1_poc.exe`; never copy it into a stock FEMM installation.
 
 ## Test
 

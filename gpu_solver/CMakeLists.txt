@@ -23,6 +23,14 @@ add_executable(gpu_bh_curve_poc
   src/bh_curve_poc.cu
 )
 
+# FEMM's preprocessor generates the exact Triangle mesh before launching
+# fkn.exe.  The MATLAB GPU adapter stages a private copy of stock FEMM and
+# installs this no-op executable as that copy's fkn.exe, preserving the mesh
+# files without running the CPU magnetic solver or changing stock FEMM.
+add_executable(gpu_femm_mesh_noop_solver
+  src/mesh_noop_solver.cpp
+)
+
 set_target_properties(gpu_linear_p1_poc PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
@@ -35,6 +43,11 @@ set_target_properties(gpu_bh_curve_poc PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CUDA_STANDARD 17
   CUDA_STANDARD_REQUIRED ON
+)
+
+set_target_properties(gpu_femm_mesh_noop_solver PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
 )
 
 # Forward UTF-8 handling only to the MSVC host compiler used by NVCC. This
@@ -88,6 +101,9 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:gpu_bh_curve_poc> --fixture
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
   )
+  add_test(NAME gpu_femm_mesh_noop_solver
+    COMMAND $<TARGET_FILE:gpu_femm_mesh_noop_solver> ignored-mesh-stem
+  )
   set_tests_properties(gpu_linear_p1_selftest PROPERTIES
     LABELS "gpu;requires_cuda"
     TIMEOUT 30
@@ -108,5 +124,9 @@ if(BUILD_TESTING)
   set_tests_properties(gpu_bh_curve_35pn230 PROPERTIES
     LABELS "gpu;requires_cuda;bh_curve"
     TIMEOUT 30
+  )
+  set_tests_properties(gpu_femm_mesh_noop_solver PROPERTIES
+    LABELS "gpu;mesh_only"
+    TIMEOUT 5
   )
 endif()

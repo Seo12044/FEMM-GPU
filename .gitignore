@@ -16,6 +16,7 @@ Thumbs.db
 build/
 build_*/
 /build-gpu/
+/build-femm-mesh/
 bin/
 .vs/
 .vscode/
