@@ -131,7 +131,9 @@ unique `task_id` and one complete `gpu_femm_motor_sample_v1` request.
 - CSR symbolic data is reused for matching geometry.
 - `max_items_per_chunk` must be between 1 and 4096.
 - The effective chunk size also accounts for available VRAM.
-- V2 angle-dependent operators currently use an effective chunk size of one.
+- V2 items are partitioned by verified artifact and exact mechanical pose.
+  Compatible items use the effective chunk width; different poses are solved
+  in separate operator groups while response order is preserved.
 - Duplicate task IDs and mismatched artifact identities are rejected.
 
 `--motor-batch-profile` returns the same numerical results as `--motor-batch`

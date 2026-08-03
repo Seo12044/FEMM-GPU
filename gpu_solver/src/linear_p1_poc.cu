@@ -4907,6 +4907,50 @@ void LoadMotorBatchArtifact(const std::string& path, MotorBatchArtifactLoad* loa
   load->status = Status::kOk;
 }
 
+// SolveBatch can share its CUDA CSR operator only when every item has the
+// exact same assembled model.  For v2 this deliberately keys the immutable
+// artifact bytes and the requested mechanical pose, rather than treating all
+// sliding-band samples as one geometry.  Different current vectors and
+// postprocess requests do not change that operator and may therefore batch.
+std::string MotorBatchOperatorKey(const MotorSampleRequest& request,
+    const MotorBatchArtifactLoad& load, const NonlinearModel& model)
+{
+  if (!load.artifact.has_sliding_band) return NonlinearModelFingerprint(model);
+  std::ostringstream key;
+  key << std::setprecision(17) << "sliding|" << load.artifact_sha256 << '|'
+      << request.rotor_angle_deg << '|'
+      << request.displacement_mm[0] << ',' << request.displacement_mm[1];
+  return key.str();
+}
+
+struct MotorBatchPreparedItem {
+  size_t request_index = 0;
+  const GpuFemmMeshArtifact* artifact = nullptr;
+  NonlinearModel model;
+  std::vector<double> currents;
+  std::string operator_key;
+};
+
+// Return stable first-seen groups so the execution order remains predictable;
+// response placement always uses request_index and therefore stays in caller
+// order even when compatible samples were interleaved in the input.
+std::vector<std::vector<size_t>> GroupMotorBatchPreparedItemsByOperator(
+    const std::vector<MotorBatchPreparedItem>& prepared)
+{
+  std::map<std::string, size_t> group_by_key;
+  std::vector<std::vector<size_t>> groups;
+  for (size_t index = 0; index < prepared.size(); ++index) {
+    const auto found = group_by_key.find(prepared[index].operator_key);
+    if (found != group_by_key.end()) {
+      groups[found->second].push_back(index);
+      continue;
+    }
+    group_by_key.emplace(prepared[index].operator_key, groups.size());
+    groups.push_back({ index });
+  }
+  return groups;
+}
+
 // Keep only protocol output after each item/chunk.  In particular, do not
 // retain the nodal A or per-element B vectors for a whole batch.
 struct MotorBatchResponseDto {
@@ -5098,13 +5142,10 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth,
           free_bytes > kMotorBatchSafetyReserveBytes
               ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1))) : 1;
-  const bool contains_sliding_band = cached_artifact_loads[preflight_slot] != nullptr
-      && cached_artifact_loads[preflight_slot]->status == Status::kOk
-      && cached_artifact_loads[preflight_slot]->artifact.has_sliding_band;
-  // A v2 operator changes with mechanical angle.  Until an angle-keyed CUDA
-  // symbolic cache is introduced, keep each v2 item isolated rather than
-  // accidentally applying one angle's AGE matrix to another angle's solve.
-  const int32_t effective_chunk = contains_sliding_band ? 1 : std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
+  // v2 items are partitioned by their exact artifact-and-pose operator below.
+  // The chunk cap therefore remains usable for samples that share an angle,
+  // while a different angle can never inherit the prior AGE matrix.
+  const int32_t effective_chunk = std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
       kMotorBatchMaxParallelWidth }));
   // Only paths that recur across chunks (plus the already-required preflight
   // path) remain resident.  A mixed request with thousands of distinct
@@ -5118,13 +5159,13 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   int32_t chunk_count = 0;
   int actual_parallel_width = 0;
   int batched_pcg_launches = 0;
+  size_t csr_symbolic_cache_hits = 0;
+  size_t accounted_csr_symbolic_reuse_count = 0;
   for (size_t first = 0; first < request.items.size(); first += static_cast<size_t>(effective_chunk)) {
     ++chunk_count;
     const size_t end = std::min(request.items.size(), first + static_cast<size_t>(effective_chunk));
-    std::vector<size_t> chunk_slots;
-    std::vector<const GpuFemmMeshArtifact*> chunk_artifacts;
-    std::vector<NonlinearModel> chunk_models;
-    std::vector<std::vector<double>> chunk_currents;
+    std::vector<MotorBatchPreparedItem> prepared;
+    prepared.reserve(end - first);
     const ProfileClock::time_point artifact_start = ProfileClock::now();
     const size_t candidate_count = end - first;
     std::vector<MotorBatchArtifactLoad*> artifact_by_slot(
@@ -5195,68 +5236,87 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       if (!ApplySlidingBandRotorAngle(item, artifact, &model)) {
         responses[index].status = Status::kInvalidArgument; continue;
       }
-      const std::string fingerprint = NonlinearModelFingerprint(model);
-      if (cached_fingerprint.empty()) {
-        const ProfileClock::time_point initialize_start = ProfileClock::now();
-        responses[index].status = cached_solver.Initialize(model);
-        timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
-        if (responses[index].status != Status::kOk) continue;
-        cached_fingerprint = fingerprint;
-      } else if (fingerprint != cached_fingerprint) {
-        const ProfileClock::time_point initialize_start = ProfileClock::now();
-        responses[index].status = cached_solver.Initialize(model);
-        timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
-        if (responses[index].status != Status::kOk) continue;
-        cached_fingerprint = fingerprint;
-      } else {
-        ++cache_hits;
-      }
-      chunk_slots.push_back(index);
-      chunk_currents.push_back(item.circuit_currents_a);
-      chunk_artifacts.push_back(&artifact);
-      chunk_models.push_back(std::move(model));
+      const std::string operator_key = MotorBatchOperatorKey(item, *load, model);
+      prepared.push_back({ index, &artifact, std::move(model), item.circuit_currents_a,
+          operator_key });
     }
-    if (!chunk_slots.empty()) {
-      actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(chunk_slots.size()));
+    // A SolveBatch instance owns exactly one CSR operator.  Partition the
+    // request chunk before initializing it, so only samples with identical
+    // v2 artifact-and-pose operators share a CUDA batch.
+    for (const std::vector<size_t>& group : GroupMotorBatchPreparedItemsByOperator(prepared)) {
+      if (group.empty()) continue;
+      const MotorBatchPreparedItem& representative = prepared[group.front()];
+      if (cached_fingerprint != representative.operator_key) {
+        const ProfileClock::time_point initialize_start = ProfileClock::now();
+        const Status initialize_status = cached_solver.Initialize(representative.model);
+        timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
+        cached_fingerprint = initialize_status == Status::kOk ? representative.operator_key : "";
+        if (initialize_status != Status::kOk) {
+          for (size_t prepared_index : group)
+            responses[prepared[prepared_index].request_index].status = initialize_status;
+          continue;
+        }
+        // Initialize starts a fresh solver-local counter.  Keep the response
+        // metric process-wide so multiple v2 pose groups do not hide prior
+        // symbolic CSR reuse.
+        accounted_csr_symbolic_reuse_count = 0;
+        cache_hits += static_cast<int32_t>(group.size() - 1);
+      } else {
+        cache_hits += static_cast<int32_t>(group.size());
+      }
+      actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(group.size()));
+      std::vector<std::vector<double>> group_currents;
+      group_currents.reserve(group.size());
+      for (size_t prepared_index : group)
+        group_currents.push_back(prepared[prepared_index].currents);
       NonlinearOptions options; options.relative_tolerance = 1e-8; options.max_newton_iterations = 128;
       options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
       options.max_linear_iterations = kMotorMaxLinearIterations;
       NonlinearBatchTiming chunk_timing;
       std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
-          chunk_currents, options, &batched_pcg_launches, &chunk_timing);
+          group_currents, options, &batched_pcg_launches, &chunk_timing);
+      const size_t current_csr_symbolic_reuse_count = cached_solver.csr_symbolic_reuse_count();
+      if (current_csr_symbolic_reuse_count >= accounted_csr_symbolic_reuse_count) {
+        csr_symbolic_cache_hits += current_csr_symbolic_reuse_count
+            - accounted_csr_symbolic_reuse_count;
+      }
+      accounted_csr_symbolic_reuse_count = current_csr_symbolic_reuse_count;
       timing.nonlinear.host_assembly_seconds += chunk_timing.host_assembly_seconds;
       timing.nonlinear.gpu_upload_seconds += chunk_timing.gpu_upload_seconds;
       timing.nonlinear.gpu_kernel_sync_seconds += chunk_timing.gpu_kernel_sync_seconds;
       timing.nonlinear.gpu_download_seconds += chunk_timing.gpu_download_seconds;
       timing.nonlinear.state_update_seconds += chunk_timing.state_update_seconds;
       timing.nonlinear.finalize_seconds += chunk_timing.finalize_seconds;
-      for (size_t local = 0; local < chunk_slots.size(); ++local) {
-        const size_t index = chunk_slots[local];
+      for (size_t local = 0; local < group.size(); ++local) {
+        const MotorBatchPreparedItem& prepared_item = prepared[group[local]];
+        const size_t index = prepared_item.request_index;
         const MotorSampleRequest& item = request.items[index].request;
         NonlinearSolveResult& solution = chunk_solutions[local];
         if (solution.info.status != Status::kOk) {
           responses[index] = MakeMotorBatchResponseDto(solution.info.status, item, &solution, nullptr);
           continue;
         }
-      FrozenPostprocessOptions post_options;
-      post_options.selected_group_number = item.selected_group_number; post_options.air_group_number = item.air_group_number;
-      post_options.max_mask_iterations = 4096; post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
-      for (double angle : item.airgap_angles_deg)
-        post_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
+        FrozenPostprocessOptions post_options;
+        post_options.selected_group_number = item.selected_group_number;
+        post_options.air_group_number = item.air_group_number;
+        post_options.max_mask_iterations = 4096; post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
+        for (double angle : item.airgap_angles_deg)
+          post_options.airgap_angles_rad.push_back(
+              angle * 3.141592653589793238462643383279502884 / 180.0);
         const ProfileClock::time_point postprocess_start = ProfileClock::now();
-        FrozenPostprocessResult postprocess = chunk_artifacts[local]->has_sliding_band
-            ? ComputeAirGapElementPostprocess(chunk_models[local], solution, post_options)
-            : ComputeFrozenPostprocess(chunk_models[local], solution, post_options);
-      timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
-      responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
-          postprocess.status == Status::kOk ? &postprocess : nullptr);
+        FrozenPostprocessResult postprocess = prepared_item.artifact->has_sliding_band
+            ? ComputeAirGapElementPostprocess(prepared_item.model, solution, post_options)
+            : ComputeFrozenPostprocess(prepared_item.model, solution, post_options);
+        timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
+        responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
+            postprocess.status == Status::kOk ? &postprocess : nullptr);
       }
     }
   }
   timing.measured_before_response_write_seconds = ProfileSecondsSince(total_start);
   if (!WriteMotorBatchResponse(response_path, &request, responses,
           request.max_items_per_chunk, effective_chunk, cache_hits, chunk_count,
-          cached_solver.csr_symbolic_reuse_count(), actual_parallel_width, batched_pcg_launches,
+          csr_symbolic_cache_hits, actual_parallel_width, batched_pcg_launches,
           include_timing ? &timing : nullptr)) return 1;
   return std::all_of(responses.begin(), responses.end(),
       [](const MotorBatchResponseDto& response) { return response.status == Status::kOk; }) ? 0 : 1;
@@ -5650,6 +5710,39 @@ int SelfTest()
           && cell_shift_model.air_gap_elements[0].quad_points[0].node[0]
               == sliding_artifact.model.air_gap_elements[0].quad_points[1].node[0],
       "v2 request cyclically remaps inner AGE records after a whole-cell shift");
+  // The batch key must batch same-pose current samples, but split a changed
+  // sliding operator even if that request is interleaved in caller order.
+  MotorBatchArtifactLoad sliding_load;
+  sliding_load.status = Status::kOk;
+  sliding_load.artifact_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  sliding_load.artifact = sliding_artifact;
+  MotorSampleRequest same_pose_request = sliding_request;
+  same_pose_request.circuit_currents_a = { 3.0, -3.0 };
+  MotorSampleRequest next_pose_request = sliding_request;
+  next_pose_request.rotor_angle_deg = 4.0;
+  NonlinearModel same_pose_model, next_pose_model;
+  const bool batch_key_models_valid = ApplySlidingBandRotorAngle(same_pose_request, sliding_artifact,
+      &same_pose_model) && ApplySlidingBandRotorAngle(next_pose_request, sliding_artifact,
+      &next_pose_model);
+  const std::string same_pose_key = batch_key_models_valid
+      ? MotorBatchOperatorKey(same_pose_request, sliding_load, same_pose_model) : "";
+  const std::string next_pose_key = batch_key_models_valid
+      ? MotorBatchOperatorKey(next_pose_request, sliding_load, next_pose_model) : "";
+  std::vector<MotorBatchPreparedItem> sliding_prepared;
+  if (batch_key_models_valid) {
+    sliding_prepared.push_back({ 0, &sliding_artifact, shifted_sliding_model,
+        sliding_request.circuit_currents_a, same_pose_key });
+    sliding_prepared.push_back({ 1, &sliding_artifact, std::move(next_pose_model),
+        next_pose_request.circuit_currents_a, next_pose_key });
+    sliding_prepared.push_back({ 2, &sliding_artifact, std::move(same_pose_model),
+        same_pose_request.circuit_currents_a, same_pose_key });
+  }
+  const std::vector<std::vector<size_t>> sliding_groups =
+      GroupMotorBatchPreparedItemsByOperator(sliding_prepared);
+  expect(batch_key_models_valid && same_pose_key != next_pose_key
+          && sliding_groups.size() == 2 && sliding_groups[0] == std::vector<size_t>({ 0, 2 })
+          && sliding_groups[1] == std::vector<size_t>({ 1 }),
+      "v2 batch groups same artifact-and-pose samples while preserving response slots");
   parsed_request.circuit_currents_a = { 3.0, -3.0 };
   expect(RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request accepts a new circuit vector for one immutable geometry artifact");
@@ -5683,6 +5776,11 @@ int SelfTest()
   const std::string batch_default_response_path = "gpu_femm_batch_selftest_default_response.json";
   const std::string mixed_request_path = "gpu_femm_batch_selftest_mixed_request.json";
   const std::string mixed_response_path = "gpu_femm_batch_selftest_mixed_response.json";
+  const std::string sliding_batch_artifact_path = "gpu_femm_sliding_batch_selftest_artifact.json";
+  const std::string sliding_batch_request_path = "gpu_femm_sliding_batch_selftest_request.json";
+  const std::string sliding_batch_response_path = "gpu_femm_sliding_batch_selftest_response.json";
+  const std::string sliding_interleaved_request_path = "gpu_femm_batch_selftest_sliding_interleaved_request.json";
+  const std::string sliding_interleaved_response_path = "gpu_femm_batch_selftest_sliding_interleaved_response.json";
   std::string batch_mesh_artifact = mesh_artifact;
   const std::string selftest_boundary = "\"node_indices\":[0,1,2,3],\"A_Wb_per_m\":[0,0,0,0]";
   const size_t selftest_boundary_at = batch_mesh_artifact.find(selftest_boundary);
@@ -5690,11 +5788,62 @@ int SelfTest()
     batch_mesh_artifact.replace(selftest_boundary_at, selftest_boundary.size(),
         "\"node_indices\":[3],\"A_Wb_per_m\":[0]");
   const std::string artifact_sha = Sha256Hex(batch_mesh_artifact);
+  // Make the v2 batch fixture's inner AGE records touch the free center node.
+  // A rotor-angle remap now changes the assembled operator, so the
+  // interleaved-angle test detects accidental reuse of the prior angle.
+  std::string batch_sliding_mesh_artifact = sliding_mesh_artifact;
+  const std::string original_batch_quad_points =
+      "\"quad_points\":[{\"n0\":0,\"w0\":1,\"n1\":1,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":1,\"w0\":1,\"n1\":2,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":2,\"w0\":1,\"n1\":3,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
+  const std::string angle_sensitive_batch_quad_points =
+      "\"quad_points\":[{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":0,\"w0\":1,\"n1\":4,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
+  const size_t batch_quad_points_at = batch_sliding_mesh_artifact.find(original_batch_quad_points);
+  if (batch_quad_points_at != std::string::npos)
+    batch_sliding_mesh_artifact.replace(batch_quad_points_at, original_batch_quad_points.size(),
+        angle_sensitive_batch_quad_points);
+  GpuFemmMeshArtifact batch_sliding_artifact;
+  expect(ParseGpuFemmMeshArtifactJson(batch_sliding_mesh_artifact, &batch_sliding_artifact,
+          &parser_error), "angle-sensitive v2 batch fixture parses");
+  const std::string sliding_artifact_sha = Sha256Hex(batch_sliding_mesh_artifact);
   std::string selftest_motor_request = motor_request_json;
   const size_t artifact_sha_at = selftest_motor_request.find("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
   if (artifact_sha_at != std::string::npos) selftest_motor_request.replace(artifact_sha_at, 64, artifact_sha);
   const size_t artifact_path_at = selftest_motor_request.find("fixture.json");
   if (artifact_path_at != std::string::npos) selftest_motor_request.replace(artifact_path_at, 12, batch_artifact_path);
+  std::string selftest_sliding_request = motor_request_json;
+  const size_t sliding_sha_at = selftest_sliding_request.find(
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+  if (sliding_sha_at != std::string::npos)
+    selftest_sliding_request.replace(sliding_sha_at, 64, sliding_artifact_sha);
+  const size_t sliding_path_at = selftest_sliding_request.find("fixture.json");
+  if (sliding_path_at != std::string::npos)
+    selftest_sliding_request.replace(sliding_path_at, 12, sliding_batch_artifact_path);
+  const std::string posed_request = "\"rotor_angle_deg\":3,\"displacement_mm\":[0.1,0]";
+  const size_t posed_request_at = selftest_sliding_request.find(posed_request);
+  if (posed_request_at != std::string::npos)
+    selftest_sliding_request.replace(posed_request_at, posed_request.size(),
+        "\"rotor_angle_deg\":3,\"displacement_mm\":[0,0]");
+  const std::string empty_airgap_request = "\"airgap_radius_mm\":0,\"airgap_angles_deg\":[]";
+  const size_t empty_airgap_at = selftest_sliding_request.find(empty_airgap_request);
+  if (empty_airgap_at != std::string::npos)
+    selftest_sliding_request.replace(empty_airgap_at, empty_airgap_request.size(),
+        "\"airgap_radius_mm\":0.5,\"airgap_angles_deg\":[0,90]");
+  std::string selftest_sliding_angle4_request = selftest_sliding_request;
+  const size_t angle4_at = selftest_sliding_angle4_request.find("\"rotor_angle_deg\":3");
+  if (angle4_at != std::string::npos)
+    selftest_sliding_angle4_request.replace(angle4_at, std::string("\"rotor_angle_deg\":3").size(),
+        "\"rotor_angle_deg\":4");
+  std::string selftest_sliding_angle3_high_current_request = selftest_sliding_request;
+  const size_t angle3_current_at = selftest_sliding_angle3_high_current_request.find(
+      "\"circuit_currents_A\":[2,-2]");
+  if (angle3_current_at != std::string::npos)
+    selftest_sliding_angle3_high_current_request.replace(angle3_current_at,
+        std::string("\"circuit_currents_A\":[2,-2]").size(), "\"circuit_currents_A\":[3,-3]");
+  std::string selftest_sliding_angle4_low_current_request = selftest_sliding_angle4_request;
+  const size_t angle4_current_at = selftest_sliding_angle4_low_current_request.find(
+      "\"circuit_currents_A\":[2,-2]");
+  if (angle4_current_at != std::string::npos)
+    selftest_sliding_angle4_low_current_request.replace(angle4_current_at,
+        std::string("\"circuit_currents_A\":[2,-2]").size(), "\"circuit_currents_A\":[1,-1]");
   {
     std::ofstream artifact_output(batch_artifact_path, std::ios::binary | std::ios::trunc);
     artifact_output << batch_mesh_artifact;
@@ -5718,6 +5867,23 @@ int SelfTest()
                          << "{\"task_id\":\"bad\",\"request\":" << bad_hash_request << "},"
                          << "{\"task_id\":\"good_two\",\"request\":" << selftest_motor_request << "},"
                          << "{\"task_id\":\"good_three\",\"request\":" << selftest_motor_request << "}]}";
+    std::ofstream sliding_artifact_output(sliding_batch_artifact_path, std::ios::binary | std::ios::trunc);
+    sliding_artifact_output << batch_sliding_mesh_artifact;
+    std::ofstream sliding_request_output(sliding_batch_request_path, std::ios::trunc);
+    sliding_request_output << "{\"protocol\":\"gpu_femm_motor_batch_v1\",\"max_items_per_chunk\":4,\"items\":["
+                           << "{\"task_id\":\"sliding_first\",\"request\":" << selftest_sliding_request << "},"
+                           << "{\"task_id\":\"sliding_second\",\"request\":" << selftest_sliding_request << "},"
+                           << "{\"task_id\":\"sliding_third\",\"request\":" << selftest_sliding_request << "},"
+                           << "{\"task_id\":\"sliding_fourth\",\"request\":" << selftest_sliding_request << "}]}";
+    std::ofstream sliding_interleaved_request_output(sliding_interleaved_request_path, std::ios::trunc);
+    sliding_interleaved_request_output
+        << "{\"protocol\":\"gpu_femm_motor_batch_v1\",\"max_items_per_chunk\":4,\"items\":["
+        << "{\"task_id\":\"angle3_base\",\"request\":" << selftest_sliding_request << "},"
+        << "{\"task_id\":\"angle4_base\",\"request\":" << selftest_sliding_angle4_request << "},"
+        << "{\"task_id\":\"angle3_high\",\"request\":"
+        << selftest_sliding_angle3_high_current_request << "},"
+        << "{\"task_id\":\"angle4_low\",\"request\":"
+        << selftest_sliding_angle4_low_current_request << "}]}";
   }
   MotorSampleRequest selftest_batch_request;
   MotorBatchRequest alias_batch_request;
@@ -5740,6 +5906,10 @@ int SelfTest()
   const int batch_adapter_status = MotorBatchAdapter(batch_request_path, batch_response_path, true);
   const int batch_default_adapter_status = MotorBatchAdapter(batch_request_path, batch_default_response_path);
   const int mixed_adapter_status = MotorBatchAdapter(mixed_request_path, mixed_response_path);
+  const int sliding_batch_adapter_status = MotorBatchAdapter(sliding_batch_request_path,
+      sliding_batch_response_path);
+  const int sliding_interleaved_adapter_status = MotorBatchAdapter(sliding_interleaved_request_path,
+      sliding_interleaved_response_path);
   std::ifstream single_response_input(batch_single_response_path); std::stringstream single_response_bytes;
   single_response_bytes << single_response_input.rdbuf();
   std::ifstream batch_response_input(batch_response_path); std::stringstream batch_response_bytes;
@@ -5749,8 +5919,16 @@ int SelfTest()
   batch_default_response_bytes << batch_default_response_input.rdbuf();
   std::ifstream mixed_response_input(mixed_response_path); std::stringstream mixed_response_bytes;
   mixed_response_bytes << mixed_response_input.rdbuf();
+  std::ifstream sliding_batch_response_input(sliding_batch_response_path);
+  std::stringstream sliding_batch_response_bytes;
+  sliding_batch_response_bytes << sliding_batch_response_input.rdbuf();
+  std::ifstream sliding_interleaved_response_input(sliding_interleaved_response_path);
+  std::stringstream sliding_interleaved_response_bytes;
+  sliding_interleaved_response_bytes << sliding_interleaved_response_input.rdbuf();
   StrictJson single_response_json, batch_response_json;
   StrictJson mixed_response_json;
+  StrictJson sliding_batch_response_json;
+  StrictJson sliding_interleaved_response_json;
   const bool single_response_valid = single_adapter_status == 0
       && StrictJsonParser(single_response_bytes.str()).Parse(&single_response_json, &parser_error);
   const bool batch_response_valid = batch_adapter_status == 0
@@ -5759,6 +5937,12 @@ int SelfTest()
       && batch_default_response_bytes.str().find("\"timing\"") == std::string::npos;
   const bool mixed_response_valid = mixed_adapter_status == 1
       && StrictJsonParser(mixed_response_bytes.str()).Parse(&mixed_response_json, &parser_error);
+  const bool sliding_batch_response_valid = sliding_batch_adapter_status == 0
+      && StrictJsonParser(sliding_batch_response_bytes.str()).Parse(
+          &sliding_batch_response_json, &parser_error);
+  const bool sliding_interleaved_response_valid = sliding_interleaved_adapter_status == 0
+      && StrictJsonParser(sliding_interleaved_response_bytes.str()).Parse(
+          &sliding_interleaved_response_json, &parser_error);
   const StrictJson* batch_status = batch_response_valid ? JsonMember(batch_response_json, "status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_solve_status = batch_response_valid ? JsonMember(batch_response_json, "solve_status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_items = batch_response_valid ? JsonMember(batch_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
@@ -5792,6 +5976,80 @@ int SelfTest()
           && mixed_items->array[3].object.at("response").object.at("status").string == "PASS"
           && mixed_response_bytes.str().find("\"actual_parallel_width\": 3") != std::string::npos,
       "failed item leaves compacted active batch ordered and independently valid");
+  const StrictJson* sliding_batch_items = sliding_batch_response_valid
+      ? JsonMember(sliding_batch_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
+  expect(sliding_batch_response_valid && sliding_batch_items != nullptr
+          && sliding_batch_items->array.size() == 4
+          && sliding_batch_items->array[0].object.at("task_id").string == "sliding_first"
+          && sliding_batch_items->array[3].object.at("task_id").string == "sliding_fourth"
+          && sliding_batch_response_bytes.str().find("\"effective_chunk_size\": 4") != std::string::npos
+          && sliding_batch_response_bytes.str().find("\"actual_parallel_width\": 4") != std::string::npos,
+      "v2 same-pose batch uses requested chunk width and preserves response order");
+  MotorSampleRequest interleaved_requests[4];
+  const bool interleaved_requests_valid =
+      ReadMotorSampleRequestJson(selftest_sliding_request, &interleaved_requests[0], &parser_error)
+      && ReadMotorSampleRequestJson(selftest_sliding_angle4_request, &interleaved_requests[1], &parser_error)
+      && ReadMotorSampleRequestJson(selftest_sliding_angle3_high_current_request,
+          &interleaved_requests[2], &parser_error)
+      && ReadMotorSampleRequestJson(selftest_sliding_angle4_low_current_request,
+          &interleaved_requests[3], &parser_error);
+  const auto response_matches_single_v2 = [&parser_error, &batch_sliding_artifact](
+      const StrictJson& response, const MotorSampleRequest& sample_request) {
+    NonlinearSolveResult expected_solution;
+    FrozenPostprocessResult expected_postprocess;
+    if (SolveMeshArtifactSingleSample(sample_request, batch_sliding_artifact, &expected_solution,
+            &expected_postprocess) != Status::kOk) return false;
+    const StrictJson* status = JsonMember(response, "status", StrictJson::Type::kString, &parser_error);
+    const auto same_number = [&response, &parser_error](const char* field, double expected) {
+      const StrictJson* actual = JsonMember(response, field, StrictJson::Type::kNumber, &parser_error);
+      return actual != nullptr && actual->number == expected;
+    };
+    const auto same_array = [&response, &parser_error](const char* field,
+        const std::vector<double>& expected) {
+      const StrictJson* actual = JsonMember(response, field, StrictJson::Type::kArray, &parser_error);
+      if (actual == nullptr || actual->array.size() != expected.size()) return false;
+      for (size_t index = 0; index < expected.size(); ++index)
+        if (actual->array[index].type != StrictJson::Type::kNumber
+            || actual->array[index].number != expected[index]) return false;
+      return true;
+    };
+    std::vector<double> expected_radial_flux_density;
+    for (const AirgapSample& sample : expected_postprocess.airgap_samples)
+      expected_radial_flux_density.push_back(sample.radial_b_t);
+    return status != nullptr && status->string == "PASS"
+        && same_number("Fx_N", expected_postprocess.force_x_n)
+        && same_number("Fy_N", expected_postprocess.force_y_n)
+        && same_number("torque_Nm", expected_postprocess.torque_nm)
+        && same_array("actual_circuit_currents_A", expected_solution.circuit_currents_a)
+        && same_array("circuit_flux_linkage_Wb", expected_solution.circuit_flux_linkage_wb)
+        && same_array("airgap_sample_angles_deg", sample_request.airgap_angles_deg)
+        && same_array("airgap_radial_flux_density_T", expected_radial_flux_density);
+  };
+  const StrictJson* sliding_interleaved_items = sliding_interleaved_response_valid
+      ? JsonMember(sliding_interleaved_response_json, "items", StrictJson::Type::kArray, &parser_error)
+      : nullptr;
+  const bool interleaved_matches_singles = interleaved_requests_valid
+      && sliding_interleaved_items != nullptr && sliding_interleaved_items->array.size() == 4
+      && response_matches_single_v2(sliding_interleaved_items->array[0].object.at("response"),
+          interleaved_requests[0])
+      && response_matches_single_v2(sliding_interleaved_items->array[1].object.at("response"),
+          interleaved_requests[1])
+      && response_matches_single_v2(sliding_interleaved_items->array[2].object.at("response"),
+          interleaved_requests[2])
+      && response_matches_single_v2(sliding_interleaved_items->array[3].object.at("response"),
+          interleaved_requests[3]);
+  expect(sliding_interleaved_response_valid && sliding_interleaved_items != nullptr
+          && sliding_interleaved_items->array.size() == 4
+          && sliding_interleaved_items->array[0].object.at("task_id").string == "angle3_base"
+          && sliding_interleaved_items->array[1].object.at("task_id").string == "angle4_base"
+          && sliding_interleaved_items->array[2].object.at("task_id").string == "angle3_high"
+          && sliding_interleaved_items->array[3].object.at("task_id").string == "angle4_low"
+          && sliding_interleaved_response_bytes.str().find("\"effective_chunk_size\": 4") != std::string::npos
+          && sliding_interleaved_response_bytes.str().find("\"actual_parallel_width\": 2") != std::string::npos
+          && sliding_interleaved_response_bytes.str().find("\"csr_symbolic_cache_hits\": 6")
+              != std::string::npos
+          && interleaved_matches_singles,
+      "interleaved v2 angles split operators, preserve order, and match single postprocess outputs");
   if (single_response_valid && batch_response_valid && batch_items != nullptr && batch_items->array.size() == 4) {
     const StrictJson& first_response = batch_items->array[0].object.at("response");
     const auto same_number = [&parser_error](const StrictJson& left, const StrictJson& right, const char* field) {

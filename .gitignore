@@ -48,3 +48,4 @@ bin/statlib.dat
 
 *.patch
 gpu_femm_batch_selftest_*.json
+gpu_femm_sliding_batch_selftest_*.json

@@ -196,8 +196,9 @@ check `solve_status`, `error_identifier`, and `error_message`. See
 codes.
 
 For v2 sliding-band artifacts, the air-gap coupling and rotor mapping are
-rebuilt for each requested angle. These items currently run one at a time for
-correctness; batching still avoids repeated request setup and artifact decoding.
+rebuilt for each requested angle. Items with the same verified artifact and
+exact mechanical pose can share a CUDA batch. Different poses are partitioned
+before the solve, so one angle's air-gap operator is never reused for another.
 
 ## License
 
