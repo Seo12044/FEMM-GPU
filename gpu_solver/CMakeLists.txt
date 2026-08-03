@@ -10,7 +10,20 @@ find_package(Threads REQUIRED)
 
 add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
+  src/native_airgap_matrix.cpp
 )
+# Keep the GPU AGE stiffness matrix bit-for-bit derived from FEMM's native
+# fkn implementation.  It is generated at configure time solely from the
+# tracked source, so a future FEMM correction cannot silently diverge here.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../fkn/prob1big.cpp" GPU_FEMM_FKN_SOURCE)
+string(REGEX MATCH "MG\\[0\\]\\[0\\] =.*// Add each annulus element to the global stiffness matrix"
+  GPU_FEMM_AGE_MATRIX_SOURCE "${GPU_FEMM_FKN_SOURCE}")
+if(NOT GPU_FEMM_AGE_MATRIX_SOURCE)
+  message(FATAL_ERROR "Could not extract FEMM native air-gap element matrix")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gpu_femm_native_age_matrix.inc"
+  "${GPU_FEMM_AGE_MATRIX_SOURCE}")
+target_include_directories(gpu_linear_p1_poc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(gpu_linear_p1_poc PRIVATE Threads::Threads)
 # This target uses CUDA cooperative groups.  The existing FEMM-derived source
 # relies on the legacy MSVC preprocessor's token handling, so acknowledge the

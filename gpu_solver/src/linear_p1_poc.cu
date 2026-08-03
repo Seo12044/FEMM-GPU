@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "native_airgap_matrix.h"
+
 // Legacy CUDA/MSVC compatibility headers reserve these otherwise ordinary
 // FEMM local-variable names.  They are not used as macros in this source.
 #undef element
@@ -1804,11 +1806,32 @@ struct NonlinearTriangle {
   int32_t material = -1;
 };
 
+// FEMM's native Air Gap Element (AGE) represents the annular air band without
+// re-triangulating it.  The four node/weight pairs map each annulus endpoint
+// to the independently meshed rotor and stator rings.
+struct AirGapQuadPoint {
+  int32_t node[4] = {};
+  double weight[4] = {};
+};
+
+struct AirGapElement {
+  bool antiperiodic = false;
+  double center_x_m = 0.0;
+  double center_y_m = 0.0;
+  double inner_radius_m = 0.0;
+  double outer_radius_m = 0.0;
+  double arc_length_deg = 0.0;
+  double inner_shift = 0.0;
+  double outer_shift = 0.0;
+  std::vector<AirGapQuadPoint> quad_points;
+};
+
 struct NonlinearModel {
   std::vector<Node> nodes;
   std::vector<NonlinearMaterial> materials;
   std::vector<NonlinearBhCurve> bh_curves;
   std::vector<NonlinearTriangle> triangles;
+  std::vector<AirGapElement> air_gap_elements;
   std::vector<int32_t> dirichlet_nodes;
   std::vector<double> dirichlet_a_wb_per_m;
   int32_t circuit_count = 1;
@@ -1925,6 +1948,20 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
     if (!BuildElementTerms(p, &terms))
       return Status::kMeshInvalid;
   }
+  for (const AirGapElement& age : model.air_gap_elements) {
+    const size_t elements = age.quad_points.size() - 1;
+    if (age.quad_points.size() < 3 || !(age.inner_radius_m > 0.0)
+        || !(age.outer_radius_m > age.inner_radius_m) || !(age.arc_length_deg > 0.0)
+        || !std::isfinite(age.center_x_m) || !std::isfinite(age.center_y_m)
+        || !std::isfinite(age.inner_shift) || !std::isfinite(age.outer_shift))
+      return Status::kMeshInvalid;
+    for (const AirGapQuadPoint& point : age.quad_points) for (int local = 0; local < 4; ++local) {
+      if (point.node[local] < 0 || static_cast<size_t>(point.node[local]) >= model.nodes.size()
+          || !std::isfinite(point.weight[local])) return Status::kMeshInvalid;
+    }
+    const double dt = age.arc_length_deg / static_cast<double>(elements);
+    if (!(dt > 0.0) || !std::isfinite(dt)) return Status::kMeshInvalid;
+  }
   return Status::kOk;
 }
 
@@ -2010,6 +2047,45 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
           return added;
         if (use_newton)
           rhs[global_i] += c * a_old[global_j];
+      }
+    }
+  }
+  for (const AirGapElement& age : model.air_gap_elements) {
+    const size_t elements = age.quad_points.size() - 1;
+    if (elements == 0) return Status::kMeshInvalid;
+    const double dt = (3.141592653589793238462643383279502884 / 180.0)
+        * age.arc_length_deg / static_cast<double>(elements);
+    const double K = 2.0 * (age.outer_radius_m - age.inner_radius_m)
+        / (dt * (age.outer_radius_m + age.inner_radius_m));
+    const double Ki = 1.0 / K;
+    double ci = age.inner_shift, co = age.outer_shift;
+    if (ci > co) { ci -= co; co = 0.0; }
+    else { ci = 1.0 - co + ci; co = 1.0; }
+    ci -= std::floor(ci);
+    co -= std::floor(co);
+    double matrix[10][10];
+    if (!BuildNativeFemmAirGapMatrix(K, Ki, ci, co, matrix)) return Status::kMeshInvalid;
+    for (size_t k = 0; k < elements; ++k) {
+      const size_t previous = k == 0 ? elements - 1 : k - 1;
+      const size_t next = k + 1;
+      const size_t next2 = k + 2 > elements ? 1 : k + 2;
+      int32_t node[10] = {
+        age.quad_points[previous].node[0], age.quad_points[k].node[0],
+        age.quad_points[k].node[1], age.quad_points[next].node[1],
+        age.quad_points[next2].node[1], age.quad_points[previous].node[2],
+        age.quad_points[k].node[2], age.quad_points[k].node[3],
+        age.quad_points[next].node[3], age.quad_points[next2].node[3] };
+      double weight[10] = {
+        age.quad_points[previous].weight[0], age.quad_points[k].weight[0],
+        age.quad_points[k].weight[1], age.quad_points[next].weight[1],
+        age.quad_points[next2].weight[1], age.quad_points[previous].weight[2],
+        age.quad_points[k].weight[2], age.quad_points[k].weight[3],
+        age.quad_points[next].weight[3], age.quad_points[next2].weight[3] };
+      if (age.antiperiodic && k == 0) { weight[0] = -weight[0]; weight[5] = -weight[5]; }
+      if (age.antiperiodic && k + 1 == elements) { weight[4] = -weight[4]; weight[9] = -weight[9]; }
+      for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j) {
+        const Status added = AddSparseEntry(&jacobian, node[i], node[j], matrix[i][j] * weight[i] * weight[j]);
+        if (added != Status::kOk) return added;
       }
     }
   }
@@ -2593,7 +2669,7 @@ class Sha256 {
   {
     total_bits_ += static_cast<uint64_t>(size) * 8;
     while (size > 0) {
-      const size_t count = std::min(size, sizeof(buffer_) - buffered_);
+        const size_t count = std::min(size, static_cast<size_t>(sizeof(buffer_) - buffered_));
       std::memcpy(buffer_ + buffered_, data, count);
       buffered_ += count; data += count; size -= count;
       if (buffered_ == sizeof(buffer_)) { Transform(buffer_); buffered_ = 0; }
@@ -2647,6 +2723,7 @@ struct GpuFemmMeshArtifact {
   std::string pose_fem_sha256;
   std::string base_motor_fem_sha256;
   std::string canonical_identity_sha256;
+  bool has_sliding_band = false;
   double rotor_angle_deg = 0.0;
   double displacement_mm[2] = {};
 };
@@ -2666,10 +2743,13 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* identity = JsonMember(root, "canonical_identity_sha256", StrictJson::Type::kString, error);
   const StrictJson* resolved = JsonMember(root, "resolved", StrictJson::Type::kObject, error);
   if (schema == nullptr || root_base_sha == nullptr || source_sha == nullptr || identity == nullptr || resolved == nullptr
-      || schema->string != "gpu_femm_mesh_v1" || !JsonSha256(root_base_sha->string) || !JsonSha256(source_sha->string)
+      || (schema->string != "gpu_femm_mesh_v1" && schema->string != "gpu_femm_mesh_v2") || !JsonSha256(root_base_sha->string) || !JsonSha256(source_sha->string)
       || !JsonSha256(identity->string)
-      || !ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles",
-        "regions", "materials", "circuits", "outer_dirichlet" }, error)) {
+      || !(schema->string == "gpu_femm_mesh_v1"
+          ? ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles",
+            "regions", "materials", "circuits", "outer_dirichlet" }, error)
+          : ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles",
+            "regions", "materials", "circuits", "outer_dirichlet", "air_gap_elements" }, error))) {
     if (error->empty()) *error = "invalid gpu_femm_mesh_v1 header";
     return false;
   }
@@ -2706,6 +2786,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       || regions->array.empty()) { *error = "empty mesh/material/circuit input"; return false; }
 
   GpuFemmMeshArtifact parsed;
+  const bool is_sliding_band_v2 = schema->string == "gpu_femm_mesh_v2";
+  parsed.has_sliding_band = is_sliding_band_v2;
   parsed.pose_fem_sha256 = source_sha->string;
   parsed.base_motor_fem_sha256 = base_sha->string;
   parsed.canonical_identity_sha256 = identity->string;
@@ -2863,6 +2945,58 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
         || boundary_values->array[index].number != 0.0) { *error = "outer Dirichlet must be zero and in range"; return false; }
     parsed.model.dirichlet_nodes.push_back(node);
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
+  }
+  if (is_sliding_band_v2) {
+    const StrictJson* ages = JsonMember(*resolved, "air_gap_elements", StrictJson::Type::kArray, error);
+    if (ages == nullptr || ages->array.empty() || parsed.displacement_mm[0] != 0.0
+        || parsed.displacement_mm[1] != 0.0 || parsed.rotor_angle_deg != 0.0) {
+      if (error->empty()) *error = "sliding-band artifacts require a centered zero-degree reference mesh";
+      return false;
+    }
+    for (const StrictJson& entry : ages->array) {
+      if (!ExactObject(entry, { "name", "periodicity", "center_mm", "ri_mm", "ro_mm", "arc_length_deg",
+            "sector_count", "inner_shift", "outer_shift", "quad_points" }, error)) return false;
+      const StrictJson* name = JsonMember(entry, "name", StrictJson::Type::kString, error);
+      const StrictJson* periodicity = JsonMember(entry, "periodicity", StrictJson::Type::kString, error);
+      const StrictJson* center = JsonMember(entry, "center_mm", StrictJson::Type::kArray, error);
+      const StrictJson* ri = JsonMember(entry, "ri_mm", StrictJson::Type::kNumber, error);
+      const StrictJson* ro = JsonMember(entry, "ro_mm", StrictJson::Type::kNumber, error);
+      const StrictJson* arc = JsonMember(entry, "arc_length_deg", StrictJson::Type::kNumber, error);
+      const StrictJson* sectors = JsonMember(entry, "sector_count", StrictJson::Type::kNumber, error);
+      const StrictJson* inner_shift = JsonMember(entry, "inner_shift", StrictJson::Type::kNumber, error);
+      const StrictJson* outer_shift = JsonMember(entry, "outer_shift", StrictJson::Type::kNumber, error);
+      const StrictJson* points = JsonMember(entry, "quad_points", StrictJson::Type::kArray, error);
+      int32_t sector_count = 0;
+      if (name == nullptr || name->string.empty() || periodicity == nullptr || center == nullptr || ri == nullptr || ro == nullptr
+          || arc == nullptr || sectors == nullptr || inner_shift == nullptr || outer_shift == nullptr || points == nullptr
+          || center->array.size() != 2 || center->array[0].type != StrictJson::Type::kNumber
+          || center->array[1].type != StrictJson::Type::kNumber || !JsonInteger(*sectors, &sector_count)
+          || sector_count < 2 || points->array.size() != static_cast<size_t>(sector_count + 1)
+          || (periodicity->string != "periodic" && periodicity->string != "antiperiodic")) {
+        *error = "invalid sliding-band air-gap element"; return false;
+      }
+      AirGapElement age;
+      age.antiperiodic = periodicity->string == "antiperiodic";
+      age.center_x_m = center->array[0].number * 1e-3; age.center_y_m = center->array[1].number * 1e-3;
+      age.inner_radius_m = ri->number * 1e-3; age.outer_radius_m = ro->number * 1e-3;
+      age.arc_length_deg = arc->number; age.inner_shift = inner_shift->number; age.outer_shift = outer_shift->number;
+      for (const StrictJson& point : points->array) {
+        if (!ExactObject(point, { "n0", "w0", "n1", "w1", "n2", "w2", "n3", "w3" }, error)) return false;
+        AirGapQuadPoint parsed_point;
+        for (int local = 0; local < 4; ++local) {
+          const std::string node_name = std::string("n") + char('0' + local);
+          const std::string weight_name = std::string("w") + char('0' + local);
+          const StrictJson* node = JsonMember(point, node_name.c_str(), StrictJson::Type::kNumber, error);
+          const StrictJson* weight = JsonMember(point, weight_name.c_str(), StrictJson::Type::kNumber, error);
+          if (node == nullptr || weight == nullptr || !JsonInteger(*node, &parsed_point.node[local])) {
+            *error = "invalid sliding-band quadrature point"; return false;
+          }
+          parsed_point.weight[local] = weight->number;
+        }
+        age.quad_points.push_back(parsed_point);
+      }
+      parsed.model.air_gap_elements.push_back(std::move(age));
+    }
   }
   if (ValidateNonlinearModel(parsed.model) != Status::kOk) { *error = "mapped mesh model validation failed"; return false; }
   *artifact = std::move(parsed);
@@ -3384,6 +3518,86 @@ FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
   }
   if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n)
       || !std::isfinite(result.torque_nm))
+    result.status = Status::kNumericalNonfinite;
+  return result;
+}
+
+bool BuildAirGapStencil(const AirGapElement& age, size_t k, int32_t node[10], double weight[10])
+{
+  const size_t elements = age.quad_points.size() - 1;
+  if (elements < 2 || k >= elements) return false;
+  const size_t previous = k == 0 ? elements - 1 : k - 1;
+  const size_t next = k + 1;
+  const size_t next2 = k + 2 > elements ? 1 : k + 2;
+  const AirGapQuadPoint& before = age.quad_points[previous];
+  const AirGapQuadPoint& current = age.quad_points[k];
+  const AirGapQuadPoint& after = age.quad_points[next];
+  const AirGapQuadPoint& after2 = age.quad_points[next2];
+  const int local_node[10] = { before.node[0], current.node[0], current.node[1], after.node[1], after2.node[1],
+    before.node[2], current.node[2], current.node[3], after.node[3], after2.node[3] };
+  const double local_weight[10] = { before.weight[0], current.weight[0], current.weight[1], after.weight[1], after2.weight[1],
+    before.weight[2], current.weight[2], current.weight[3], after.weight[3], after2.weight[3] };
+  std::copy(local_node, local_node + 10, node); std::copy(local_weight, local_weight + 10, weight);
+  if (age.antiperiodic && k == 0) { weight[0] = -weight[0]; weight[5] = -weight[5]; }
+  if (age.antiperiodic && k + 1 == elements) { weight[4] = -weight[4]; weight[9] = -weight[9]; }
+  return true;
+}
+
+FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& model,
+    const NonlinearSolveResult& solution, const FrozenPostprocessOptions& options)
+{
+  FrozenPostprocessResult result;
+  if (model.air_gap_elements.empty() || solution.a_wb_per_m.size() != model.nodes.size()) {
+    result.status = Status::kInvalidArgument; return result;
+  }
+  struct AirGapField { const AirGapElement* age = nullptr; std::vector<double> br, bt; };
+  std::vector<AirGapField> fields;
+  for (const AirGapElement& age : model.air_gap_elements) {
+    const size_t elements = age.quad_points.size() - 1;
+    const double dt = (3.141592653589793238462643383279502884 / 180.0)
+        * age.arc_length_deg / static_cast<double>(elements);
+    const double radius = 0.5 * (age.inner_radius_m + age.outer_radius_m);
+    const double dr = age.outer_radius_m - age.inner_radius_m;
+    if (!(dt > 0.0) || !(radius > 0.0) || !(dr > 0.0)) { result.status = Status::kMeshInvalid; return result; }
+    AirGapField field; field.age = &age; field.br.resize(elements); field.bt.resize(elements);
+    for (size_t k = 0; k < elements; ++k) {
+      int32_t node[10]; double weight[10], a[10];
+      if (!BuildAirGapStencil(age, k, node, weight)) { result.status = Status::kMeshInvalid; return result; }
+      for (int local = 0; local < 10; ++local) a[local] = solution.a_wb_per_m[node[local]] * weight[local];
+      const double ci = age.inner_shift, co = age.outer_shift;
+      field.br[k] = (-(ci * a[1]) - 2 * a[2] + 2 * a[3] + ci * (a[2] + a[3] - a[4])
+          - ci * ci * ci * (a[0] - 4 * a[1] + 6 * a[2] - 4 * a[3] + a[4])
+          + ci * ci * (a[0] - 5 * a[1] + 9 * a[2] - 7 * a[3] + 2 * a[4]) - 2 * a[7] + 2 * a[8]
+          + co * (-a[6] + a[7] + a[8] - a[9]) - co * co * co * (a[5] - 4 * a[6] + 6 * a[7] - 4 * a[8] + a[9])
+          + co * co * (a[5] - 5 * a[6] + 9 * a[7] - 7 * a[8] + 2 * a[9])) / (4 * dt * radius);
+      field.bt[k] = (ci * a[1] + 2 * a[2] + 2 * a[3] - ci * ci * (a[0] - 3 * a[1] + a[2] + 3 * a[3] - 2 * a[4])
+          + ci * (a[2] - a[3] - a[4]) + ci * ci * ci * (a[0] - 2 * a[1] + 2 * a[3] - a[4])
+          - co * a[6] + (-2 + co) * (1 + co) * a[7] - 2 * a[8]
+          + co * (a[8] + co * (a[5] - 3 * a[6] + 3 * a[8] - 2 * a[9]) + a[9]
+              + co * co * (-a[5] + 2 * a[6] - 2 * a[8] + a[9]))) / (4 * dr);
+      if (!std::isfinite(field.br[k]) || !std::isfinite(field.bt[k])) { result.status = Status::kNumericalNonfinite; return result; }
+      const double theta = (static_cast<double>(k) + 0.5) * dt;
+      const double normal = field.br[k] * field.br[k] - field.bt[k] * field.bt[k];
+      const double shear = 2.0 * field.br[k] * field.bt[k];
+      const double scale = model.depth_m * radius * dt / (2.0 * kMu0);
+      result.force_x_n += scale * (normal * std::cos(theta) - shear * std::sin(theta));
+      result.force_y_n += scale * (normal * std::sin(theta) + shear * std::cos(theta));
+      result.torque_nm += model.depth_m * radius * radius * dt * field.br[k] * field.bt[k] / kMu0;
+    }
+    fields.push_back(std::move(field));
+  }
+  for (const double angle : options.airgap_angles_rad) {
+    if (!std::isfinite(angle)) { result.status = Status::kInvalidArgument; return result; }
+    const AirGapField& field = fields.front();
+    const size_t elements = field.br.size();
+    const double dt = (3.141592653589793238462643383279502884 / 180.0)
+        * field.age->arc_length_deg / static_cast<double>(elements);
+    double wrapped = std::fmod(angle, 2.0 * 3.141592653589793238462643383279502884);
+    if (wrapped < 0.0) wrapped += 2.0 * 3.141592653589793238462643383279502884;
+    const size_t element = std::min(elements - 1, static_cast<size_t>(wrapped / dt));
+    result.airgap_samples.push_back({ angle, field.br[element] });
+  }
+  if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n) || !std::isfinite(result.torque_nm))
     result.status = Status::kNumericalNonfinite;
   return result;
 }
@@ -4300,12 +4514,32 @@ bool ReadMotorSampleRequestJson(const std::string& json, MotorSampleRequest* req
 
 bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact)
 {
+  const bool matching_pose = artifact.has_sliding_band
+      ? request.displacement_mm[0] == 0.0 && request.displacement_mm[1] == 0.0
+      : request.rotor_angle_deg == artifact.rotor_angle_deg
+          && request.displacement_mm[0] == artifact.displacement_mm[0]
+          && request.displacement_mm[1] == artifact.displacement_mm[1];
   return request.base_motor_fem_sha256 == artifact.base_motor_fem_sha256
       && request.source_fem_sha256 == artifact.pose_fem_sha256
-      && request.rotor_angle_deg == artifact.rotor_angle_deg
-      && request.displacement_mm[0] == artifact.displacement_mm[0]
-      && request.displacement_mm[1] == artifact.displacement_mm[1]
+      && matching_pose
       && request.circuit_currents_a.size() == static_cast<size_t>(artifact.model.circuit_count);
+}
+
+bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact,
+    NonlinearModel* model)
+{
+  if (model == nullptr) return false;
+  *model = artifact.model;
+  if (!artifact.has_sliding_band) return true;
+  const double delta_deg = request.rotor_angle_deg - artifact.rotor_angle_deg;
+  if (!std::isfinite(delta_deg)) return false;
+  for (AirGapElement& age : model->air_gap_elements) {
+    const size_t sectors = age.quad_points.size() - 1;
+    if (sectors == 0 || !(age.arc_length_deg > 0.0)) return false;
+    age.inner_shift += delta_deg * static_cast<double>(sectors) / age.arc_length_deg;
+    age.inner_shift -= std::floor(age.inner_shift);
+  }
+  return true;
 }
 
 Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
@@ -4314,8 +4548,10 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
 {
   if (solution == nullptr || postprocess == nullptr || !RequestMatchesArtifact(request, artifact))
     return Status::kInvalidArgument;
+  NonlinearModel model;
+  if (!ApplySlidingBandRotorAngle(request, artifact, &model)) return Status::kInvalidArgument;
   NonlinearP1FixtureSolver solver;
-  Status status = solver.Initialize(artifact.model);
+  Status status = solver.Initialize(model);
   if (status != Status::kOk) return status;
   NonlinearOptions nonlinear_options;
   nonlinear_options.relative_tolerance = 1e-8;
@@ -4331,7 +4567,9 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
   postprocess_options.airgap_radius_m = request.airgap_radius_mm * 1e-3;
   for (double angle : request.airgap_angles_deg)
     postprocess_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
-  *postprocess = ComputeFrozenPostprocess(artifact.model, *solution, postprocess_options);
+  *postprocess = artifact.has_sliding_band
+      ? ComputeAirGapElementPostprocess(model, *solution, postprocess_options)
+      : ComputeFrozenPostprocess(model, *solution, postprocess_options);
   return postprocess->status;
 }
 
@@ -4484,6 +4722,14 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
   }
   for (const NonlinearTriangle& triangle : model.triangles)
     bytes << triangle.node[0] << ',' << triangle.node[1] << ',' << triangle.node[2] << ',' << triangle.material << ';';
+  for (const AirGapElement& age : model.air_gap_elements) {
+    bytes << 'A' << age.antiperiodic << ',' << age.center_x_m << ',' << age.center_y_m << ','
+          << age.inner_radius_m << ',' << age.outer_radius_m << ',' << age.arc_length_deg << ','
+          << age.inner_shift << ',' << age.outer_shift << ';';
+    for (const AirGapQuadPoint& point : age.quad_points)
+      for (int local = 0; local < 4; ++local) bytes << point.node[local] << ',' << point.weight[local] << ',';
+    bytes << ';';
+  }
   for (int32_t node : model.dirichlet_nodes) bytes << node << ',';
   bytes << ':';
   for (double value : model.dirichlet_a_wb_per_m) bytes << value << ',';
@@ -4725,12 +4971,13 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     if (load.status == Status::kOk
         && load.artifact_sha256 == first.mesh_artifact_sha256
         && RequestMatchesArtifact(first, load.artifact)) {
-      std::vector<double> initial_a(load.artifact.model.nodes.size(), 0.0);
-      for (size_t boundary = 0; boundary < load.artifact.model.dirichlet_nodes.size(); ++boundary)
-        initial_a[load.artifact.model.dirichlet_nodes[boundary]] =
-            load.artifact.model.dirichlet_a_wb_per_m[boundary];
+      NonlinearModel model;
+      if (!ApplySlidingBandRotorAngle(first, load.artifact, &model)) model.nodes.clear();
+      std::vector<double> initial_a(model.nodes.size(), 0.0);
+      for (size_t boundary = 0; boundary < model.dirichlet_nodes.size(); ++boundary)
+        initial_a[model.dirichlet_nodes[boundary]] = model.dirichlet_a_wb_per_m[boundary];
       Assembly estimate;
-      if (AssembleNonlinearNewton(load.artifact.model, initial_a, first.circuit_currents_a, false, &estimate) == Status::kOk) {
+      if (AssembleNonlinearNewton(model, initial_a, first.circuit_currents_a, false, &estimate) == Status::kOk) {
         values_per_item = estimate.values.size();
         nodes_per_item = estimate.free_nodes.size();
       }
@@ -4753,7 +5000,13 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth,
           free_bytes > kMotorBatchSafetyReserveBytes
               ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1))) : 1;
-  const int32_t effective_chunk = std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
+  const bool contains_sliding_band = cached_artifact_loads[preflight_slot] != nullptr
+      && cached_artifact_loads[preflight_slot]->status == Status::kOk
+      && cached_artifact_loads[preflight_slot]->artifact.has_sliding_band;
+  // A v2 operator changes with mechanical angle.  Until an angle-keyed CUDA
+  // symbolic cache is introduced, keep each v2 item isolated rather than
+  // accidentally applying one angle's AGE matrix to another angle's solve.
+  const int32_t effective_chunk = contains_sliding_band ? 1 : std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
       kMotorBatchMaxParallelWidth }));
   // Only paths that recur across chunks (plus the already-required preflight
   // path) remain resident.  A mixed request with thousands of distinct
@@ -4772,6 +5025,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     const size_t end = std::min(request.items.size(), first + static_cast<size_t>(effective_chunk));
     std::vector<size_t> chunk_slots;
     std::vector<const GpuFemmMeshArtifact*> chunk_artifacts;
+    std::vector<NonlinearModel> chunk_models;
     std::vector<std::vector<double>> chunk_currents;
     const ProfileClock::time_point artifact_start = ProfileClock::now();
     const size_t candidate_count = end - first;
@@ -4839,22 +5093,30 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         continue;
       }
       const GpuFemmMeshArtifact& artifact = load->artifact;
-      const std::string& fingerprint = load->fingerprint;
+      NonlinearModel model;
+      if (!ApplySlidingBandRotorAngle(item, artifact, &model)) {
+        responses[index].status = Status::kInvalidArgument; continue;
+      }
+      const std::string fingerprint = NonlinearModelFingerprint(model);
       if (cached_fingerprint.empty()) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
-        responses[index].status = cached_solver.Initialize(artifact.model);
+        responses[index].status = cached_solver.Initialize(model);
         timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
         if (responses[index].status != Status::kOk) continue;
         cached_fingerprint = fingerprint;
       } else if (fingerprint != cached_fingerprint) {
-        responses[index].status = Status::kInvalidArgument;
-        continue; // caller mixed geometry groups
+        const ProfileClock::time_point initialize_start = ProfileClock::now();
+        responses[index].status = cached_solver.Initialize(model);
+        timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
+        if (responses[index].status != Status::kOk) continue;
+        cached_fingerprint = fingerprint;
       } else {
         ++cache_hits;
       }
       chunk_slots.push_back(index);
       chunk_currents.push_back(item.circuit_currents_a);
       chunk_artifacts.push_back(&artifact);
+      chunk_models.push_back(std::move(model));
     }
     if (!chunk_slots.empty()) {
       actual_parallel_width = std::max(actual_parallel_width, static_cast<int>(chunk_slots.size()));
@@ -4884,7 +5146,9 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       for (double angle : item.airgap_angles_deg)
         post_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 / 180.0);
         const ProfileClock::time_point postprocess_start = ProfileClock::now();
-        FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(chunk_artifacts[local]->model, solution, post_options);
+        FrozenPostprocessResult postprocess = chunk_artifacts[local]->has_sliding_band
+            ? ComputeAirGapElementPostprocess(chunk_models[local], solution, post_options)
+            : ComputeFrozenPostprocess(chunk_models[local], solution, post_options);
       timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
       responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
           postprocess.status == Status::kOk ? &postprocess : nullptr);
@@ -5205,6 +5469,23 @@ int SelfTest()
           && parsed_artifact.base_motor_fem_sha256.size() == 64
           && parsed_artifact.pose_fem_sha256.size() == 64,
       "gpu_femm_mesh_v1 maps multi-circuit labels and identities");
+  double native_age_matrix[10][10] = {};
+  expect(BuildNativeFemmAirGapMatrix(0.75, 1.0 / 0.75, 0.25, 0.75, native_age_matrix)
+          && native_age_matrix[0][0] > 0.0 && native_age_matrix[7][7] > 0.0
+          && Near(native_age_matrix[1][8], native_age_matrix[8][1], 1e-14),
+      "native FEMM AGE matrix is finite, positive-diagonal, and symmetric");
+  std::string sliding_mesh_artifact = mesh_artifact;
+  sliding_mesh_artifact.replace(sliding_mesh_artifact.find("gpu_femm_mesh_v1"), 16, "gpu_femm_mesh_v2");
+  const std::string v1_pose = "\"pose\":{\"rotor_angle_deg\":3,\"displacement_mm\":[0.1,0]}";
+  sliding_mesh_artifact.replace(sliding_mesh_artifact.find(v1_pose), v1_pose.size(),
+      "\"pose\":{\"rotor_angle_deg\":0,\"displacement_mm\":[0,0]}");
+  const std::string v1_boundary = "\"outer_dirichlet\":{\"node_indices\":[0,1,2,3],\"A_Wb_per_m\":[0,0,0,0]}";
+  const std::string v2_boundary = v1_boundary + ",\"air_gap_elements\":[{\"name\":\"gap\",\"periodicity\":\"periodic\",\"center_mm\":[0,0],\"ri_mm\":0.4,\"ro_mm\":0.6,\"arc_length_deg\":360,\"sector_count\":2,\"inner_shift\":0,\"outer_shift\":0,\"quad_points\":[{\"n0\":0,\"w0\":1,\"n1\":1,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":1,\"w0\":1,\"n1\":2,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":2,\"w0\":1,\"n1\":3,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]}]";
+  sliding_mesh_artifact.replace(sliding_mesh_artifact.find(v1_boundary), v1_boundary.size(), v2_boundary);
+  GpuFemmMeshArtifact sliding_artifact;
+  expect(ParseGpuFemmMeshArtifactJson(sliding_mesh_artifact, &sliding_artifact, &parser_error)
+          && sliding_artifact.has_sliding_band && sliding_artifact.model.air_gap_elements.size() == 1,
+      std::string("gpu_femm_mesh_v2 sliding-band parser: ") + parser_error);
   expect(Sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
       "dependency-free SHA-256 matches known vector");
   const std::string motor_request_json = R"json({
@@ -5220,6 +5501,14 @@ int SelfTest()
   expect(ReadMotorSampleRequestJson(motor_request_json, &parsed_request, &parser_error)
           && RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request binds artifact identities and pose");
+  MotorSampleRequest sliding_request = parsed_request;
+  sliding_request.rotor_angle_deg = 3.0; sliding_request.displacement_mm[0] = 0.0;
+  expect(RequestMatchesArtifact(sliding_request, sliding_artifact),
+      "v2 request permits a centered non-reference rotor angle");
+  NonlinearModel shifted_sliding_model;
+  expect(ApplySlidingBandRotorAngle(sliding_request, sliding_artifact, &shifted_sliding_model)
+          && Near(shifted_sliding_model.air_gap_elements[0].inner_shift, 3.0 / 180.0, 1e-14),
+      "v2 request shifts FEMM AGE inner ring by angle over annulus pitch");
   parsed_request.circuit_currents_a = { 3.0, -3.0 };
   expect(RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request accepts a new circuit vector for one immutable geometry artifact");
