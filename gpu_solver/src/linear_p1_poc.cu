@@ -1845,6 +1845,11 @@ struct NonlinearOptions {
   double linear_relative_tolerance = 1e-13;
 };
 
+constexpr double kMu0 = 4.0e-7 * 3.141592653589793238462643383279502884;
+// fkn's AGE matrix is expressed against relative permeability; P1 assembly
+// below is SI and therefore needs this free-space reluctivity multiplier.
+constexpr double kNativeFemmAgeToSiReluctivity = 1.0 / kMu0;
+
 // Full motor meshes can need substantially more PCG steps than the compact
 // fixtures, especially for thin V-magnet bridges.  This remains an upper
 // bound: the deterministic solver exits as soon as the motor-specific 1e-12
@@ -2084,7 +2089,10 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
       if (age.antiperiodic && k == 0) { weight[0] = -weight[0]; weight[5] = -weight[5]; }
       if (age.antiperiodic && k + 1 == elements) { weight[4] = -weight[4]; weight[9] = -weight[9]; }
       for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j) {
-        const Status added = AddSparseEntry(&jacobian, node[i], node[j], matrix[i][j] * weight[i] * weight[j]);
+        // fkn works in a relative-permeability, centimetre-scaled system;
+        // this solver's P1 assembly is SI and carries 1/mu0 explicitly.
+        const Status added = AddSparseEntry(&jacobian, node[i], node[j],
+            matrix[i][j] * weight[i] * weight[j] * kNativeFemmAgeToSiReluctivity);
         if (added != Status::kOk) return added;
       }
     }
@@ -2458,8 +2466,6 @@ class NonlinearP1FixtureSolver {
   bool initialized_ = false;
   NonlinearModel model_;
 };
-
-constexpr double kMu0 = 4.0e-7 * 3.141592653589793238462643383279502884;
 
 // Strict, dependency-free reader for the MATLAB-owned gpu_femm_mesh_v1
 // interchange.  This intentionally accepts only the narrow JSON subset used
@@ -5474,6 +5480,8 @@ int SelfTest()
           && native_age_matrix[0][0] > 0.0 && native_age_matrix[7][7] > 0.0
           && Near(native_age_matrix[1][8], native_age_matrix[8][1], 1e-14),
       "native FEMM AGE matrix is finite, positive-diagonal, and symmetric");
+  expect(Near(kNativeFemmAgeToSiReluctivity * kMu0, 1.0, 1e-15),
+      "native FEMM AGE stiffness is converted to SI free-space reluctivity");
   std::string sliding_mesh_artifact = mesh_artifact;
   sliding_mesh_artifact.replace(sliding_mesh_artifact.find("gpu_femm_mesh_v1"), 16, "gpu_femm_mesh_v2");
   const std::string v1_pose = "\"pose\":{\"rotor_angle_deg\":3,\"displacement_mm\":[0.1,0]}";
