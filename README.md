@@ -83,8 +83,10 @@ build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe
 `gpu_femm_mesh_noop_solver.exe` is a mesh-preparation helper for the MATLAB
 motor adapter. The adapter stages a temporary copy of stock FEMM and places
 the helper in that copy as `fkn.exe`. FEMM then runs its normal Triangle mesh
-generation, but no CPU magnetic solve is performed. Keep the helper beside
-`gpu_linear_p1_poc.exe`; never copy it into a stock FEMM installation.
+generation, but no CPU magnetic solve is performed. The Windows build uses the
+GUI subsystem so repeated mesh generation does not flash console windows. Keep
+the helper beside `gpu_linear_p1_poc.exe`; never copy it into a stock FEMM
+installation.
 
 ## Test
 

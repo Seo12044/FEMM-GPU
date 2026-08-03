@@ -27,9 +27,15 @@ add_executable(gpu_bh_curve_poc
 # fkn.exe.  The MATLAB GPU adapter stages a private copy of stock FEMM and
 # installs this no-op executable as that copy's fkn.exe, preserving the mesh
 # files without running the CPU magnetic solver or changing stock FEMM.
-add_executable(gpu_femm_mesh_noop_solver
-  src/mesh_noop_solver.cpp
-)
+if(WIN32)
+  add_executable(gpu_femm_mesh_noop_solver WIN32
+    src/mesh_noop_solver.cpp
+  )
+else()
+  add_executable(gpu_femm_mesh_noop_solver
+    src/mesh_noop_solver.cpp
+  )
+endif()
 
 set_target_properties(gpu_linear_p1_poc PROPERTIES
   CXX_STANDARD 17
