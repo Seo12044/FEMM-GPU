@@ -85,7 +85,10 @@ native 10-by-10 air-gap element matrix; the stator mesh remains fixed.
 V2 validation is strict: the preserved boundary name, periodicity, center,
 radii, arc length, sector count, indices, and weights must be internally
 consistent. Unknown fields and identity mismatches are rejected just as in v1.
-Eccentric displacement is not supported by this interface.
+Eccentric displacement is not supported by this interface. Requested selected
+and air groups must exist in the artifact. When radial B samples are requested,
+`airgap_radius_mm` must lie inside the native air-gap annulus; FEMM's AGE
+Fourier reconstruction reports the field at the annulus mean radius.
 
 ## `gpu_femm_motor_sample_v1`
 

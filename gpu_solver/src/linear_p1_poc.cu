@@ -4574,9 +4574,29 @@ bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMesh
       : request.rotor_angle_deg == artifact.rotor_angle_deg
           && request.displacement_mm[0] == artifact.displacement_mm[0]
           && request.displacement_mm[1] == artifact.displacement_mm[1];
+  bool matching_sliding_postprocess = true;
+  if (artifact.has_sliding_band) {
+    const auto has_group = [&artifact](int32_t group) {
+      return std::any_of(artifact.model.materials.begin(), artifact.model.materials.end(),
+          [group](const NonlinearMaterial& material) { return material.group_number == group; });
+    };
+    matching_sliding_postprocess = has_group(request.selected_group_number)
+        && has_group(request.air_group_number);
+    if (matching_sliding_postprocess && !request.airgap_angles_deg.empty()) {
+      matching_sliding_postprocess = !artifact.model.air_gap_elements.empty();
+      for (const AirGapElement& age : artifact.model.air_gap_elements) {
+        const double inner_radius_mm = 1000.0 * age.inner_radius_m;
+        const double outer_radius_mm = 1000.0 * age.outer_radius_m;
+        const double tolerance_mm = 1e-9 * std::max(1.0, std::abs(outer_radius_mm));
+        matching_sliding_postprocess = matching_sliding_postprocess
+            && request.airgap_radius_mm >= inner_radius_mm - tolerance_mm
+            && request.airgap_radius_mm <= outer_radius_mm + tolerance_mm;
+      }
+    }
+  }
   return request.base_motor_fem_sha256 == artifact.base_motor_fem_sha256
       && request.source_fem_sha256 == artifact.pose_fem_sha256
-      && matching_pose
+      && matching_pose && matching_sliding_postprocess
       && request.circuit_currents_a.size() == static_cast<size_t>(artifact.model.circuit_count);
 }
 
@@ -5607,6 +5627,15 @@ int SelfTest()
   sliding_request.rotor_angle_deg = 3.0; sliding_request.displacement_mm[0] = 0.0;
   expect(RequestMatchesArtifact(sliding_request, sliding_artifact),
       "v2 request permits a centered non-reference rotor angle");
+  MotorSampleRequest invalid_sliding_postprocess = sliding_request;
+  invalid_sliding_postprocess.airgap_angles_deg = { 0.0 };
+  invalid_sliding_postprocess.airgap_radius_mm = 0.7;
+  expect(!RequestMatchesArtifact(invalid_sliding_postprocess, sliding_artifact),
+      "v2 request rejects sampling outside the native AGE annulus");
+  invalid_sliding_postprocess = sliding_request;
+  invalid_sliding_postprocess.selected_group_number = 999;
+  expect(!RequestMatchesArtifact(invalid_sliding_postprocess, sliding_artifact),
+      "v2 request rejects postprocess groups absent from the artifact");
   NonlinearModel shifted_sliding_model;
   expect(ApplySlidingBandRotorAngle(sliding_request, sliding_artifact, &shifted_sliding_model)
           && Near(shifted_sliding_model.air_gap_elements[0].inner_shift, 3.0 / 180.0, 1e-14)
