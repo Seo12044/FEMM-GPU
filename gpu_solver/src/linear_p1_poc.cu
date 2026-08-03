@@ -198,7 +198,8 @@ Status CopyToHost(void* destination, const void* source, size_t bytes)
 bool BuildJacobiInverseDiagonal(const std::vector<double>& diagonal,
     std::vector<double>* inverse_diagonal)
 {
-  if (inverse_diagonal == nullptr) return false;
+  if (inverse_diagonal == nullptr)
+    return false;
   inverse_diagonal->resize(diagonal.size());
   bool usable = true;
   for (size_t index = 0; index < diagonal.size(); ++index) {
@@ -234,14 +235,16 @@ __device__ double DeterministicBlockSum(double local, double* scratch)
   scratch[lane] = local;
   __syncthreads();
   for (int stride = kPcgBlockThreads / 2; stride >= 64; stride /= 2) {
-    if (lane < stride) scratch[lane] += scratch[lane + stride];
+    if (lane < stride)
+      scratch[lane] += scratch[lane + stride];
     __syncthreads();
   }
   if (lane < warpSize) {
     double value = scratch[lane] + scratch[lane + warpSize];
     for (int offset = warpSize / 2; offset > 0; offset /= 2)
       value += __shfl_down_sync(0xffffffffu, value, offset);
-    if (lane == 0) scratch[0] = value;
+    if (lane == 0)
+      scratch[0] = value;
   }
   __syncthreads();
   return scratch[0];
@@ -253,14 +256,16 @@ __device__ double DeterministicBlockMax(double local, double* scratch)
   scratch[lane] = local;
   __syncthreads();
   for (int stride = kPcgBlockThreads / 2; stride >= 64; stride /= 2) {
-    if (lane < stride) scratch[lane] = fmax(scratch[lane], scratch[lane + stride]);
+    if (lane < stride)
+      scratch[lane] = fmax(scratch[lane], scratch[lane + stride]);
     __syncthreads();
   }
   if (lane < warpSize) {
     double value = fmax(scratch[lane], scratch[lane + warpSize]);
     for (int offset = warpSize / 2; offset > 0; offset /= 2)
       value = fmax(value, __shfl_down_sync(0xffffffffu, value, offset));
-    if (lane == 0) scratch[0] = value;
+    if (lane == 0)
+      scratch[0] = value;
   }
   __syncthreads();
   return scratch[0];
@@ -608,8 +613,7 @@ __device__ double CooperativeItemSum(double local, double* reduction_scratch,
 {
   const double block_sum = DeterministicBlockSum(local, reduction_scratch);
   if (threadIdx.x == 0)
-    partials[static_cast<size_t>(item) * shard_count + shard] =
-        block_sum;
+    partials[static_cast<size_t>(item) * shard_count + shard] = block_sum;
   grid.sync();
   if (shard == 0 && threadIdx.x == 0) {
     double sum = 0.0;
@@ -628,8 +632,7 @@ __device__ double CooperativeItemMax(double local, double* reduction_scratch,
 {
   const double block_max = DeterministicBlockMax(local, reduction_scratch);
   if (threadIdx.x == 0)
-    partials[static_cast<size_t>(item) * shard_count + shard] =
-        block_max;
+    partials[static_cast<size_t>(item) * shard_count + shard] = block_max;
   grid.sync();
   if (shard == 0 && threadIdx.x == 0) {
     double maximum = 0.0;
@@ -682,11 +685,14 @@ __global__ void CooperativeDeterministicPcgKernel(
     info->residual_l2 = INFINITY;
     item_controls[kActive] = n > 0 && max_iterations >= 0
             && relative_tolerance > 0.0 && relative_tolerance < 1.0
-            && isfinite(relative_tolerance) ? 1 : 0;
+            && isfinite(relative_tolerance)
+        ? 1
+        : 0;
     item_controls[kThreshold] = 0;
     item_controls[kRestart] = 0;
     item_controls[kVerified] = 0;
-    if (!item_controls[kActive]) info->status = Status::kInvalidArgument;
+    if (!item_controls[kActive])
+      info->status = Status::kInvalidArgument;
   }
   grid.sync();
   // Preserve the established diagonal validation before using an optional
@@ -774,7 +780,8 @@ __global__ void CooperativeDeterministicPcgKernel(
       controls[global_any_index] = any_active;
     }
     grid.sync();
-    if (!controls[global_any_index]) break;
+    if (!controls[global_any_index])
+      break;
     if (item_controls[kActive]) {
       for (int row = begin + lane; row < end; row += kPcgBlockThreads) {
         double sum = 0.0;
@@ -899,7 +906,8 @@ __global__ void CooperativeDeterministicPcgKernel(
           preconditioned[i] = residual[i] * inverse_diagonal[i];
         else
           preconditioned[i] = residual[i] / diagonal[i];
-        if (item_controls[kRestart]) direction[i] = preconditioned[i];
+        if (item_controls[kRestart])
+          direction[i] = preconditioned[i];
       }
     }
     grid.sync();
@@ -975,7 +983,8 @@ __global__ void CooperativeDeterministicPcgKernel(
     } else {
       info->residual_l2 = sqrt(final_residual_sum) * rhs_scale;
       info->status = isfinite(info->residual_l2)
-          ? Status::kLinearSolveNotConverged : Status::kNumericalNonfinite;
+          ? Status::kLinearSolveNotConverged
+          : Status::kNumericalNonfinite;
     }
     item_controls[kActive] = 0;
   }
@@ -1288,16 +1297,24 @@ class GpuCsrSolver {
   Status UpdateValues(const Assembly& assembly)
   {
     if (!HasMatchingStructure(assembly) || assembly.values.size() != host_column_indices_.size()
-        || assembly.diagonal.size() != static_cast<size_t>(n_)) return Status::kInvalidArgument;
-    for (double value : assembly.values) if (!std::isfinite(value)) return Status::kInvalidArgument;
-    for (double value : assembly.diagonal) if (!std::isfinite(value)) return Status::kInvalidArgument;
+        || assembly.diagonal.size() != static_cast<size_t>(n_))
+      return Status::kInvalidArgument;
+    for (double value : assembly.values)
+      if (!std::isfinite(value))
+        return Status::kInvalidArgument;
+    for (double value : assembly.diagonal)
+      if (!std::isfinite(value))
+        return Status::kInvalidArgument;
     std::vector<double> inverse_diagonal;
     inverse_diagonal_usable_ = BuildJacobiInverseDiagonal(
         assembly.diagonal, &inverse_diagonal);
     Status status = CopyToDevice(values_.get(), assembly.values.data(), assembly.values.size() * sizeof(double));
-    if (status != Status::kOk) return status;
+    if (status != Status::kOk)
+      return status;
     if ((status = CopyToDevice(diagonal_.get(), assembly.diagonal.data(),
-             assembly.diagonal.size() * sizeof(double))) != Status::kOk) return status;
+             assembly.diagonal.size() * sizeof(double)))
+        != Status::kOk)
+      return status;
     return CopyToDevice(inverse_diagonal_.get(), inverse_diagonal.data(),
         inverse_diagonal.size() * sizeof(double));
   }
@@ -1349,7 +1366,8 @@ class GpuCsrSolver {
       GpuBatchSolveTiming* timing = nullptr)
   {
     if (infos == nullptr || solutions == nullptr || assemblies.empty()
-        || assemblies.size() != rhs_values.size()) return Status::kInvalidArgument;
+        || assemblies.size() != rhs_values.size())
+      return Status::kInvalidArgument;
     const size_t count = assemblies.size();
     for (size_t item = 0; item < count; ++item) {
       if (!HasMatchingStructure(assemblies[item]) || rhs_values[item].size() != static_cast<size_t>(n_))
@@ -1357,43 +1375,31 @@ class GpuCsrSolver {
     }
     const size_t nnz = host_column_indices_.size();
     const ProfileClock::time_point upload_start = ProfileClock::now();
-    if (batch_capacity_ < count) {
-      Status status = Status::kOk;
-      if ((status = batch_values_.allocate(count * nnz)) != Status::kOk
-          || (status = batch_diagonal_.allocate(count * n_)) != Status::kOk
-          || (status = batch_inverse_diagonal_.allocate(count * n_)) != Status::kOk
-          || (status = batch_rhs_.allocate(count * n_)) != Status::kOk
-          || (status = batch_solution_.allocate(count * n_)) != Status::kOk
-          || (status = batch_residual_.allocate(count * n_)) != Status::kOk
-          || (status = batch_direction_.allocate(count * n_)) != Status::kOk
-          || (status = batch_preconditioned_.allocate(count * n_)) != Status::kOk
-          || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
-          || (status = batch_info_.allocate(count)) != Status::kOk
-          || (status = batch_cooperative_partials_.allocate(
-                  count * kPcgCooperativeShardsPerItem)) != Status::kOk
-          || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
-          || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk) return status;
-      batch_capacity_ = count;
-    }
+    const Status capacity_status = EnsureBatchCapacity(count, nnz);
+    if (capacity_status != Status::kOk)
+      return capacity_status;
     std::vector<double> inverse_diagonal;
     bool batch_inverse_diagonal_usable = true;
     for (size_t item = 0; item < count; ++item) {
       batch_inverse_diagonal_usable = BuildJacobiInverseDiagonal(
-          assemblies[item].diagonal, &inverse_diagonal) && batch_inverse_diagonal_usable;
+                                          assemblies[item].diagonal, &inverse_diagonal)
+          && batch_inverse_diagonal_usable;
       Status status = CopyToDevice(batch_values_.get() + item * nnz, assemblies[item].values.data(), nnz * sizeof(double));
-      if (status != Status::kOk) return status;
+      if (status != Status::kOk)
+        return status;
       if ((status = CopyToDevice(batch_diagonal_.get() + item * n_, assemblies[item].diagonal.data(), n_ * sizeof(double))) != Status::kOk
           || (status = CopyToDevice(batch_inverse_diagonal_.get() + item * n_, inverse_diagonal.data(), n_ * sizeof(double))) != Status::kOk
-          || (status = CopyToDevice(batch_rhs_.get() + item * n_, rhs_values[item].data(), n_ * sizeof(double))) != Status::kOk) return status;
+          || (status = CopyToDevice(batch_rhs_.get() + item * n_, rhs_values[item].data(), n_ * sizeof(double))) != Status::kOk)
+        return status;
     }
-    if (timing != nullptr) timing->upload_seconds += ProfileSecondsSince(upload_start);
+    if (timing != nullptr)
+      timing->upload_seconds += ProfileSecondsSince(upload_start);
     const ProfileClock::time_point kernel_start = ProfileClock::now();
     const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
         count, nnz, relative_tolerance, max_iterations, batch_inverse_diagonal_usable);
     if (cooperative_result == CooperativeLaunchResult::kFailed)
       return Status::kInternalError;
-    const bool launched_cooperatively =
-        cooperative_result == CooperativeLaunchResult::kCompleted;
+    const bool launched_cooperatively = cooperative_result == CooperativeLaunchResult::kCompleted;
     if (!launched_cooperatively && batch_inverse_diagonal_usable) {
       DeterministicPcgKernel<true><<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
           n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
@@ -1409,23 +1415,156 @@ class GpuCsrSolver {
           batch_matrix_direction_.get(), relative_tolerance, max_iterations, batch_info_.get(),
           static_cast<int>(nnz));
     }
-    if (launches != nullptr) ++*launches;
+    if (launches != nullptr)
+      ++*launches;
     if (!launched_cooperatively
-        && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) return Status::kInternalError;
-    if (timing != nullptr) timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
+        && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess))
+      return Status::kInternalError;
+    if (timing != nullptr)
+      timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
     const ProfileClock::time_point download_start = ProfileClock::now();
-    infos->assign(count, SolveInfo {}); solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
+    infos->assign(count, SolveInfo {});
+    solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
     for (size_t item = 0; item < count; ++item) {
       Status status = CopyToHost(&(*infos)[item], batch_info_.get() + item, sizeof(SolveInfo));
-      if (status != Status::kOk) return status;
-      if ((status = CopyToHost((*solutions)[item].data(), batch_solution_.get() + item * n_, n_ * sizeof(double))) != Status::kOk) return status;
+      if (status != Status::kOk)
+        return status;
+      if ((status = CopyToHost((*solutions)[item].data(), batch_solution_.get() + item * n_, n_ * sizeof(double))) != Status::kOk)
+        return status;
     }
-    if (timing != nullptr) timing->download_seconds += ProfileSecondsSince(download_start);
+    if (timing != nullptr)
+      timing->download_seconds += ProfileSecondsSince(download_start);
+    return Status::kOk;
+  }
+
+  // Device nonlinear assembly writes these numeric buffers directly.  The
+  // immutable CSR graph remains owned here, while this narrow API avoids a
+  // host round trip for values, diagonal and RHS between Newton assembly and
+  // PCG.  It is intentionally batch-only: the established single-solve path
+  // remains the conservative reference implementation.
+  Status PrepareDeviceBatch(size_t count)
+  {
+    if (!initialized_ || count == 0)
+      return Status::kInvalidArgument;
+    return EnsureBatchCapacity(count, host_column_indices_.size());
+  }
+
+  int device_dimension() const { return n_; }
+  size_t device_nnz() const { return host_column_indices_.size(); }
+  double* device_batch_values() { return batch_values_.get(); }
+  double* device_batch_diagonal() { return batch_diagonal_.get(); }
+  double* device_batch_inverse_diagonal() { return batch_inverse_diagonal_.get(); }
+  double* device_batch_rhs() { return batch_rhs_.get(); }
+  void set_device_batch_inverse_diagonal_usable(bool value) { batch_inverse_diagonal_usable_ = value; }
+
+  Status CopyPreparedDeviceAssembly(size_t item, std::vector<double>* values,
+      std::vector<double>* diagonal, std::vector<double>* rhs) const
+  {
+    if (!initialized_ || values == nullptr || diagonal == nullptr || rhs == nullptr
+        || item >= batch_capacity_)
+      return Status::kInvalidArgument;
+    const size_t nnz = host_column_indices_.size();
+    values->resize(nnz);
+    diagonal->resize(static_cast<size_t>(n_));
+    rhs->resize(static_cast<size_t>(n_));
+    Status status = CopyToHost(values->data(), batch_values_.get() + item * nnz,
+        nnz * sizeof(double));
+    if (status != Status::kOk)
+      return status;
+    status = CopyToHost(diagonal->data(), batch_diagonal_.get() + item * n_,
+        static_cast<size_t>(n_) * sizeof(double));
+    if (status != Status::kOk)
+      return status;
+    return CopyToHost(rhs->data(), batch_rhs_.get() + item * n_,
+        static_cast<size_t>(n_) * sizeof(double));
+  }
+
+  Status SolvePreparedDeviceBatch(size_t count, double relative_tolerance,
+      int max_iterations, std::vector<SolveInfo>* infos,
+      std::vector<std::vector<double>>* solutions, int* launches,
+      GpuBatchSolveTiming* timing = nullptr)
+  {
+    if (!initialized_ || infos == nullptr || solutions == nullptr || count == 0
+        || count > batch_capacity_)
+      return Status::kInvalidArgument;
+    const size_t nnz = host_column_indices_.size();
+    const ProfileClock::time_point kernel_start = ProfileClock::now();
+    const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
+        count, nnz, relative_tolerance, max_iterations,
+        batch_inverse_diagonal_usable_);
+    if (cooperative_result == CooperativeLaunchResult::kFailed)
+      return Status::kInternalError;
+    const bool launched_cooperatively = cooperative_result == CooperativeLaunchResult::kCompleted;
+    // Device assembly has already produced an inverse diagonal.  Its kernel
+    // marks invalid entries before this point, so the regular fallback only
+    // selects whether Jacobi multiplication or validated division is used.
+    if (!launched_cooperatively && batch_inverse_diagonal_usable_) {
+      DeterministicPcgKernel<true><<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
+          batch_inverse_diagonal_.get(), batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(),
+          batch_direction_.get(), batch_preconditioned_.get(), batch_matrix_direction_.get(),
+          relative_tolerance, max_iterations, batch_info_.get(), static_cast<int>(nnz));
+    } else if (!launched_cooperatively) {
+      DeterministicPcgKernel<false><<<static_cast<unsigned int>(count), kPcgBlockThreads>>>(
+          n_, row_offsets_.get(), column_indices_.get(), batch_values_.get(), batch_diagonal_.get(),
+          batch_inverse_diagonal_.get(), batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(),
+          batch_direction_.get(), batch_preconditioned_.get(), batch_matrix_direction_.get(),
+          relative_tolerance, max_iterations, batch_info_.get(), static_cast<int>(nnz));
+    }
+    if (launches != nullptr)
+      ++*launches;
+    if (!launched_cooperatively
+        && (cudaGetLastError() != cudaSuccess
+            || cudaDeviceSynchronize() != cudaSuccess))
+      return Status::kInternalError;
+    if (timing != nullptr)
+      timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
+    const ProfileClock::time_point download_start = ProfileClock::now();
+    infos->assign(count, SolveInfo {});
+    solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
+    for (size_t item = 0; item < count; ++item) {
+      Status status = CopyToHost(&(*infos)[item], batch_info_.get() + item, sizeof(SolveInfo));
+      if (status != Status::kOk)
+        return status;
+      if ((status = CopyToHost((*solutions)[item].data(), batch_solution_.get() + item * n_,
+               n_ * sizeof(double)))
+          != Status::kOk)
+        return status;
+    }
+    if (timing != nullptr)
+      timing->download_seconds += ProfileSecondsSince(download_start);
     return Status::kOk;
   }
 
   private:
-  enum class CooperativeLaunchResult { kNotSupported, kCompleted, kFailed };
+  Status EnsureBatchCapacity(size_t count, size_t nnz)
+  {
+    if (batch_capacity_ >= count && batch_dimension_ == n_
+        && batch_nnz_ == nnz)
+      return Status::kOk;
+    Status status = Status::kOk;
+    if ((status = batch_values_.allocate(count * nnz)) != Status::kOk
+        || (status = batch_diagonal_.allocate(count * n_)) != Status::kOk
+        || (status = batch_inverse_diagonal_.allocate(count * n_)) != Status::kOk
+        || (status = batch_rhs_.allocate(count * n_)) != Status::kOk
+        || (status = batch_solution_.allocate(count * n_)) != Status::kOk
+        || (status = batch_residual_.allocate(count * n_)) != Status::kOk
+        || (status = batch_direction_.allocate(count * n_)) != Status::kOk
+        || (status = batch_preconditioned_.allocate(count * n_)) != Status::kOk
+        || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
+        || (status = batch_info_.allocate(count)) != Status::kOk
+        || (status = batch_cooperative_partials_.allocate(count * kPcgCooperativeShardsPerItem)) != Status::kOk
+        || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
+        || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk)
+      return status;
+    batch_capacity_ = count;
+    batch_dimension_ = n_;
+    batch_nnz_ = nnz;
+    return Status::kOk;
+  }
+  enum class CooperativeLaunchResult { kNotSupported,
+    kCompleted,
+    kFailed };
 
   CooperativeLaunchResult TryLaunchCooperativeBatch(
       size_t count, size_t nnz, double relative_tolerance,
@@ -1443,7 +1582,8 @@ class GpuCsrSolver {
     cudaDeviceProp properties {};
     if (cudaGetDevice(&device) != cudaSuccess
         || cudaDeviceGetAttribute(&cooperative_supported, cudaDevAttrCooperativeLaunch,
-               device) != cudaSuccess
+               device)
+            != cudaSuccess
         || cooperative_supported == 0
         || cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
       cudaGetLastError();
@@ -1523,6 +1663,9 @@ class GpuCsrSolver {
   DeviceBuffer<SolveInfo> batch_info_;
   DeviceBuffer<double> batch_cooperative_partials_, batch_cooperative_scalars_;
   DeviceBuffer<int> batch_cooperative_controls_;
+  bool batch_inverse_diagonal_usable_ = true;
+  int batch_dimension_ = 0;
+  size_t batch_nnz_ = 0;
 };
 
 class LinearP1FixtureSolver {
@@ -1960,12 +2103,15 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
         || !std::isfinite(age.center_x_m) || !std::isfinite(age.center_y_m)
         || !std::isfinite(age.inner_shift) || !std::isfinite(age.outer_shift))
       return Status::kMeshInvalid;
-    for (const AirGapQuadPoint& point : age.quad_points) for (int local = 0; local < 4; ++local) {
-      if (point.node[local] < 0 || static_cast<size_t>(point.node[local]) >= model.nodes.size()
-          || !std::isfinite(point.weight[local])) return Status::kMeshInvalid;
-    }
+    for (const AirGapQuadPoint& point : age.quad_points)
+      for (int local = 0; local < 4; ++local) {
+        if (point.node[local] < 0 || static_cast<size_t>(point.node[local]) >= model.nodes.size()
+            || !std::isfinite(point.weight[local]))
+          return Status::kMeshInvalid;
+      }
     const double dt = age.arc_length_deg / static_cast<double>(elements);
-    if (!(dt > 0.0) || !std::isfinite(dt)) return Status::kMeshInvalid;
+    if (!(dt > 0.0) || !std::isfinite(dt))
+      return Status::kMeshInvalid;
   }
   return Status::kOk;
 }
@@ -2010,7 +2156,7 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
         ? EvaluateNonlinearBh(model.bh_curves[material.bh_curve_index], b_magnitude)
         : NonlinearBhEvaluation {};
     double reluctivity = material.bh_curve_index >= 0 ? bh.reluctivity_m_per_h
-        : material.reluctivity_zero_m_per_h
+                                                      : material.reluctivity_zero_m_per_h
             * (1.0 + material.alpha_per_t2 * b_magnitude * b_magnitude);
     // The Newton term uses d(v)/d(B^2), so a v0*(1+alpha*B^2)
     // material contributes v0*alpha without an extra |B| factor.
@@ -2057,17 +2203,24 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
   }
   for (const AirGapElement& age : model.air_gap_elements) {
     const size_t elements = age.quad_points.size() - 1;
-    if (elements == 0) return Status::kMeshInvalid;
+    if (elements == 0)
+      return Status::kMeshInvalid;
     const double dt = (3.141592653589793238462643383279502884 / 180.0)
         * age.arc_length_deg / static_cast<double>(elements);
     const double K = 2.0 * (age.outer_radius_m - age.inner_radius_m)
         / (dt * (age.outer_radius_m + age.inner_radius_m));
     const double Ki = 1.0 / K;
     double ci = age.inner_shift, co = age.outer_shift;
-    if (ci > co) { ci -= co; co = 0.0; }
-    else { ci = 1.0 - co + ci; co = 1.0; }
+    if (ci > co) {
+      ci -= co;
+      co = 0.0;
+    } else {
+      ci = 1.0 - co + ci;
+      co = 1.0;
+    }
     double matrix[10][10];
-    if (!BuildNativeFemmAirGapMatrix(K, Ki, ci, co, matrix)) return Status::kMeshInvalid;
+    if (!BuildNativeFemmAirGapMatrix(K, Ki, ci, co, matrix))
+      return Status::kMeshInvalid;
     for (size_t k = 0; k < elements; ++k) {
       const size_t previous = k == 0 ? elements - 1 : k - 1;
       const size_t next = k + 1;
@@ -2077,22 +2230,32 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
         age.quad_points[k].node[1], age.quad_points[next].node[1],
         age.quad_points[next2].node[1], age.quad_points[previous].node[2],
         age.quad_points[k].node[2], age.quad_points[k].node[3],
-        age.quad_points[next].node[3], age.quad_points[next2].node[3] };
+        age.quad_points[next].node[3], age.quad_points[next2].node[3]
+      };
       double weight[10] = {
         age.quad_points[previous].weight[0], age.quad_points[k].weight[0],
         age.quad_points[k].weight[1], age.quad_points[next].weight[1],
         age.quad_points[next2].weight[1], age.quad_points[previous].weight[2],
         age.quad_points[k].weight[2], age.quad_points[k].weight[3],
-        age.quad_points[next].weight[3], age.quad_points[next2].weight[3] };
-      if (age.antiperiodic && k == 0) { weight[0] = -weight[0]; weight[5] = -weight[5]; }
-      if (age.antiperiodic && k + 1 == elements) { weight[4] = -weight[4]; weight[9] = -weight[9]; }
-      for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j) {
-        // fkn works in a relative-permeability, centimetre-scaled system;
-        // this solver's P1 assembly is SI and carries 1/mu0 explicitly.
-        const Status added = AddSparseEntry(&jacobian, node[i], node[j],
-            matrix[i][j] * weight[i] * weight[j] * kNativeFemmAgeToSiReluctivity);
-        if (added != Status::kOk) return added;
+        age.quad_points[next].weight[3], age.quad_points[next2].weight[3]
+      };
+      if (age.antiperiodic && k == 0) {
+        weight[0] = -weight[0];
+        weight[5] = -weight[5];
       }
+      if (age.antiperiodic && k + 1 == elements) {
+        weight[4] = -weight[4];
+        weight[9] = -weight[9];
+      }
+      for (int i = 0; i < 10; ++i)
+        for (int j = 0; j < 10; ++j) {
+          // fkn works in a relative-permeability, centimetre-scaled system;
+          // this solver's P1 assembly is SI and carries 1/mu0 explicitly.
+          const Status added = AddSparseEntry(&jacobian, node[i], node[j],
+              matrix[i][j] * weight[i] * weight[j] * kNativeFemmAgeToSiReluctivity);
+          if (added != Status::kOk)
+            return added;
+        }
     }
   }
   const Status sparse_validation = ValidateSparseRows(jacobian);
@@ -2155,14 +2318,458 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
       use_newton, assembly);
 }
 
+// First production assembly stage.  The symbolic graph and all contributor
+// routes are made once per immutable model, then every Newton state writes
+// numeric CSR values/diagonal/RHS directly into GpuCsrSolver's batch buffers.
+// Host Newton state updates intentionally remain below; this keeps the new
+// path narrow and makes the existing host assembler an exact fallback.
+struct DeviceNonlinearTriangle {
+  int32_t node[3];
+  double area_m2;
+  double b_x[3];
+  double b_y[3];
+  double reluctivity_zero;
+  double alpha;
+  int32_t curve_offset;
+  int32_t curve_count;
+  double cold_secant;
+  int32_t circuit_index;
+  double coil;
+  double pm[3];
+};
+
+__device__ bool DeviceBhEvaluation(const DeviceNonlinearTriangle& triangle,
+    const double* curve_b, const double* curve_h, const double* curve_slope,
+    double field_b, double* reluctivity, double* derivative)
+{
+  if (reluctivity == nullptr || derivative == nullptr || triangle.curve_count < 2)
+    return false;
+  const double b = fabs(field_b);
+  const int offset = triangle.curve_offset;
+  if (b == 0.0) {
+    *reluctivity = curve_slope[offset];
+    *derivative = 0.0;
+    return isfinite(*reluctivity);
+  }
+  double h = 0.0, dh = 0.0;
+  const int last = offset + triangle.curve_count - 1;
+  if (b > curve_b[last]) {
+    h = curve_h[last] + curve_slope[last] * (b - curve_b[last]);
+    dh = curve_slope[last];
+  } else {
+    bool found = false;
+    for (int index = offset; index < last; ++index) {
+      if (b >= curve_b[index] && b <= curve_b[index + 1]) {
+        const double length = curve_b[index + 1] - curve_b[index];
+        const double z = (b - curve_b[index]) / length, z2 = z * z;
+        h = (1.0 - 3.0 * z2 + 2.0 * z2 * z) * curve_h[index]
+            + z * (1.0 - 2.0 * z + z2) * length * curve_slope[index]
+            + z2 * (3.0 - 2.0 * z) * curve_h[index + 1]
+            + z2 * (z - 1.0) * length * curve_slope[index + 1];
+        dh = 6.0 * z * (z - 1.0) * curve_h[index] / length
+            + (1.0 - 4.0 * z + 3.0 * z2) * curve_slope[index]
+            + 6.0 * z * (1.0 - z) * curve_h[index + 1] / length
+            + z * (3.0 * z - 2.0) * curve_slope[index + 1];
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+      return false;
+  }
+  *reluctivity = h / b;
+  *derivative = 0.5 * (dh / (b * b) - h / (b * b * b));
+  return isfinite(*reluctivity) && isfinite(*derivative);
+}
+
+__global__ void DeviceNonlinearElementKernel(const DeviceNonlinearTriangle* triangles,
+    size_t triangle_count, const double* old_a, size_t node_count,
+    const double* curve_b, const double* curve_h, const double* curve_slope,
+    bool use_newton, double* bx_values, double* by_values, double* nu_values,
+    double* derivative_values, int* valid)
+{
+  const size_t triangle = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t item = blockIdx.y;
+  if (triangle >= triangle_count)
+    return;
+  const DeviceNonlinearTriangle properties = triangles[triangle];
+  const double* a = old_a + item * node_count;
+  double bx = 0.0, by = 0.0;
+  for (int local = 0; local < 3; ++local) {
+    bx += a[properties.node[local]] * properties.b_x[local];
+    by += a[properties.node[local]] * properties.b_y[local];
+  }
+  const double magnitude = hypot(bx, by);
+  double nu = 0.0, derivative = 0.0;
+  bool ok = isfinite(magnitude);
+  if (ok && properties.curve_count >= 0) {
+    if (!use_newton) {
+      nu = properties.cold_secant;
+      derivative = 0.0;
+    } else
+      ok = DeviceBhEvaluation(properties, curve_b, curve_h, curve_slope,
+          magnitude, &nu, &derivative);
+  } else if (ok) {
+    nu = properties.reluctivity_zero * (1.0 + properties.alpha * magnitude * magnitude);
+    derivative = use_newton ? properties.reluctivity_zero * properties.alpha : 0.0;
+  }
+  const size_t index = item * triangle_count + triangle;
+  bx_values[index] = bx;
+  by_values[index] = by;
+  nu_values[index] = nu;
+  derivative_values[index] = derivative;
+  if (!ok || !(nu > 0.0) || !isfinite(derivative))
+    atomicExch(valid, 0);
+}
+
+__global__ void DeviceNonlinearValuesKernel(const DeviceNonlinearTriangle* triangles,
+    const int32_t* contributor_offsets, const int32_t* contributors, size_t nnz,
+    const double* base_values, const double* bx_values, const double* by_values,
+    const double* nu_values, const double* derivative_values, size_t triangle_count,
+    bool use_newton, double* values)
+{
+  const size_t slot = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t item = blockIdx.y;
+  if (slot >= nnz)
+    return;
+  double sum = 0.0;
+  const size_t element_base = item * triangle_count;
+  // The contributor list is fixed in host element/i/j emission order. One
+  // lane owns a slot, so no atomic or schedule-dependent reduction is used.
+  for (int32_t position = contributor_offsets[slot]; position < contributor_offsets[slot + 1]; ++position) {
+    const int32_t encoded = contributors[position];
+    const size_t triangle_index = static_cast<size_t>(encoded / 9);
+    const int local_i = (encoded % 9) / 3, local_j = encoded % 3;
+    const DeviceNonlinearTriangle triangle = triangles[triangle_index];
+    const double bx = bx_values[element_base + triangle_index];
+    const double by = by_values[element_base + triangle_index];
+    const double gradient = triangle.b_x[local_i] * triangle.b_x[local_j]
+        + triangle.b_y[local_i] * triangle.b_y[local_j];
+    const double k = triangle.area_m2 * nu_values[element_base + triangle_index] * gradient;
+    const double c = use_newton ? 2.0 * triangle.area_m2
+            * derivative_values[element_base + triangle_index]
+            * (bx * triangle.b_x[local_i] + by * triangle.b_y[local_i])
+            * (bx * triangle.b_x[local_j] + by * triangle.b_y[local_j])
+                                : 0.0;
+    sum += k + c;
+  }
+  // Host assembly emits every triangle before AGE contributions.  Preserve
+  // that phase ordering even though the fixed AGE terms are pre-accumulated.
+  sum += base_values[slot];
+  values[item * nnz + slot] = sum;
+}
+
+__global__ void DeviceNonlinearRhsKernel(const DeviceNonlinearTriangle* triangles,
+    const int32_t* contributor_offsets, const int32_t* contributors, size_t free_count,
+    const double* pm_rhs, const double* circuit_rhs, int circuit_count,
+    const double* currents, const double* age_rhs, const double* old_a,
+    const double* boundary_values, const double* bx_values, const double* by_values,
+    const double* nu_values, const double* derivative_values, size_t triangle_count,
+    size_t node_count, bool use_newton, double* rhs)
+{
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t item = blockIdx.y;
+  if (row >= free_count)
+    return;
+  double sum = pm_rhs[row] + age_rhs[row];
+  for (int circuit = 0; circuit < circuit_count; ++circuit)
+    sum += currents[item * static_cast<size_t>(circuit_count) + circuit]
+        * circuit_rhs[static_cast<size_t>(circuit) * free_count + row];
+  const size_t element_base = item * triangle_count;
+  for (int32_t position = contributor_offsets[row]; position < contributor_offsets[row + 1]; ++position) {
+    const int32_t encoded = contributors[position];
+    const size_t triangle_index = static_cast<size_t>(encoded / 3);
+    const int local_i = encoded % 3;
+    const DeviceNonlinearTriangle triangle = triangles[triangle_index];
+    const double bx = bx_values[element_base + triangle_index];
+    const double by = by_values[element_base + triangle_index];
+    for (int local_j = 0; local_j < 3; ++local_j) {
+      const double b_i = bx * triangle.b_x[local_i] + by * triangle.b_y[local_i];
+      const double b_j = bx * triangle.b_x[local_j] + by * triangle.b_y[local_j];
+      const double k = triangle.area_m2 * nu_values[element_base + triangle_index]
+          * (triangle.b_x[local_i] * triangle.b_x[local_j]
+              + triangle.b_y[local_i] * triangle.b_y[local_j]);
+      const double c = use_newton ? 2.0 * triangle.area_m2
+              * derivative_values[element_base + triangle_index] * b_i * b_j
+                                  : 0.0;
+      const int32_t node = triangle.node[local_j];
+      if (use_newton)
+        sum += c * old_a[item * node_count + node];
+      if (boundary_values[node] != 0.0)
+        sum -= (k + c) * boundary_values[node];
+    }
+  }
+  rhs[item * free_count + row] = sum;
+}
+
+__global__ void DeviceNonlinearDiagonalKernel(const int32_t* diagonal_slots,
+    size_t free_count, size_t nnz, const double* values, double* diagonal,
+    double* inverse_diagonal, int* valid)
+{
+  const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t item = blockIdx.y;
+  if (row >= free_count)
+    return;
+  const int32_t slot = diagonal_slots[row];
+  const double value = slot >= 0 && static_cast<size_t>(slot) < nnz
+      ? values[item * nnz + slot]
+      : 0.0;
+  diagonal[item * free_count + row] = value;
+  if (isfinite(value) && value > 0.0)
+    inverse_diagonal[item * free_count + row] = 1.0 / value;
+  else {
+    inverse_diagonal[item * free_count + row] = 0.0;
+    atomicExch(valid, 0);
+  }
+}
+
+class DeviceNonlinearAssemblyPlan {
+  public:
+  Status Initialize(const NonlinearModel& model)
+  {
+    if (ValidateNonlinearModel(model) != Status::kOk)
+      return Status::kInvalidArgument;
+    node_count_ = model.nodes.size();
+    circuit_count_ = model.circuit_count;
+    std::vector<bool> boundary(node_count_, false);
+    std::vector<double> boundary_values(node_count_, 0.0);
+    for (size_t index = 0; index < model.dirichlet_nodes.size(); ++index) {
+      boundary[model.dirichlet_nodes[index]] = true;
+      boundary_values[model.dirichlet_nodes[index]] = model.dirichlet_a_wb_per_m[index];
+    }
+    std::vector<int32_t> free_index(node_count_, -1), free_nodes;
+    for (size_t node = 0; node < node_count_; ++node)
+      if (!boundary[node]) {
+        free_index[node] = static_cast<int32_t>(free_nodes.size());
+        free_nodes.push_back(static_cast<int32_t>(node));
+      }
+    free_count_ = free_nodes.size();
+    std::vector<std::map<int32_t, int32_t>> structural(free_count_);
+    const auto add_structure = [&structural, &free_index](int32_t row, int32_t column) {
+      if (free_index[row] >= 0 && free_index[column] >= 0)
+        structural[free_index[row]][free_index[column]] = -1;
+    };
+    for (const NonlinearTriangle& triangle : model.triangles)
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          add_structure(triangle.node[i], triangle.node[j]);
+    for (const AirGapElement& age : model.air_gap_elements) {
+      const size_t elements = age.quad_points.size() - 1;
+      for (size_t k = 0; k < elements; ++k) {
+        const size_t previous = k == 0 ? elements - 1 : k - 1, next = k + 1, next2 = k + 2 > elements ? 1 : k + 2;
+        const int32_t node[10] = { age.quad_points[previous].node[0], age.quad_points[k].node[0], age.quad_points[k].node[1], age.quad_points[next].node[1], age.quad_points[next2].node[1], age.quad_points[previous].node[2], age.quad_points[k].node[2], age.quad_points[k].node[3], age.quad_points[next].node[3], age.quad_points[next2].node[3] };
+        for (int i = 0; i < 10; ++i)
+          for (int j = 0; j < 10; ++j)
+            add_structure(node[i], node[j]);
+      }
+    }
+    Assembly symbolic;
+    symbolic.free_nodes = free_nodes;
+    symbolic.boundary_values = boundary_values;
+    symbolic.row_offsets.assign(free_count_ + 1, 0);
+    std::vector<int32_t> diagonal_slots(free_count_, -1);
+    for (size_t row = 0; row < free_count_; ++row) {
+      symbolic.row_offsets[row] = static_cast<int32_t>(symbolic.column_indices.size());
+      for (const auto& entry : structural[row]) {
+        const int32_t slot = static_cast<int32_t>(symbolic.column_indices.size());
+        structural[row][entry.first] = slot;
+        symbolic.column_indices.push_back(entry.first);
+        symbolic.values.push_back(0.0);
+        if (entry.first == static_cast<int32_t>(row))
+          diagonal_slots[row] = slot;
+      }
+      if (diagonal_slots[row] < 0)
+        return Status::kAssemblyFailed;
+    }
+    symbolic.row_offsets[free_count_] = static_cast<int32_t>(symbolic.column_indices.size());
+    symbolic.diagonal.assign(free_count_, 1.0);
+    symbolic.rhs_per_amp.assign(free_count_, 0.0);
+    symbolic.rhs_offset.assign(free_count_, 0.0);
+    nnz_ = symbolic.values.size();
+    std::vector<std::vector<int32_t>> contributors(nnz_), rhs_contributors(free_count_);
+    std::vector<DeviceNonlinearTriangle> triangles;
+    triangles.reserve(model.triangles.size());
+    std::vector<double> pm_rhs(free_count_, 0.0), circuit_rhs(static_cast<size_t>(circuit_count_) * free_count_, 0.0);
+    std::vector<double> curve_b, curve_h, curve_slope;
+    std::vector<int32_t> curve_offsets(model.bh_curves.size(), -1), curve_counts(model.bh_curves.size(), 0);
+    for (size_t curve = 0; curve < model.bh_curves.size(); ++curve) {
+      curve_offsets[curve] = static_cast<int32_t>(curve_b.size());
+      curve_counts[curve] = static_cast<int32_t>(model.bh_curves[curve].b_t.size());
+      curve_b.insert(curve_b.end(), model.bh_curves[curve].b_t.begin(), model.bh_curves[curve].b_t.end());
+      curve_h.insert(curve_h.end(), model.bh_curves[curve].h_a_per_m.begin(), model.bh_curves[curve].h_a_per_m.end());
+      curve_slope.insert(curve_slope.end(), model.bh_curves[curve].slope.begin(), model.bh_curves[curve].slope.end());
+    }
+    for (size_t element = 0; element < model.triangles.size(); ++element) {
+      const NonlinearTriangle& triangle = model.triangles[element];
+      const NonlinearMaterial& material = model.materials[triangle.material];
+      Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+      NonlinearElementTerms terms;
+      if (!BuildElementTerms(p, &terms))
+        return Status::kMeshInvalid;
+      DeviceNonlinearTriangle device {};
+      device.area_m2 = terms.area_m2;
+      device.reluctivity_zero = material.reluctivity_zero_m_per_h;
+      device.alpha = material.alpha_per_t2;
+      device.curve_offset = material.bh_curve_index >= 0 ? curve_offsets[material.bh_curve_index] : -1;
+      device.curve_count = material.bh_curve_index >= 0 ? curve_counts[material.bh_curve_index] : -1;
+      device.cold_secant = material.bh_curve_index >= 0 ? model.bh_curves[material.bh_curve_index].cold_secant_reluctivity_m_per_h : 0.0;
+      device.circuit_index = material.circuit_index;
+      device.coil = terms.area_m2 * material.source_j_per_a / 3.0;
+      const double theta = material.magnetization_deg * 3.141592653589793238462643383279502884 / 180.0, hcx = material.h_c_a_per_m * std::cos(theta), hcy = material.h_c_a_per_m * std::sin(theta);
+      for (int i = 0; i < 3; ++i) {
+        device.node[i] = triangle.node[i];
+        device.b_x[i] = terms.b_x[i];
+        device.b_y[i] = terms.b_y[i];
+        device.pm[i] = terms.area_m2 * (hcx * terms.b_x[i] + hcy * terms.b_y[i]);
+        const int32_t row = free_index[triangle.node[i]];
+        if (row >= 0) {
+          rhs_contributors[row].push_back(static_cast<int32_t>(element * 3 + i));
+          pm_rhs[row] += device.pm[i];
+          if (device.circuit_index >= 0)
+            circuit_rhs[static_cast<size_t>(device.circuit_index) * free_count_ + row] += device.coil;
+        }
+        for (int j = 0; j < 3; ++j)
+          if (free_index[triangle.node[i]] >= 0 && free_index[triangle.node[j]] >= 0)
+            contributors[structural[free_index[triangle.node[i]]][free_index[triangle.node[j]]]].push_back(static_cast<int32_t>(element * 9 + i * 3 + j));
+      }
+      triangles.push_back(device);
+    }
+    std::vector<double> age_values(nnz_, 0.0), age_rhs(free_count_, 0.0);
+    for (const AirGapElement& age : model.air_gap_elements) {
+      const size_t elements = age.quad_points.size() - 1;
+      const double dt = (3.141592653589793238462643383279502884 / 180.0) * age.arc_length_deg / static_cast<double>(elements);
+      const double K = 2.0 * (age.outer_radius_m - age.inner_radius_m) / (dt * (age.outer_radius_m + age.inner_radius_m)), Ki = 1.0 / K;
+      double ci = age.inner_shift, co = age.outer_shift;
+      if (ci > co) {
+        ci -= co;
+        co = 0.0;
+      } else {
+        ci = 1.0 - co + ci;
+        co = 1.0;
+      }
+      double matrix[10][10];
+      if (!BuildNativeFemmAirGapMatrix(K, Ki, ci, co, matrix))
+        return Status::kMeshInvalid;
+      for (size_t k = 0; k < elements; ++k) {
+        const size_t previous = k == 0 ? elements - 1 : k - 1, next = k + 1, next2 = k + 2 > elements ? 1 : k + 2;
+        const int32_t node[10] = { age.quad_points[previous].node[0], age.quad_points[k].node[0], age.quad_points[k].node[1], age.quad_points[next].node[1], age.quad_points[next2].node[1], age.quad_points[previous].node[2], age.quad_points[k].node[2], age.quad_points[k].node[3], age.quad_points[next].node[3], age.quad_points[next2].node[3] };
+        double weight[10] = { age.quad_points[previous].weight[0], age.quad_points[k].weight[0], age.quad_points[k].weight[1], age.quad_points[next].weight[1], age.quad_points[next2].weight[1], age.quad_points[previous].weight[2], age.quad_points[k].weight[2], age.quad_points[k].weight[3], age.quad_points[next].weight[3], age.quad_points[next2].weight[3] };
+        if (age.antiperiodic && k == 0) {
+          weight[0] = -weight[0];
+          weight[5] = -weight[5];
+        }
+        if (age.antiperiodic && k + 1 == elements) {
+          weight[4] = -weight[4];
+          weight[9] = -weight[9];
+        }
+        for (int i = 0; i < 10; ++i)
+          for (int j = 0; j < 10; ++j) {
+            const double value = matrix[i][j] * weight[i] * weight[j] * kNativeFemmAgeToSiReluctivity;
+            const int32_t row = free_index[node[i]], column = free_index[node[j]];
+            if (row >= 0 && column >= 0)
+              age_values[structural[row][column]] += value;
+            else if (row >= 0 && boundary[node[j]])
+              age_rhs[row] -= value * boundary_values[node[j]];
+          }
+      }
+    }
+    std::vector<int32_t> matrix_offsets(nnz_ + 1, 0), matrix_entries, rhs_offsets(free_count_ + 1, 0), rhs_entries;
+    for (size_t slot = 0; slot < nnz_; ++slot) {
+      matrix_offsets[slot] = static_cast<int32_t>(matrix_entries.size());
+      matrix_entries.insert(matrix_entries.end(), contributors[slot].begin(), contributors[slot].end());
+    }
+    matrix_offsets[nnz_] = static_cast<int32_t>(matrix_entries.size());
+    for (size_t row = 0; row < free_count_; ++row) {
+      rhs_offsets[row] = static_cast<int32_t>(rhs_entries.size());
+      rhs_entries.insert(rhs_entries.end(), rhs_contributors[row].begin(), rhs_contributors[row].end());
+    }
+    rhs_offsets[free_count_] = static_cast<int32_t>(rhs_entries.size());
+    Status status = Status::kOk;
+    if ((status = d_triangles_.allocate(triangles.size())) != Status::kOk || (status = d_curve_b_.allocate(curve_b.size())) != Status::kOk || (status = d_curve_h_.allocate(curve_h.size())) != Status::kOk || (status = d_curve_slope_.allocate(curve_slope.size())) != Status::kOk || (status = d_matrix_offsets_.allocate(matrix_offsets.size())) != Status::kOk || (status = d_matrix_entries_.allocate(matrix_entries.size())) != Status::kOk || (status = d_rhs_offsets_.allocate(rhs_offsets.size())) != Status::kOk || (status = d_rhs_entries_.allocate(rhs_entries.size())) != Status::kOk || (status = d_base_values_.allocate(age_values.size())) != Status::kOk || (status = d_age_rhs_.allocate(age_rhs.size())) != Status::kOk || (status = d_pm_rhs_.allocate(pm_rhs.size())) != Status::kOk || (status = d_circuit_rhs_.allocate(circuit_rhs.size())) != Status::kOk || (status = d_boundary_values_.allocate(boundary_values.size())) != Status::kOk || (status = d_diagonal_slots_.allocate(diagonal_slots.size())) != Status::kOk || (status = d_valid_.allocate(1)) != Status::kOk)
+      return status;
+    if ((status = CopyToDevice(d_triangles_.get(), triangles.data(), triangles.size() * sizeof(DeviceNonlinearTriangle))) != Status::kOk || (status = CopyToDevice(d_curve_b_.get(), curve_b.data(), curve_b.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_h_.get(), curve_h.data(), curve_h.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_slope_.get(), curve_slope.data(), curve_slope.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_matrix_offsets_.get(), matrix_offsets.data(), matrix_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_matrix_entries_.get(), matrix_entries.data(), matrix_entries.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_rhs_offsets_.get(), rhs_offsets.data(), rhs_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_rhs_entries_.get(), rhs_entries.data(), rhs_entries.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_base_values_.get(), age_values.data(), age_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_age_rhs_.get(), age_rhs.data(), age_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_pm_rhs_.get(), pm_rhs.data(), pm_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_circuit_rhs_.get(), circuit_rhs.data(), circuit_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_boundary_values_.get(), boundary_values.data(), boundary_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_diagonal_slots_.get(), diagonal_slots.data(), diagonal_slots.size() * sizeof(int32_t))) != Status::kOk)
+      return status;
+    symbolic_ = std::move(symbolic);
+    initialized_ = true;
+    return Status::kOk;
+  }
+
+  const Assembly& symbolic_assembly() const { return symbolic_; }
+  bool initialized() const { return initialized_; }
+
+  Status Assemble(const std::vector<std::vector<double>>& states, const std::vector<std::vector<double>>& currents,
+      bool use_newton, GpuCsrSolver* solver, double* seconds)
+  {
+    if (!initialized_ || solver == nullptr || states.empty() || states.size() != currents.size())
+      return Status::kInvalidArgument;
+    const size_t count = states.size(), triangles = d_triangles_.count();
+    std::vector<double> packed_states(count * node_count_), packed_currents(count * static_cast<size_t>(circuit_count_));
+    for (size_t item = 0; item < count; ++item) {
+      if (states[item].size() != node_count_ || currents[item].size() != static_cast<size_t>(circuit_count_))
+        return Status::kInvalidArgument;
+      std::copy(states[item].begin(), states[item].end(), packed_states.begin() + item * node_count_);
+      std::copy(currents[item].begin(), currents[item].end(), packed_currents.begin() + item * static_cast<size_t>(circuit_count_));
+    }
+    Status status = EnsureStateCapacity(count);
+    if (status != Status::kOk)
+      return status;
+    const ProfileClock::time_point start = ProfileClock::now();
+    if ((status = solver->PrepareDeviceBatch(count)) != Status::kOk || (status = CopyToDevice(d_old_.get(), packed_states.data(), packed_states.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_currents_.get(), packed_currents.data(), packed_currents.size() * sizeof(double))) != Status::kOk)
+      return status;
+    int valid = 1;
+    if (cudaMemcpy(d_valid_.get(), &valid, sizeof(valid), cudaMemcpyHostToDevice) != cudaSuccess)
+      return Status::kInternalError;
+    const dim3 blocks_elements(static_cast<unsigned int>((triangles + 255) / 256), static_cast<unsigned int>(count));
+    const dim3 blocks_values(static_cast<unsigned int>((nnz_ + 255) / 256), static_cast<unsigned int>(count));
+    const dim3 blocks_rows(static_cast<unsigned int>((free_count_ + 255) / 256), static_cast<unsigned int>(count));
+    DeviceNonlinearElementKernel<<<blocks_elements, 256>>>(d_triangles_.get(), triangles, d_old_.get(), node_count_, d_curve_b_.get(), d_curve_h_.get(), d_curve_slope_.get(), use_newton, d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), d_valid_.get());
+    DeviceNonlinearValuesKernel<<<blocks_values, 256>>>(d_triangles_.get(), d_matrix_offsets_.get(), d_matrix_entries_.get(), nnz_, d_base_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, use_newton, solver->device_batch_values());
+    DeviceNonlinearRhsKernel<<<blocks_rows, 256>>>(d_triangles_.get(), d_rhs_offsets_.get(), d_rhs_entries_.get(), free_count_, d_pm_rhs_.get(), d_circuit_rhs_.get(), circuit_count_, d_currents_.get(), d_age_rhs_.get(), d_old_.get(), d_boundary_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, node_count_, use_newton, solver->device_batch_rhs());
+    DeviceNonlinearDiagonalKernel<<<blocks_rows, 256>>>(d_diagonal_slots_.get(), free_count_, nnz_, solver->device_batch_values(), solver->device_batch_diagonal(), solver->device_batch_inverse_diagonal(), d_valid_.get());
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess || cudaMemcpy(&valid, d_valid_.get(), sizeof(valid), cudaMemcpyDeviceToHost) != cudaSuccess)
+      return Status::kInternalError;
+    if (seconds != nullptr)
+      *seconds += ProfileSecondsSince(start);
+    solver->set_device_batch_inverse_diagonal_usable(valid != 0);
+    return valid != 0 ? Status::kOk : Status::kAssemblyFailed;
+  }
+
+  private:
+  Status EnsureStateCapacity(size_t count)
+  {
+    if (state_capacity_ >= count)
+      return Status::kOk;
+    const size_t triangles = d_triangles_.count();
+    Status status = Status::kOk;
+    if ((status = d_old_.allocate(count * node_count_)) != Status::kOk || (status = d_currents_.allocate(count * static_cast<size_t>(circuit_count_))) != Status::kOk || (status = d_bx_.allocate(count * triangles)) != Status::kOk || (status = d_by_.allocate(count * triangles)) != Status::kOk || (status = d_nu_.allocate(count * triangles)) != Status::kOk || (status = d_derivative_.allocate(count * triangles)) != Status::kOk)
+      return status;
+    state_capacity_ = count;
+    return Status::kOk;
+  }
+  bool initialized_ = false;
+  size_t node_count_ = 0, free_count_ = 0, nnz_ = 0, state_capacity_ = 0;
+  int circuit_count_ = 0;
+  Assembly symbolic_;
+  DeviceBuffer<DeviceNonlinearTriangle> d_triangles_;
+  DeviceBuffer<double> d_curve_b_, d_curve_h_, d_curve_slope_, d_base_values_, d_age_rhs_, d_pm_rhs_, d_circuit_rhs_, d_boundary_values_;
+  DeviceBuffer<int32_t> d_matrix_offsets_, d_matrix_entries_, d_rhs_offsets_, d_rhs_entries_, d_diagonal_slots_;
+  DeviceBuffer<int> d_valid_;
+  DeviceBuffer<double> d_old_, d_currents_, d_bx_, d_by_, d_nu_, d_derivative_;
+};
+
 struct NonlinearBatchTiming {
   double host_assembly_seconds = 0.0;
+  double device_assembly_seconds = 0.0;
   double gpu_upload_seconds = 0.0;
   double gpu_kernel_sync_seconds = 0.0;
   double gpu_download_seconds = 0.0;
   double state_update_seconds = 0.0;
   double finalize_seconds = 0.0;
 };
+
+enum class NonlinearAssemblyMode { kAuto,
+  kHost,
+  kDevice };
 
 class NonlinearP1FixtureSolver {
   public:
@@ -2174,6 +2781,7 @@ class NonlinearP1FixtureSolver {
     model_ = std::move(model);
     csr_initialized_ = false;
     csr_symbolic_reuse_count_ = 0;
+    device_assembly_.reset();
     initialized_ = true;
     return Status::kOk;
   }
@@ -2224,14 +2832,16 @@ class NonlinearP1FixtureSolver {
       }
       if (!csr_initialized_) {
         status = csr_solver_.Initialize(assembly);
-        if (status == Status::kOk) csr_initialized_ = true;
+        if (status == Status::kOk)
+          csr_initialized_ = true;
       } else if (!csr_solver_.HasMatchingStructure(assembly)) {
         // Geometry cache identity promises this cannot change.  Fail rather
         // than silently re-uploading a different symbolic matrix.
         status = Status::kAssemblyFailed;
       } else {
         status = csr_solver_.UpdateValues(assembly);
-        if (status == Status::kOk) ++csr_symbolic_reuse_count_;
+        if (status == Status::kOk)
+          ++csr_symbolic_reuse_count_;
       }
       if (status != Status::kOk) {
         result.info.status = status;
@@ -2286,16 +2896,18 @@ class NonlinearP1FixtureSolver {
     return FinalizeResult(&result);
   }
 
-  // Independent nonlinear states share only the immutable symbolic CSR.  The
-  // host still assembles each Newton state separately; every active state is
-  // then dispatched as one CUDA block in a single PCG launch.
+  // Independent nonlinear states share one immutable symbolic CSR and device
+  // assembly plan. Every active state is dispatched in one batched assembly
+  // and PCG launch; the established host assembler remains the auto fallback.
   std::vector<NonlinearSolveResult> SolveBatch(
       const std::vector<std::vector<double>>& currents, const NonlinearOptions& options,
-      int* batched_pcg_launches = nullptr, NonlinearBatchTiming* timing = nullptr)
+      int* batched_pcg_launches = nullptr, NonlinearBatchTiming* timing = nullptr,
+      NonlinearAssemblyMode requested_mode = NonlinearAssemblyMode::kAuto)
   {
     std::vector<NonlinearSolveResult> results(currents.size());
     if (!initialized_ || currents.empty() || !(options.relative_tolerance > 0.0)
-        || !std::isfinite(options.relative_tolerance) || options.max_newton_iterations < 0) return results;
+        || !std::isfinite(options.relative_tolerance) || options.max_newton_iterations < 0)
+      return results;
     std::vector<std::vector<double>> states(currents.size(), std::vector<double>(model_.nodes.size(), 0.0));
     std::vector<double> relaxations(currents.size(), 1.0);
     std::vector<double> previous_residuals(currents.size(), std::numeric_limits<double>::infinity());
@@ -2305,18 +2917,141 @@ class NonlinearP1FixtureSolver {
       results[item].circuit_currents_a = currents[item];
       if (currents[item].size() != static_cast<size_t>(model_.circuit_count)
           || !std::all_of(currents[item].begin(), currents[item].end(), [](double value) { return std::isfinite(value); })) {
-        active[item] = false; continue;
+        active[item] = false;
+        continue;
       }
       for (size_t boundary = 0; boundary < model_.dirichlet_nodes.size(); ++boundary)
         states[item][model_.dirichlet_nodes[boundary]] = model_.dirichlet_a_wb_per_m[boundary];
     }
+    bool device_assembly_active = requested_mode != NonlinearAssemblyMode::kHost;
+    if (device_assembly_active) {
+      device_assembly_ = std::make_unique<DeviceNonlinearAssemblyPlan>();
+      const Status plan_status = device_assembly_->Initialize(model_);
+      const Status setup_status = plan_status == Status::kOk
+          ? csr_solver_.Initialize(device_assembly_->symbolic_assembly())
+          : plan_status;
+      if (setup_status == Status::kOk) {
+        csr_initialized_ = true;
+      } else if (requested_mode == NonlinearAssemblyMode::kAuto) {
+        device_assembly_.reset();
+        csr_initialized_ = false;
+        device_assembly_active = false;
+      } else {
+        for (size_t item = 0; item < results.size(); ++item)
+          if (active[item]) {
+            results[item].info.status = setup_status;
+            active[item] = false;
+          }
+      }
+    }
     for (int iteration = 0; iteration < options.max_newton_iterations; ++iteration) {
       const ProfileClock::time_point assembly_start = ProfileClock::now();
-      std::vector<size_t> slots; std::vector<Assembly> assemblies; std::vector<std::vector<double>> rhs_values;
+      std::vector<size_t> slots;
+      std::vector<Assembly> assemblies;
+      std::vector<std::vector<double>> rhs_values;
       const bool symbolic_preexisting = csr_initialized_;
       std::vector<size_t> active_slots;
       for (size_t item = 0; item < currents.size(); ++item)
-        if (active[item]) active_slots.push_back(item);
+        if (active[item])
+          active_slots.push_back(item);
+      if (active_slots.empty())
+        break;
+      if (device_assembly_active) {
+        std::vector<std::vector<double>> device_states, device_currents;
+        device_states.reserve(active_slots.size());
+        device_currents.reserve(active_slots.size());
+        for (size_t item : active_slots) {
+          device_states.push_back(states[item]);
+          device_currents.push_back(currents[item]);
+        }
+        const Status assembled = device_assembly_->Assemble(device_states, device_currents, iteration > 0,
+            &csr_solver_, timing == nullptr ? nullptr : &timing->device_assembly_seconds);
+        if (assembled != Status::kOk) {
+          if (requested_mode == NonlinearAssemblyMode::kAuto) {
+            device_assembly_active = false;
+            device_assembly_.reset();
+            csr_initialized_ = false;
+            --iteration;
+            continue; // retry this exact Newton iteration on the reference path.
+          }
+          for (size_t item : active_slots) {
+            results[item].info.status = assembled;
+            active[item] = false;
+          }
+          continue;
+        }
+        std::vector<SolveInfo> infos;
+        std::vector<std::vector<double>> free_solutions;
+        GpuBatchSolveTiming gpu_timing;
+        const Status solve_status = csr_solver_.SolvePreparedDeviceBatch(active_slots.size(),
+            options.linear_relative_tolerance, options.max_linear_iterations, &infos, &free_solutions,
+            batched_pcg_launches, &gpu_timing);
+        if (timing != nullptr) {
+          timing->gpu_kernel_sync_seconds += gpu_timing.kernel_sync_seconds;
+          timing->gpu_download_seconds += gpu_timing.download_seconds;
+        }
+        if (solve_status != Status::kOk) {
+          for (size_t item : active_slots) {
+            results[item].info.status = solve_status;
+            active[item] = false;
+          }
+          continue;
+        }
+        csr_symbolic_reuse_count_ += iteration == 0
+            ? (active_slots.empty() ? 0 : active_slots.size() - 1)
+            : active_slots.size();
+        const Assembly& assembly = device_assembly_->symbolic_assembly();
+        const ProfileClock::time_point update_start = ProfileClock::now();
+        double finalized = 0.0;
+        for (size_t local = 0; local < active_slots.size(); ++local) {
+          const size_t item = active_slots[local];
+          if (infos[local].status != Status::kOk) {
+            results[item].info = infos[local];
+            active[item] = false;
+            continue;
+          }
+          std::vector<double> candidate = assembly.boundary_values;
+          for (size_t row = 0; row < free_solutions[local].size(); ++row)
+            candidate[assembly.free_nodes[row]] = free_solutions[local][row];
+          double difference_sq = 0.0, candidate_sq = 0.0;
+          for (size_t node = 0; node < candidate.size(); ++node) {
+            const double difference = candidate[node] - states[item][node];
+            difference_sq += difference * difference;
+            candidate_sq += candidate[node] * candidate[node];
+          }
+          const double residual = std::sqrt(difference_sq) / std::max(std::sqrt(candidate_sq), std::numeric_limits<double>::min());
+          results[item].residual_history.push_back(residual);
+          results[item].info.iterations = iteration + 1;
+          results[item].info.residual_l2 = residual;
+          if (!std::isfinite(residual)) {
+            results[item].info.status = Status::kNumericalNonfinite;
+            active[item] = false;
+            continue;
+          }
+          if (iteration > 5) {
+            if (residual > previous_residuals[item] && relaxations[item] > 0.125)
+              relaxations[item] *= 0.5;
+            else
+              relaxations[item] += 0.1 * (1.0 - relaxations[item]);
+          }
+          for (size_t node = 0; node < states[item].size(); ++node)
+            states[item][node] += relaxations[item] * (candidate[node] - states[item][node]);
+          if (iteration > 0 && residual < 100.0 * options.relative_tolerance) {
+            results[item].info.status = Status::kOk;
+            results[item].a_wb_per_m = std::move(states[item]);
+            const ProfileClock::time_point finalize_start = ProfileClock::now();
+            results[item] = FinalizeResult(&results[item]);
+            active[item] = false;
+            finalized += ProfileSecondsSince(finalize_start);
+          } else
+            previous_residuals[item] = residual;
+        }
+        if (timing != nullptr) {
+          timing->finalize_seconds += finalized;
+          timing->state_update_seconds += std::max(0.0, ProfileSecondsSince(update_start) - finalized);
+        }
+        continue;
+      }
       std::vector<Assembly> iteration_assemblies(active_slots.size());
       std::vector<Status> assembly_status(active_slots.size(), Status::kInternalError);
       std::atomic<size_t> next_assembly { 0 };
@@ -2325,7 +3060,8 @@ class NonlinearP1FixtureSolver {
       auto assemble = [&]() {
         for (;;) {
           const size_t local = next_assembly.fetch_add(1, std::memory_order_relaxed);
-          if (local >= active_slots.size()) return;
+          if (local >= active_slots.size())
+            return;
           const size_t item = active_slots[local];
           assembly_status[local] = AssembleNonlinearNewton(model_, states[item],
               currents[item], iteration > 0, &iteration_assemblies[local]);
@@ -2334,31 +3070,51 @@ class NonlinearP1FixtureSolver {
       std::vector<std::thread> workers;
       workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
       for (size_t worker = 1; worker < worker_count; ++worker) {
-        try { workers.emplace_back(assemble); }
-        catch (const std::system_error&) { break; }
+        try {
+          workers.emplace_back(assemble);
+        } catch (const std::system_error&) {
+          break;
+        }
       }
       assemble();
-      for (std::thread& worker : workers) worker.join();
+      for (std::thread& worker : workers)
+        worker.join();
       for (size_t local = 0; local < active_slots.size(); ++local) {
         const size_t item = active_slots[local];
         const Status status = assembly_status[local];
-        if (status != Status::kOk) { results[item].info.status = status; active[item] = false; continue; }
+        if (status != Status::kOk) {
+          results[item].info.status = status;
+          active[item] = false;
+          continue;
+        }
         Assembly& assembly = iteration_assemblies[local];
         if (!csr_initialized_) {
           const Status initialize = csr_solver_.Initialize(assembly);
-          if (initialize != Status::kOk) { results[item].info.status = initialize; active[item] = false; continue; }
+          if (initialize != Status::kOk) {
+            results[item].info.status = initialize;
+            active[item] = false;
+            continue;
+          }
           csr_initialized_ = true;
         }
         if (!csr_solver_.HasMatchingStructure(assembly)) {
-          results[item].info.status = Status::kAssemblyFailed; active[item] = false; continue;
+          results[item].info.status = Status::kAssemblyFailed;
+          active[item] = false;
+          continue;
         }
         std::vector<double> rhs(assembly.free_nodes.size());
-        for (size_t row = 0; row < rhs.size(); ++row) rhs[row] = assembly.rhs_per_amp[row] + assembly.rhs_offset[row];
-        slots.push_back(item); assemblies.push_back(std::move(assembly)); rhs_values.push_back(std::move(rhs));
+        for (size_t row = 0; row < rhs.size(); ++row)
+          rhs[row] = assembly.rhs_per_amp[row] + assembly.rhs_offset[row];
+        slots.push_back(item);
+        assemblies.push_back(std::move(assembly));
+        rhs_values.push_back(std::move(rhs));
       }
-      if (timing != nullptr) timing->host_assembly_seconds += ProfileSecondsSince(assembly_start);
-      if (slots.empty()) break;
-      std::vector<SolveInfo> infos; std::vector<std::vector<double>> free_solutions;
+      if (timing != nullptr)
+        timing->host_assembly_seconds += ProfileSecondsSince(assembly_start);
+      if (slots.empty())
+        break;
+      std::vector<SolveInfo> infos;
+      std::vector<std::vector<double>> free_solutions;
       GpuBatchSolveTiming gpu_timing;
       const Status batch_status = csr_solver_.SolveBatch(assemblies, rhs_values,
           options.linear_relative_tolerance, options.max_linear_iterations, &infos, &free_solutions,
@@ -2369,55 +3125,74 @@ class NonlinearP1FixtureSolver {
         timing->gpu_download_seconds += gpu_timing.download_seconds;
       }
       if (batch_status != Status::kOk) {
-        for (size_t item : slots) { results[item].info.status = batch_status; active[item] = false; }
+        for (size_t item : slots) {
+          results[item].info.status = batch_status;
+          active[item] = false;
+        }
         break;
       }
       csr_symbolic_reuse_count_ += symbolic_preexisting ? slots.size()
-          : (slots.empty() ? 0 : slots.size() - 1);
+                                                        : (slots.empty() ? 0 : slots.size() - 1);
       const ProfileClock::time_point update_start = ProfileClock::now();
       double iteration_finalize_seconds = 0.0;
       for (size_t local = 0; local < slots.size(); ++local) {
         const size_t item = slots[local];
-        if (infos[local].status != Status::kOk) { results[item].info = infos[local]; active[item] = false; continue; }
+        if (infos[local].status != Status::kOk) {
+          results[item].info = infos[local];
+          active[item] = false;
+          continue;
+        }
         std::vector<double> candidate = assemblies[local].boundary_values;
         for (size_t row = 0; row < free_solutions[local].size(); ++row)
           candidate[assemblies[local].free_nodes[row]] = free_solutions[local][row];
         double difference_sq = 0.0, candidate_sq = 0.0;
         for (size_t node = 0; node < candidate.size(); ++node) {
           const double difference = candidate[node] - states[item][node];
-          difference_sq += difference * difference; candidate_sq += candidate[node] * candidate[node];
+          difference_sq += difference * difference;
+          candidate_sq += candidate[node] * candidate[node];
         }
         const double residual = std::sqrt(difference_sq)
             / std::max(std::sqrt(candidate_sq), std::numeric_limits<double>::min());
         results[item].residual_history.push_back(residual);
-        results[item].info.iterations = iteration + 1; results[item].info.residual_l2 = residual;
-        if (!std::isfinite(residual)) { results[item].info.status = Status::kNumericalNonfinite; active[item] = false; continue; }
+        results[item].info.iterations = iteration + 1;
+        results[item].info.residual_l2 = residual;
+        if (!std::isfinite(residual)) {
+          results[item].info.status = Status::kNumericalNonfinite;
+          active[item] = false;
+          continue;
+        }
         if (iteration > 5) {
-          if (residual > previous_residuals[item] && relaxations[item] > 0.125) relaxations[item] *= 0.5;
-          else relaxations[item] += 0.1 * (1.0 - relaxations[item]);
+          if (residual > previous_residuals[item] && relaxations[item] > 0.125)
+            relaxations[item] *= 0.5;
+          else
+            relaxations[item] += 0.1 * (1.0 - relaxations[item]);
         }
         for (size_t node = 0; node < states[item].size(); ++node)
           states[item][node] += relaxations[item] * (candidate[node] - states[item][node]);
         if (iteration > 0 && residual < 100.0 * options.relative_tolerance) {
-          results[item].info.status = Status::kOk; results[item].a_wb_per_m = std::move(states[item]);
+          results[item].info.status = Status::kOk;
+          results[item].a_wb_per_m = std::move(states[item]);
           const ProfileClock::time_point finalize_start = ProfileClock::now();
-          results[item] = FinalizeResult(&results[item]); active[item] = false;
+          results[item] = FinalizeResult(&results[item]);
+          active[item] = false;
           iteration_finalize_seconds += ProfileSecondsSince(finalize_start);
-        } else previous_residuals[item] = residual;
+        } else
+          previous_residuals[item] = residual;
       }
       if (timing != nullptr) {
         timing->finalize_seconds += iteration_finalize_seconds;
-        timing->state_update_seconds +=
-            std::max(0.0, ProfileSecondsSince(update_start) - iteration_finalize_seconds);
+        timing->state_update_seconds += std::max(0.0, ProfileSecondsSince(update_start) - iteration_finalize_seconds);
       }
     }
-    for (size_t item = 0; item < results.size(); ++item) if (active[item]) {
-      results[item].info.status = Status::kNonlinearSolveNotConverged;
-      results[item].a_wb_per_m = std::move(states[item]);
-      const ProfileClock::time_point finalize_start = ProfileClock::now();
-      results[item] = FinalizeResult(&results[item]);
-      if (timing != nullptr) timing->finalize_seconds += ProfileSecondsSince(finalize_start);
-    }
+    for (size_t item = 0; item < results.size(); ++item)
+      if (active[item]) {
+        results[item].info.status = Status::kNonlinearSolveNotConverged;
+        results[item].a_wb_per_m = std::move(states[item]);
+        const ProfileClock::time_point finalize_start = ProfileClock::now();
+        results[item] = FinalizeResult(&results[item]);
+        if (timing != nullptr)
+          timing->finalize_seconds += ProfileSecondsSince(finalize_start);
+      }
     return results;
   }
 
@@ -2463,6 +3238,7 @@ class NonlinearP1FixtureSolver {
 
   bool initialized_ = false;
   NonlinearModel model_;
+  std::unique_ptr<DeviceNonlinearAssemblyPlan> device_assembly_;
 };
 
 // Strict, dependency-free reader for the MATLAB-owned gpu_femm_mesh_v1
@@ -2470,7 +3246,12 @@ class NonlinearP1FixtureSolver {
 // by the artifact writer; duplicate object keys, trailing data, missing
 // fields, and unsupported physics fail before a model reaches the solver.
 struct StrictJson {
-  enum class Type { kNull, kBool, kNumber, kString, kArray, kObject };
+  enum class Type { kNull,
+    kBool,
+    kNumber,
+    kString,
+    kArray,
+    kObject };
   Type type = Type::kNull;
   bool boolean = false;
   double number = 0.0;
@@ -2480,8 +3261,11 @@ struct StrictJson {
 };
 
 class StrictJsonParser {
- public:
-  explicit StrictJsonParser(const std::string& text) : text_(text) {}
+  public:
+  explicit StrictJsonParser(const std::string& text)
+      : text_(text)
+  {
+  }
 
   bool Parse(StrictJson* value, std::string* error)
   {
@@ -2498,7 +3282,7 @@ class StrictJsonParser {
     return true;
   }
 
- private:
+  private:
   void Skip()
   {
     while (position_ < text_.size()
@@ -2513,20 +3297,30 @@ class StrictJsonParser {
       return false;
     }
     const char token = text_[position_];
-    if (token == '{') return Object(value, error);
-    if (token == '[') return Array(value, error);
+    if (token == '{')
+      return Object(value, error);
+    if (token == '[')
+      return Array(value, error);
     if (token == '"') {
       value->type = StrictJson::Type::kString;
       return String(&value->string, error);
     }
     if (text_.compare(position_, 4, "true") == 0) {
-      position_ += 4; value->type = StrictJson::Type::kBool; value->boolean = true; return true;
+      position_ += 4;
+      value->type = StrictJson::Type::kBool;
+      value->boolean = true;
+      return true;
     }
     if (text_.compare(position_, 5, "false") == 0) {
-      position_ += 5; value->type = StrictJson::Type::kBool; value->boolean = false; return true;
+      position_ += 5;
+      value->type = StrictJson::Type::kBool;
+      value->boolean = false;
+      return true;
     }
     if (text_.compare(position_, 4, "null") == 0) {
-      position_ += 4; value->type = StrictJson::Type::kNull; return true;
+      position_ += 4;
+      value->type = StrictJson::Type::kNull;
+      return true;
     }
     return Number(value, error);
   }
@@ -2538,21 +3332,49 @@ class StrictJsonParser {
     output->clear();
     while (position_ < text_.size()) {
       const unsigned char c = static_cast<unsigned char>(text_[position_++]);
-      if (c == '"') return true;
-      if (c < 0x20) { *error = "control character in JSON string"; return false; }
-      if (c != '\\') { output->push_back(static_cast<char>(c)); continue; }
-      if (position_ >= text_.size()) { *error = "truncated JSON escape"; return false; }
+      if (c == '"')
+        return true;
+      if (c < 0x20) {
+        *error = "control character in JSON string";
+        return false;
+      }
+      if (c != '\\') {
+        output->push_back(static_cast<char>(c));
+        continue;
+      }
+      if (position_ >= text_.size()) {
+        *error = "truncated JSON escape";
+        return false;
+      }
       const char escaped = text_[position_++];
       switch (escaped) {
-      case '"': output->push_back('"'); break;
-      case '\\': output->push_back('\\'); break;
-      case '/': output->push_back('/'); break;
-      case 'b': output->push_back('\b'); break;
-      case 'f': output->push_back('\f'); break;
-      case 'n': output->push_back('\n'); break;
-      case 'r': output->push_back('\r'); break;
-      case 't': output->push_back('\t'); break;
-      default: *error = "unsupported JSON string escape"; return false;
+      case '"':
+        output->push_back('"');
+        break;
+      case '\\':
+        output->push_back('\\');
+        break;
+      case '/':
+        output->push_back('/');
+        break;
+      case 'b':
+        output->push_back('\b');
+        break;
+      case 'f':
+        output->push_back('\f');
+        break;
+      case 'n':
+        output->push_back('\n');
+        break;
+      case 'r':
+        output->push_back('\r');
+        break;
+      case 't':
+        output->push_back('\t');
+        break;
+      default:
+        *error = "unsupported JSON string escape";
+        return false;
       }
     }
     *error = "unterminated JSON string";
@@ -2562,64 +3384,131 @@ class StrictJsonParser {
   bool Number(StrictJson* value, std::string* error)
   {
     const size_t begin = position_;
-    if (position_ < text_.size() && text_[position_] == '-') ++position_;
-    if (position_ >= text_.size()) { *error = "invalid JSON number"; return false; }
-    if (text_[position_] == '0') ++position_;
+    if (position_ < text_.size() && text_[position_] == '-')
+      ++position_;
+    if (position_ >= text_.size()) {
+      *error = "invalid JSON number";
+      return false;
+    }
+    if (text_[position_] == '0')
+      ++position_;
     else if (text_[position_] >= '1' && text_[position_] <= '9')
-      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_]))) ++position_;
-    else { *error = "invalid JSON number"; return false; }
+      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_])))
+        ++position_;
+    else {
+      *error = "invalid JSON number";
+      return false;
+    }
     if (position_ < text_.size() && text_[position_] == '.') {
-      ++position_; const size_t fraction = position_;
-      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_]))) ++position_;
-      if (fraction == position_) { *error = "invalid JSON fraction"; return false; }
+      ++position_;
+      const size_t fraction = position_;
+      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_])))
+        ++position_;
+      if (fraction == position_) {
+        *error = "invalid JSON fraction";
+        return false;
+      }
     }
     if (position_ < text_.size() && (text_[position_] == 'e' || text_[position_] == 'E')) {
-      ++position_; if (position_ < text_.size() && (text_[position_] == '+' || text_[position_] == '-')) ++position_;
+      ++position_;
+      if (position_ < text_.size() && (text_[position_] == '+' || text_[position_] == '-'))
+        ++position_;
       const size_t exponent = position_;
-      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_]))) ++position_;
-      if (exponent == position_) { *error = "invalid JSON exponent"; return false; }
+      while (position_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[position_])))
+        ++position_;
+      if (exponent == position_) {
+        *error = "invalid JSON exponent";
+        return false;
+      }
     }
     try {
       value->number = std::stod(text_.substr(begin, position_ - begin));
-    } catch (...) { *error = "JSON number conversion failed"; return false; }
-    if (!std::isfinite(value->number)) { *error = "nonfinite JSON number"; return false; }
+    } catch (...) {
+      *error = "JSON number conversion failed";
+      return false;
+    }
+    if (!std::isfinite(value->number)) {
+      *error = "nonfinite JSON number";
+      return false;
+    }
     value->type = StrictJson::Type::kNumber;
     return true;
   }
 
   bool Array(StrictJson* value, std::string* error)
   {
-    ++position_; value->type = StrictJson::Type::kArray; value->array.clear(); Skip();
-    if (position_ < text_.size() && text_[position_] == ']') { ++position_; return true; }
+    ++position_;
+    value->type = StrictJson::Type::kArray;
+    value->array.clear();
+    Skip();
+    if (position_ < text_.size() && text_[position_] == ']') {
+      ++position_;
+      return true;
+    }
     while (true) {
       StrictJson child;
-      if (!Value(&child, error)) return false;
-      value->array.push_back(std::move(child)); Skip();
-      if (position_ >= text_.size()) { *error = "unterminated JSON array"; return false; }
-      if (text_[position_] == ']') { ++position_; return true; }
-      if (text_[position_++] != ',') { *error = "JSON array comma expected"; return false; }
+      if (!Value(&child, error))
+        return false;
+      value->array.push_back(std::move(child));
+      Skip();
+      if (position_ >= text_.size()) {
+        *error = "unterminated JSON array";
+        return false;
+      }
+      if (text_[position_] == ']') {
+        ++position_;
+        return true;
+      }
+      if (text_[position_++] != ',') {
+        *error = "JSON array comma expected";
+        return false;
+      }
       Skip();
     }
   }
 
   bool Object(StrictJson* value, std::string* error)
   {
-    ++position_; value->type = StrictJson::Type::kObject; value->object.clear(); Skip();
-    if (position_ < text_.size() && text_[position_] == '}') { ++position_; return true; }
+    ++position_;
+    value->type = StrictJson::Type::kObject;
+    value->object.clear();
+    Skip();
+    if (position_ < text_.size() && text_[position_] == '}') {
+      ++position_;
+      return true;
+    }
     while (true) {
       std::string key;
-      if (!String(&key, error)) { *error = "JSON object key expected"; return false; }
-      Skip();
-      if (position_ >= text_.size() || text_[position_++] != ':') { *error = "JSON colon expected"; return false; }
-      Skip(); StrictJson child;
-      if (!Value(&child, error)) return false;
-      if (!value->object.emplace(std::move(key), std::move(child)).second) {
-        *error = "duplicate JSON object key"; return false;
+      if (!String(&key, error)) {
+        *error = "JSON object key expected";
+        return false;
       }
       Skip();
-      if (position_ >= text_.size()) { *error = "unterminated JSON object"; return false; }
-      if (text_[position_] == '}') { ++position_; return true; }
-      if (text_[position_++] != ',') { *error = "JSON object comma expected"; return false; }
+      if (position_ >= text_.size() || text_[position_++] != ':') {
+        *error = "JSON colon expected";
+        return false;
+      }
+      Skip();
+      StrictJson child;
+      if (!Value(&child, error))
+        return false;
+      if (!value->object.emplace(std::move(key), std::move(child)).second) {
+        *error = "duplicate JSON object key";
+        return false;
+      }
+      Skip();
+      if (position_ >= text_.size()) {
+        *error = "unterminated JSON object";
+        return false;
+      }
+      if (text_[position_] == '}') {
+        ++position_;
+        return true;
+      }
+      if (text_[position_++] != ',') {
+        *error = "JSON object comma expected";
+        return false;
+      }
       Skip();
     }
   }
@@ -2631,10 +3520,19 @@ class StrictJsonParser {
 const StrictJson* JsonMember(const StrictJson& object, const char* name,
     StrictJson::Type type, std::string* error)
 {
-  if (object.type != StrictJson::Type::kObject) { *error = "expected JSON object"; return nullptr; }
+  if (object.type != StrictJson::Type::kObject) {
+    *error = "expected JSON object";
+    return nullptr;
+  }
   const auto found = object.object.find(name);
-  if (found == object.object.end()) { *error = std::string("missing JSON field: ") + name; return nullptr; }
-  if (found->second.type != type) { *error = std::string("wrong JSON type: ") + name; return nullptr; }
+  if (found == object.object.end()) {
+    *error = std::string("missing JSON field: ") + name;
+    return nullptr;
+  }
+  if (found->second.type != type) {
+    *error = std::string("wrong JSON type: ") + name;
+    return nullptr;
+  }
   return &found->second;
 }
 
@@ -2642,11 +3540,14 @@ bool ExactObject(const StrictJson& value, std::initializer_list<const char*> nam
     std::string* error)
 {
   if (value.type != StrictJson::Type::kObject || value.object.size() != names.size()) {
-    *error = "unexpected JSON object fields"; return false;
+    *error = "unexpected JSON object fields";
+    return false;
   }
-  for (const char* name : names) if (value.object.find(name) == value.object.end()) {
-    *error = std::string("missing JSON field: ") + name; return false;
-  }
+  for (const char* name : names)
+    if (value.object.find(name) == value.object.end()) {
+      *error = std::string("missing JSON field: ") + name;
+      return false;
+    }
   return true;
 }
 
@@ -2654,29 +3555,35 @@ bool JsonInteger(const StrictJson& value, int32_t* result)
 {
   if (value.type != StrictJson::Type::kNumber || value.number != std::floor(value.number)
       || value.number < static_cast<double>(std::numeric_limits<int32_t>::min())
-      || value.number > static_cast<double>(std::numeric_limits<int32_t>::max())) return false;
-  *result = static_cast<int32_t>(value.number); return true;
+      || value.number > static_cast<double>(std::numeric_limits<int32_t>::max()))
+    return false;
+  *result = static_cast<int32_t>(value.number);
+  return true;
 }
 
 bool JsonSha256(const std::string& value)
 {
-  return value.size() == 64 && std::all_of(value.begin(), value.end(),
-      [](unsigned char c) { return std::isxdigit(c); });
+  return value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isxdigit(c); });
 }
 
 // Small dependency-free SHA-256 implementation.  Artifact fingerprints bind
 // the exact bytes on disk, not a parsed/re-serialized JSON representation.
 class Sha256 {
- public:
+  public:
   Sha256() { Reset(); }
   void Update(const unsigned char* data, size_t size)
   {
     total_bits_ += static_cast<uint64_t>(size) * 8;
     while (size > 0) {
-        const size_t count = std::min(size, static_cast<size_t>(sizeof(buffer_) - buffered_));
+      const size_t count = std::min(size, static_cast<size_t>(sizeof(buffer_) - buffered_));
       std::memcpy(buffer_ + buffered_, data, count);
-      buffered_ += count; data += count; size -= count;
-      if (buffered_ == sizeof(buffer_)) { Transform(buffer_); buffered_ = 0; }
+      buffered_ += count;
+      data += count;
+      size -= count;
+      if (buffered_ == sizeof(buffer_)) {
+        Transform(buffer_);
+        buffered_ = 0;
+      }
     }
   }
   std::string FinalHex()
@@ -2685,39 +3592,82 @@ class Sha256 {
     const unsigned char one = 0x80;
     Update(&one, 1);
     const unsigned char zero = 0;
-    while (buffered_ != 56) Update(&zero, 1);
+    while (buffered_ != 56)
+      Update(&zero, 1);
     unsigned char length[8];
-    for (int i = 0; i < 8; ++i) length[7 - i] = static_cast<unsigned char>(bits >> (8 * i));
+    for (int i = 0; i < 8; ++i)
+      length[7 - i] = static_cast<unsigned char>(bits >> (8 * i));
     Update(length, sizeof(length));
-    std::ostringstream output; output << std::hex << std::setfill('0');
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
     for (uint32_t word : state_)
-      for (int shift = 24; shift >= 0; shift -= 8) output << std::setw(2) << ((word >> shift) & 0xffU);
+      for (int shift = 24; shift >= 0; shift -= 8)
+        output << std::setw(2) << ((word >> shift) & 0xffU);
     return output.str();
   }
- private:
+
+  private:
   static uint32_t RotateRight(uint32_t value, int shift) { return (value >> shift) | (value << (32 - shift)); }
   void Reset()
   {
-    state_[0]=0x6a09e667U; state_[1]=0xbb67ae85U; state_[2]=0x3c6ef372U; state_[3]=0xa54ff53aU;
-    state_[4]=0x510e527fU; state_[5]=0x9b05688cU; state_[6]=0x1f83d9abU; state_[7]=0x5be0cd19U;
-    total_bits_ = 0; buffered_ = 0;
+    state_[0] = 0x6a09e667U;
+    state_[1] = 0xbb67ae85U;
+    state_[2] = 0x3c6ef372U;
+    state_[3] = 0xa54ff53aU;
+    state_[4] = 0x510e527fU;
+    state_[5] = 0x9b05688cU;
+    state_[6] = 0x1f83d9abU;
+    state_[7] = 0x5be0cd19U;
+    total_bits_ = 0;
+    buffered_ = 0;
   }
   void Transform(const unsigned char block[64])
   {
-    static const uint32_t k[64] = { 0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U };
+    static const uint32_t k[64] = { 0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U, 0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U };
     uint32_t w[64];
-    for (int i = 0; i < 16; ++i) w[i] = (static_cast<uint32_t>(block[4*i]) << 24) | (static_cast<uint32_t>(block[4*i+1]) << 16) | (static_cast<uint32_t>(block[4*i+2]) << 8) | block[4*i+3];
-    for (int i = 16; i < 64; ++i) { const uint32_t s0=RotateRight(w[i-15],7)^RotateRight(w[i-15],18)^(w[i-15]>>3); const uint32_t s1=RotateRight(w[i-2],17)^RotateRight(w[i-2],19)^(w[i-2]>>10); w[i]=w[i-16]+s0+w[i-7]+s1; }
-    uint32_t a=state_[0],b=state_[1],c=state_[2],d=state_[3],e=state_[4],f=state_[5],g=state_[6],h=state_[7];
-    for (int i = 0; i < 64; ++i) { const uint32_t s1=RotateRight(e,6)^RotateRight(e,11)^RotateRight(e,25); const uint32_t ch=(e&f)^((~e)&g); const uint32_t t1=h+s1+ch+k[i]+w[i]; const uint32_t s0=RotateRight(a,2)^RotateRight(a,13)^RotateRight(a,22); const uint32_t maj=(a&b)^(a&c)^(b&c); h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+s0+maj; }
-    state_[0]+=a;state_[1]+=b;state_[2]+=c;state_[3]+=d;state_[4]+=e;state_[5]+=f;state_[6]+=g;state_[7]+=h;
+    for (int i = 0; i < 16; ++i)
+      w[i] = (static_cast<uint32_t>(block[4 * i]) << 24) | (static_cast<uint32_t>(block[4 * i + 1]) << 16) | (static_cast<uint32_t>(block[4 * i + 2]) << 8) | block[4 * i + 3];
+    for (int i = 16; i < 64; ++i) {
+      const uint32_t s0 = RotateRight(w[i - 15], 7) ^ RotateRight(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const uint32_t s1 = RotateRight(w[i - 2], 17) ^ RotateRight(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3], e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+    for (int i = 0; i < 64; ++i) {
+      const uint32_t s1 = RotateRight(e, 6) ^ RotateRight(e, 11) ^ RotateRight(e, 25);
+      const uint32_t ch = (e & f) ^ ((~e) & g);
+      const uint32_t t1 = h + s1 + ch + k[i] + w[i];
+      const uint32_t s0 = RotateRight(a, 2) ^ RotateRight(a, 13) ^ RotateRight(a, 22);
+      const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      h = g;
+      g = f;
+      f = e;
+      e = d + t1;
+      d = c;
+      c = b;
+      b = a;
+      a = t1 + s0 + maj;
+    }
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+    state_[5] += f;
+    state_[6] += g;
+    state_[7] += h;
   }
-  uint32_t state_[8] = {}; unsigned char buffer_[64] = {}; size_t buffered_ = 0; uint64_t total_bits_ = 0;
+  uint32_t state_[8] = {};
+  unsigned char buffer_[64] = {};
+  size_t buffered_ = 0;
+  uint64_t total_bits_ = 0;
 };
 
 std::string Sha256Hex(const std::string& bytes)
 {
-  Sha256 sha; sha.Update(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()); return sha.FinalHex();
+  Sha256 sha;
+  sha.Update(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
+  return sha.FinalHex();
 }
 
 struct GpuFemmMeshArtifact {
@@ -2735,12 +3685,13 @@ struct GpuFemmMeshArtifact {
 bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* artifact,
     std::string* error)
 {
-  if (artifact == nullptr || error == nullptr) return false;
+  if (artifact == nullptr || error == nullptr)
+    return false;
   StrictJson root;
   StrictJsonParser parser(text);
   if (!parser.Parse(&root, error)
-      || !ExactObject(root, { "schema_version", "base_motor_fem_sha256", "source_fem_sha256",
-        "canonical_identity_sha256", "resolved" }, error)) return false;
+      || !ExactObject(root, { "schema_version", "base_motor_fem_sha256", "source_fem_sha256", "canonical_identity_sha256", "resolved" }, error))
+    return false;
   const StrictJson* schema = JsonMember(root, "schema_version", StrictJson::Type::kString, error);
   const StrictJson* root_base_sha = JsonMember(root, "base_motor_fem_sha256", StrictJson::Type::kString, error);
   const StrictJson* source_sha = JsonMember(root, "source_fem_sha256", StrictJson::Type::kString, error);
@@ -2750,11 +3701,10 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       || (schema->string != "gpu_femm_mesh_v1" && schema->string != "gpu_femm_mesh_v2") || !JsonSha256(root_base_sha->string) || !JsonSha256(source_sha->string)
       || !JsonSha256(identity->string)
       || !(schema->string == "gpu_femm_mesh_v1"
-          ? ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles",
-            "regions", "materials", "circuits", "outer_dirichlet" }, error)
-          : ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles",
-            "regions", "materials", "circuits", "outer_dirichlet", "air_gap_elements" }, error))) {
-    if (error->empty()) *error = "invalid gpu_femm_mesh_v1 header";
+              ? ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles", "regions", "materials", "circuits", "outer_dirichlet" }, error)
+              : ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles", "regions", "materials", "circuits", "outer_dirichlet", "air_gap_elements" }, error))) {
+    if (error->empty())
+      *error = "invalid gpu_femm_mesh_v1 header";
     return false;
   }
   const StrictJson* resolved_sha = JsonMember(*resolved, "source_fem_sha256", StrictJson::Type::kString, error);
@@ -2771,23 +3721,35 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       || materials == nullptr || circuits == nullptr || boundary == nullptr
       || !JsonSha256(resolved_sha->string) || !JsonSha256(base_sha->string)
       || resolved_sha->string != source_sha->string || base_sha->string != root_base_sha->string) {
-    if (error->empty()) *error = "source FEM SHA mismatch";
+    if (error->empty())
+      *error = "source FEM SHA mismatch";
     return false;
   }
-  if (!ExactObject(*model, { "depth_mm", "problem_type", "frequency_hz" }, error)) return false;
+  if (!ExactObject(*model, { "depth_mm", "problem_type", "frequency_hz" }, error))
+    return false;
   const StrictJson* depth = JsonMember(*model, "depth_mm", StrictJson::Type::kNumber, error);
   const StrictJson* type = JsonMember(*model, "problem_type", StrictJson::Type::kString, error);
   const StrictJson* frequency = JsonMember(*model, "frequency_hz", StrictJson::Type::kNumber, error);
   if (depth == nullptr || type == nullptr || frequency == nullptr || !(depth->number > 0.0)
-      || type->string != "planar" || frequency->number != 0.0) { *error = "unsupported model physics"; return false; }
-  if (!ExactObject(*pose, { "rotor_angle_deg", "displacement_mm" }, error)) return false;
+      || type->string != "planar" || frequency->number != 0.0) {
+    *error = "unsupported model physics";
+    return false;
+  }
+  if (!ExactObject(*pose, { "rotor_angle_deg", "displacement_mm" }, error))
+    return false;
   const StrictJson* rotor_angle = JsonMember(*pose, "rotor_angle_deg", StrictJson::Type::kNumber, error);
   const StrictJson* displacement = JsonMember(*pose, "displacement_mm", StrictJson::Type::kArray, error);
   if (rotor_angle == nullptr || displacement == nullptr || displacement->array.size() != 2
       || displacement->array[0].type != StrictJson::Type::kNumber
-      || displacement->array[1].type != StrictJson::Type::kNumber) { *error = "invalid pose"; return false; }
+      || displacement->array[1].type != StrictJson::Type::kNumber) {
+    *error = "invalid pose";
+    return false;
+  }
   if (nodes->array.size() < 3 || circuits->array.empty() || materials->array.empty()
-      || regions->array.empty()) { *error = "empty mesh/material/circuit input"; return false; }
+      || regions->array.empty()) {
+    *error = "empty mesh/material/circuit input";
+    return false;
+  }
 
   GpuFemmMeshArtifact parsed;
   const bool is_sliding_band_v2 = schema->string == "gpu_femm_mesh_v2";
@@ -2802,15 +3764,16 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   for (const StrictJson& pair : nodes->array) {
     if (pair.type != StrictJson::Type::kArray || pair.array.size() != 2
         || pair.array[0].type != StrictJson::Type::kNumber || pair.array[1].type != StrictJson::Type::kNumber) {
-      *error = "invalid node coordinate"; return false;
+      *error = "invalid node coordinate";
+      return false;
     }
     parsed.model.nodes.push_back({ pair.array[0].number * 1e-3, pair.array[1].number * 1e-3 });
   }
   std::map<int32_t, int32_t> material_lookup;
   for (size_t index = 0; index < materials->array.size(); ++index) {
     const StrictJson& entry = materials->array[index];
-    if (!ExactObject(entry, { "id", "name", "mu_x", "mu_y", "H_c_A_per_m", "B_T", "H_A_per_m",
-          "lam_type", "lam_fill" }, error)) return false;
+    if (!ExactObject(entry, { "id", "name", "mu_x", "mu_y", "H_c_A_per_m", "B_T", "H_A_per_m", "lam_type", "lam_fill" }, error))
+      return false;
     const StrictJson* id = JsonMember(entry, "id", StrictJson::Type::kNumber, error);
     const StrictJson* material_name = JsonMember(entry, "name", StrictJson::Type::kString, error);
     const StrictJson* mux = JsonMember(entry, "mu_x", StrictJson::Type::kNumber, error);
@@ -2826,23 +3789,36 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
         || material_id < 0 || material_name->string.empty() || material_lookup.count(material_id) != 0 || !(mux->number > 0.0)
         || mux->number != muy->number || hc->number < 0.0 || lam_type->number != 0.0
         || lam_fill->number != 1.0 || b->array.size() != h->array.size()) {
-      *error = "invalid material definition"; return false;
+      *error = "invalid material definition";
+      return false;
     }
     NonlinearMaterial material;
     material.reluctivity_zero_m_per_h = 1.0 / (kMu0 * mux->number);
     material.h_c_a_per_m = hc->number;
-    if (b->array.size() > 4096) { *error = "B-H curve exceeds point cap"; return false; }
+    if (b->array.size() > 4096) {
+      *error = "B-H curve exceeds point cap";
+      return false;
+    }
     if (!b->array.empty()) {
-      if (b->array.size() < 2) { *error = "B-H curve needs two points"; return false; }
+      if (b->array.size() < 2) {
+        *error = "B-H curve needs two points";
+        return false;
+      }
       NonlinearBhCurve curve;
       for (size_t point = 0; point < b->array.size(); ++point) {
         if (b->array[point].type != StrictJson::Type::kNumber || h->array[point].type != StrictJson::Type::kNumber
             || b->array[point].number < 0.0 || h->array[point].number < 0.0
-            || (point > 0 && (b->array[point].number < b->array[point - 1].number
-                || h->array[point].number < h->array[point - 1].number))) { *error = "invalid B-H point"; return false; }
-        curve.b_t.push_back(b->array[point].number); curve.h_a_per_m.push_back(h->array[point].number);
+            || (point > 0 && (b->array[point].number < b->array[point - 1].number || h->array[point].number < h->array[point - 1].number))) {
+          *error = "invalid B-H point";
+          return false;
+        }
+        curve.b_t.push_back(b->array[point].number);
+        curve.h_a_per_m.push_back(h->array[point].number);
       }
-      if (!BuildNonlinearBhSpline(&curve)) { *error = "invalid B-H spline"; return false; }
+      if (!BuildNonlinearBhSpline(&curve)) {
+        *error = "invalid B-H spline";
+        return false;
+      }
       material.bh_curve_index = static_cast<int32_t>(parsed.model.bh_curves.size());
       parsed.model.bh_curves.push_back(std::move(curve));
     }
@@ -2854,7 +3830,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   std::map<int32_t, int32_t> circuit_lookup;
   for (size_t index = 0; index < circuits->array.size(); ++index) {
     const StrictJson& entry = circuits->array[index];
-    if (!ExactObject(entry, { "index", "name", "type", "current_A" }, error)) return false;
+    if (!ExactObject(entry, { "index", "name", "type", "current_A" }, error))
+      return false;
     const StrictJson* id = JsonMember(entry, "index", StrictJson::Type::kNumber, error);
     const StrictJson* name = JsonMember(entry, "name", StrictJson::Type::kString, error);
     const StrictJson* circuit_type = JsonMember(entry, "type", StrictJson::Type::kString, error);
@@ -2862,7 +3839,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     int32_t circuit = -1;
     if (id == nullptr || name == nullptr || circuit_type == nullptr || current == nullptr || !JsonInteger(*id, &circuit)
         || circuit != static_cast<int32_t>(index) || name->string.empty() || circuit_type->string != "series") {
-      *error = "circuits must be ordered contiguous current-driven series circuits"; return false;
+      *error = "circuits must be ordered contiguous current-driven series circuits";
+      return false;
     }
     circuit_lookup.emplace(circuit, circuit);
     parsed.circuit_currents_a.push_back(current->number);
@@ -2870,10 +3848,17 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   parsed.model.circuit_count = static_cast<int32_t>(parsed.circuit_currents_a.size());
   std::map<int32_t, int32_t> region_lookup;
   std::vector<double> region_area_m2;
-  struct RegionRaw { int32_t material; int32_t circuit; double turns; double angle; int32_t group; };
+  struct RegionRaw {
+    int32_t material;
+    int32_t circuit;
+    double turns;
+    double angle;
+    int32_t group;
+  };
   std::vector<RegionRaw> raw_regions;
   for (const StrictJson& entry : regions->array) {
-    if (!ExactObject(entry, { "id", "group_number", "material_id", "circuit_index", "turns", "pm_magnetization_deg" }, error)) return false;
+    if (!ExactObject(entry, { "id", "group_number", "material_id", "circuit_index", "turns", "pm_magnetization_deg" }, error))
+      return false;
     const StrictJson* id = JsonMember(entry, "id", StrictJson::Type::kNumber, error);
     const StrictJson* group = JsonMember(entry, "group_number", StrictJson::Type::kNumber, error);
     const StrictJson* material = JsonMember(entry, "material_id", StrictJson::Type::kNumber, error);
@@ -2887,33 +3872,46 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
         || region_lookup.count(region_id) != 0 || circuit_id < -1
         || (circuit_id == -1 && turns->number != 0.0)
         || (circuit_id >= 0 && (circuit_lookup.count(circuit_id) == 0 || turns->number == 0.0))) {
-      *error = "invalid region definition"; return false;
+      *error = "invalid region definition";
+      return false;
     }
     region_lookup.emplace(region_id, static_cast<int32_t>(raw_regions.size()));
     raw_regions.push_back({ material_lookup[material_id], circuit_id, turns->number, angle->number, group_id });
     region_area_m2.push_back(0.0);
   }
-  if (!ExactObject(*triangles, { "node_indices", "region_ids" }, error)) return false;
+  if (!ExactObject(*triangles, { "node_indices", "region_ids" }, error))
+    return false;
   const StrictJson* faces = JsonMember(*triangles, "node_indices", StrictJson::Type::kArray, error);
   const StrictJson* triangle_regions = JsonMember(*triangles, "region_ids", StrictJson::Type::kArray, error);
   if (faces == nullptr || triangle_regions == nullptr || faces->array.empty() || faces->array.size() != triangle_regions->array.size()) {
-    *error = "invalid triangle arrays"; return false;
+    *error = "invalid triangle arrays";
+    return false;
   }
   std::vector<int32_t> mapped_regions;
   for (size_t element = 0; element < faces->array.size(); ++element) {
     if (faces->array[element].type != StrictJson::Type::kArray || faces->array[element].array.size() != 3) {
-      *error = "triangle must have three node indices"; return false;
+      *error = "triangle must have three node indices";
+      return false;
     }
     int32_t node[3], region_id = -1;
     if (triangle_regions->array[element].type != StrictJson::Type::kNumber || !JsonInteger(triangle_regions->array[element], &region_id)
-        || region_lookup.count(region_id) == 0) { *error = "triangle references unknown region"; return false; }
+        || region_lookup.count(region_id) == 0) {
+      *error = "triangle references unknown region";
+      return false;
+    }
     for (int local = 0; local < 3; ++local) {
       if (!JsonInteger(faces->array[element].array[local], &node[local]) || node[local] < 0
-          || static_cast<size_t>(node[local]) >= parsed.model.nodes.size()) { *error = "triangle node out of range"; return false; }
+          || static_cast<size_t>(node[local]) >= parsed.model.nodes.size()) {
+        *error = "triangle node out of range";
+        return false;
+      }
     }
     Node p[3] = { parsed.model.nodes[node[0]], parsed.model.nodes[node[1]], parsed.model.nodes[node[2]] };
     NonlinearElementTerms terms;
-    if (!BuildElementTerms(p, &terms)) { *error = "triangle is not CCW"; return false; }
+    if (!BuildElementTerms(p, &terms)) {
+      *error = "triangle is not CCW";
+      return false;
+    }
     const int32_t mapped = region_lookup[region_id];
     region_area_m2[mapped] += terms.area_m2;
     mapped_regions.push_back(mapped);
@@ -2921,7 +3919,10 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   }
   for (size_t region = 0; region < raw_regions.size(); ++region) {
     const RegionRaw& raw = raw_regions[region];
-    if (!(region_area_m2[region] > 0.0)) { *error = "region has no triangle area"; return false; }
+    if (!(region_area_m2[region] > 0.0)) {
+      *error = "region has no triangle area";
+      return false;
+    }
     const NonlinearMaterial base = parsed.model.materials[raw.material];
     NonlinearMaterial label = base;
     label.group_number = raw.group;
@@ -2936,27 +3937,34 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     triangle.material = labels_begin + triangle.material;
     parsed.triangle_group_numbers.push_back(parsed.model.materials[triangle.material].group_number);
   }
-  if (!ExactObject(*boundary, { "node_indices", "A_Wb_per_m" }, error)) return false;
+  if (!ExactObject(*boundary, { "node_indices", "A_Wb_per_m" }, error))
+    return false;
   const StrictJson* boundary_nodes = JsonMember(*boundary, "node_indices", StrictJson::Type::kArray, error);
   const StrictJson* boundary_values = JsonMember(*boundary, "A_Wb_per_m", StrictJson::Type::kArray, error);
   if (boundary_nodes == nullptr || boundary_values == nullptr || boundary_nodes->array.empty()
-      || boundary_nodes->array.size() != boundary_values->array.size()) { *error = "invalid outer Dirichlet"; return false; }
+      || boundary_nodes->array.size() != boundary_values->array.size()) {
+    *error = "invalid outer Dirichlet";
+    return false;
+  }
   for (size_t index = 0; index < boundary_nodes->array.size(); ++index) {
     int32_t node = -1;
     if (!JsonInteger(boundary_nodes->array[index], &node) || node < 0
         || static_cast<size_t>(node) >= parsed.model.nodes.size()
         || boundary_values->array[index].type != StrictJson::Type::kNumber
-        || boundary_values->array[index].number != 0.0) { *error = "outer Dirichlet must be zero and in range"; return false; }
+        || boundary_values->array[index].number != 0.0) {
+      *error = "outer Dirichlet must be zero and in range";
+      return false;
+    }
     parsed.model.dirichlet_nodes.push_back(node);
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
   }
   if (is_sliding_band_v2) {
     const auto ages_it = resolved->object.find("air_gap_elements");
-    if (ages_it == resolved->object.end() || (ages_it->second.type != StrictJson::Type::kArray
-            && ages_it->second.type != StrictJson::Type::kObject)
+    if (ages_it == resolved->object.end() || (ages_it->second.type != StrictJson::Type::kArray && ages_it->second.type != StrictJson::Type::kObject)
         || parsed.displacement_mm[0] != 0.0
         || parsed.displacement_mm[1] != 0.0 || parsed.rotor_angle_deg != 0.0) {
-      if (error->empty()) *error = "sliding-band artifacts require a centered zero-degree reference mesh";
+      if (error->empty())
+        *error = "sliding-band artifacts require a centered zero-degree reference mesh";
       return false;
     }
     // MATLAB's jsonencode represents a scalar struct as an object rather
@@ -2964,15 +3972,19 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     // while retaining the array form for multi-AGE artifacts.
     std::vector<const StrictJson*> age_entries;
     if (ages_it->second.type == StrictJson::Type::kArray) {
-      if (ages_it->second.array.empty()) { *error = "sliding-band requires an air-gap element"; return false; }
-      for (const StrictJson& entry : ages_it->second.array) age_entries.push_back(&entry);
+      if (ages_it->second.array.empty()) {
+        *error = "sliding-band requires an air-gap element";
+        return false;
+      }
+      for (const StrictJson& entry : ages_it->second.array)
+        age_entries.push_back(&entry);
     } else {
       age_entries.push_back(&ages_it->second);
     }
     for (const StrictJson* entry_ptr : age_entries) {
       const StrictJson& entry = *entry_ptr;
-      if (!ExactObject(entry, { "name", "periodicity", "center_mm", "ri_mm", "ro_mm", "arc_length_deg",
-            "sector_count", "inner_shift", "outer_shift", "quad_points" }, error)) return false;
+      if (!ExactObject(entry, { "name", "periodicity", "center_mm", "ri_mm", "ro_mm", "arc_length_deg", "sector_count", "inner_shift", "outer_shift", "quad_points" }, error))
+        return false;
       const StrictJson* name = JsonMember(entry, "name", StrictJson::Type::kString, error);
       const StrictJson* periodicity = JsonMember(entry, "periodicity", StrictJson::Type::kString, error);
       const StrictJson* center = JsonMember(entry, "center_mm", StrictJson::Type::kArray, error);
@@ -2990,15 +4002,21 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
           || center->array[1].type != StrictJson::Type::kNumber || !JsonInteger(*sectors, &sector_count)
           || sector_count < 2 || points->array.size() != static_cast<size_t>(sector_count + 1)
           || (periodicity->string != "periodic" && periodicity->string != "antiperiodic")) {
-        *error = "invalid sliding-band air-gap element"; return false;
+        *error = "invalid sliding-band air-gap element";
+        return false;
       }
       AirGapElement age;
       age.antiperiodic = periodicity->string == "antiperiodic";
-      age.center_x_m = center->array[0].number * 1e-3; age.center_y_m = center->array[1].number * 1e-3;
-      age.inner_radius_m = ri->number * 1e-3; age.outer_radius_m = ro->number * 1e-3;
-      age.arc_length_deg = arc->number; age.inner_shift = inner_shift->number; age.outer_shift = outer_shift->number;
+      age.center_x_m = center->array[0].number * 1e-3;
+      age.center_y_m = center->array[1].number * 1e-3;
+      age.inner_radius_m = ri->number * 1e-3;
+      age.outer_radius_m = ro->number * 1e-3;
+      age.arc_length_deg = arc->number;
+      age.inner_shift = inner_shift->number;
+      age.outer_shift = outer_shift->number;
       for (const StrictJson& point : points->array) {
-        if (!ExactObject(point, { "n0", "w0", "n1", "w1", "n2", "w2", "n3", "w3" }, error)) return false;
+        if (!ExactObject(point, { "n0", "w0", "n1", "w1", "n2", "w2", "n3", "w3" }, error))
+          return false;
         AirGapQuadPoint parsed_point;
         for (int local = 0; local < 4; ++local) {
           const std::string node_name = std::string("n") + char('0' + local);
@@ -3006,7 +4024,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
           const StrictJson* node = JsonMember(point, node_name.c_str(), StrictJson::Type::kNumber, error);
           const StrictJson* weight = JsonMember(point, weight_name.c_str(), StrictJson::Type::kNumber, error);
           if (node == nullptr || weight == nullptr || !JsonInteger(*node, &parsed_point.node[local])) {
-            *error = "invalid sliding-band quadrature point"; return false;
+            *error = "invalid sliding-band quadrature point";
+            return false;
           }
           parsed_point.weight[local] = weight->number;
         }
@@ -3015,7 +4034,10 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       parsed.model.air_gap_elements.push_back(std::move(age));
     }
   }
-  if (ValidateNonlinearModel(parsed.model) != Status::kOk) { *error = "mapped mesh model validation failed"; return false; }
+  if (ValidateNonlinearModel(parsed.model) != Status::kOk) {
+    *error = "mapped mesh model validation failed";
+    return false;
+  }
   *artifact = std::move(parsed);
   return true;
 }
@@ -3024,8 +4046,12 @@ bool ReadGpuFemmMeshArtifact(const std::string& path, GpuFemmMeshArtifact* artif
     std::string* error)
 {
   std::ifstream input(path);
-  std::stringstream contents; contents << input.rdbuf();
-  if (!input) { *error = "cannot open mesh artifact"; return false; }
+  std::stringstream contents;
+  contents << input.rdbuf();
+  if (!input) {
+    *error = "cannot open mesh artifact";
+    return false;
+  }
   return ParseGpuFemmMeshArtifactJson(contents.str(), artifact, error);
 }
 
@@ -3111,9 +4137,11 @@ bool TriangleBarycentric(const Node p[3], double x_m, double y_m, double lambda[
   if (!(determinant > 0.0) || !std::isfinite(determinant))
     return false;
   lambda[1] = ((x_m - p[0].x_m) * (p[2].y_m - p[0].y_m)
-      - (p[2].x_m - p[0].x_m) * (y_m - p[0].y_m)) / determinant;
+                  - (p[2].x_m - p[0].x_m) * (y_m - p[0].y_m))
+      / determinant;
   lambda[2] = ((p[1].x_m - p[0].x_m) * (y_m - p[0].y_m)
-      - (x_m - p[0].x_m) * (p[1].y_m - p[0].y_m)) / determinant;
+                  - (x_m - p[0].x_m) * (p[1].y_m - p[0].y_m))
+      / determinant;
   lambda[0] = 1.0 - lambda[1] - lambda[2];
   return std::isfinite(lambda[0]) && std::isfinite(lambda[1]) && std::isfinite(lambda[2]);
 }
@@ -3121,8 +4149,7 @@ bool TriangleBarycentric(const Node p[3], double x_m, double y_m, double lambda[
 Status BuildWeightedStressMask(const NonlinearModel& model,
     const FrozenPostprocessOptions& options, std::vector<double>* mask)
 {
-  if (mask == nullptr || ((options.selected_group_number < 0)
-          && (options.selected_material_label < 0 || static_cast<size_t>(options.selected_material_label) >= model.materials.size()))
+  if (mask == nullptr || ((options.selected_group_number < 0) && (options.selected_material_label < 0 || static_cast<size_t>(options.selected_material_label) >= model.materials.size()))
       || ((options.air_group_number < 0)
           && (options.air_material_label < 0 || static_cast<size_t>(options.air_material_label) >= model.materials.size()))
       || (options.selected_group_number >= 0 && options.selected_group_number == options.air_group_number)
@@ -3140,8 +4167,7 @@ Status BuildWeightedStressMask(const NonlinearModel& model,
   bool selected_seen = false;
   for (size_t element = 0; element < model.triangles.size(); ++element) {
     const NonlinearTriangle& triangle = model.triangles[element];
-    selected_seen = selected_seen || IsSelectedPostprocessMaterial(
-        model.materials[triangle.material], options, triangle.material);
+    selected_seen = selected_seen || IsSelectedPostprocessMaterial(model.materials[triangle.material], options, triangle.material);
     for (int local = 0; local < 3; ++local) {
       edge_elements[CanonicalEdge(triangle.node[local], triangle.node[(local + 1) % 3])]
           .push_back(static_cast<int32_t>(element));
@@ -3158,8 +4184,7 @@ Status BuildWeightedStressMask(const NonlinearModel& model,
       const int32_t material = model.triangles[element].material;
       const NonlinearMaterial& properties = model.materials[material];
       selected = selected || IsSelectedPostprocessMaterial(properties, options, material);
-      other_non_air = other_non_air || (!IsSelectedPostprocessMaterial(properties, options, material)
-          && !IsAirPostprocessMaterial(properties, options, material));
+      other_non_air = other_non_air || (!IsSelectedPostprocessMaterial(properties, options, material) && !IsAirPostprocessMaterial(properties, options, material));
     }
     if (selected && other_non_air)
       return Status::kInvalidMaterial;
@@ -3199,8 +4224,7 @@ Status BuildWeightedStressMask(const NonlinearModel& model,
     for (int row = 0; row < 3; ++row) {
       for (int column = 0; column < 3; ++column) {
         const Status added = AddSparseEntry(&stiffness, triangle.node[row], triangle.node[column],
-            mask_weight * terms.area_m2 * (terms.b_x[row] * terms.b_x[column]
-                + terms.b_y[row] * terms.b_y[column]));
+            mask_weight * terms.area_m2 * (terms.b_x[row] * terms.b_x[column] + terms.b_y[row] * terms.b_y[column]));
         if (added != Status::kOk)
           return added;
       }
@@ -3310,8 +4334,7 @@ bool SmoothedElementB(const NonlinearModel& model, const std::vector<double>& a,
         const Node& p2 = model.nodes[candidate.node[2]];
         const double cx = (p0.x_m + p1.x_m + p2.x_m) / 3.0;
         const double cy = (p0.y_m + p1.y_m + p2.y_m) / 3.0;
-        const double weight = 1.0 / std::hypot(model.nodes[node].x_m - cx,
-            model.nodes[node].y_m - cy);
+        const double weight = 1.0 / std::hypot(model.nodes[node].x_m - cx, model.nodes[node].y_m - cy);
         if (!(weight > 0.0) || !std::isfinite(weight))
           return false;
         weight_sum += weight;
@@ -3514,9 +4537,7 @@ FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
         break;
       }
     }
-    if (containing < 0 || !IsAirPostprocessMaterial(
-            model.materials[model.triangles[containing].material], options,
-            model.triangles[containing].material)) {
+    if (containing < 0 || !IsAirPostprocessMaterial(model.materials[model.triangles[containing].material], options, model.triangles[containing].material)) {
       result.status = Status::kInvalidArgument;
       return result;
     }
@@ -3542,7 +4563,8 @@ FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
 bool BuildAirGapStencil(const AirGapElement& age, size_t k, int32_t node[10], double weight[10])
 {
   const size_t elements = age.quad_points.size() - 1;
-  if (elements < 2 || k >= elements) return false;
+  if (elements < 2 || k >= elements)
+    return false;
   const size_t previous = k == 0 ? elements - 1 : k - 1;
   const size_t next = k + 1;
   const size_t next2 = k + 2 > elements ? 1 : k + 2;
@@ -3554,9 +4576,16 @@ bool BuildAirGapStencil(const AirGapElement& age, size_t k, int32_t node[10], do
     before.node[2], current.node[2], current.node[3], after.node[3], after2.node[3] };
   const double local_weight[10] = { before.weight[0], current.weight[0], current.weight[1], after.weight[1], after2.weight[1],
     before.weight[2], current.weight[2], current.weight[3], after.weight[3], after2.weight[3] };
-  std::copy(local_node, local_node + 10, node); std::copy(local_weight, local_weight + 10, weight);
-  if (age.antiperiodic && k == 0) { weight[0] = -weight[0]; weight[5] = -weight[5]; }
-  if (age.antiperiodic && k + 1 == elements) { weight[4] = -weight[4]; weight[9] = -weight[9]; }
+  std::copy(local_node, local_node + 10, node);
+  std::copy(local_weight, local_weight + 10, weight);
+  if (age.antiperiodic && k == 0) {
+    weight[0] = -weight[0];
+    weight[5] = -weight[5];
+  }
+  if (age.antiperiodic && k + 1 == elements) {
+    weight[4] = -weight[4];
+    weight[9] = -weight[9];
+  }
   return true;
 }
 
@@ -3569,7 +4598,8 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
   result.force_y_n = 0.0;
   result.torque_nm = 0.0;
   if (model.air_gap_elements.empty() || solution.a_wb_per_m.size() != model.nodes.size()) {
-    result.status = Status::kInvalidArgument; return result;
+    result.status = Status::kInvalidArgument;
+    return result;
   }
   struct AirGapField {
     const AirGapElement* age = nullptr;
@@ -3584,25 +4614,38 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
         * age.arc_length_deg / static_cast<double>(elements);
     const double radius = 0.5 * (age.inner_radius_m + age.outer_radius_m);
     const double dr = age.outer_radius_m - age.inner_radius_m;
-    if (!(dt > 0.0) || !(radius > 0.0) || !(dr > 0.0)) { result.status = Status::kMeshInvalid; return result; }
-    AirGapField field; field.age = &age; field.br.resize(elements); field.bt.resize(elements);
+    if (!(dt > 0.0) || !(radius > 0.0) || !(dr > 0.0)) {
+      result.status = Status::kMeshInvalid;
+      return result;
+    }
+    AirGapField field;
+    field.age = &age;
+    field.br.resize(elements);
+    field.bt.resize(elements);
     for (size_t k = 0; k < elements; ++k) {
-      int32_t node[10]; double weight[10], a[10];
-      if (!BuildAirGapStencil(age, k, node, weight)) { result.status = Status::kMeshInvalid; return result; }
-      for (int local = 0; local < 10; ++local) a[local] = solution.a_wb_per_m[node[local]] * weight[local];
+      int32_t node[10];
+      double weight[10], a[10];
+      if (!BuildAirGapStencil(age, k, node, weight)) {
+        result.status = Status::kMeshInvalid;
+        return result;
+      }
+      for (int local = 0; local < 10; ++local)
+        a[local] = solution.a_wb_per_m[node[local]] * weight[local];
       const double ci = age.inner_shift, co = age.outer_shift;
       field.br[k] = (-(ci * a[1]) - 2 * a[2] + 2 * a[3] + ci * (a[2] + a[3] - a[4])
-          - ci * ci * ci * (a[0] - 4 * a[1] + 6 * a[2] - 4 * a[3] + a[4])
-          + ci * ci * (a[0] - 5 * a[1] + 9 * a[2] - 7 * a[3] + 2 * a[4]) - 2 * a[7] + 2 * a[8]
-          + co * (-a[6] + a[7] + a[8] - a[9]) - co * co * co * (a[5] - 4 * a[6] + 6 * a[7] - 4 * a[8] + a[9])
-          + co * co * (a[5] - 5 * a[6] + 9 * a[7] - 7 * a[8] + 2 * a[9])) / (4 * dt * radius);
+                        - ci * ci * ci * (a[0] - 4 * a[1] + 6 * a[2] - 4 * a[3] + a[4])
+                        + ci * ci * (a[0] - 5 * a[1] + 9 * a[2] - 7 * a[3] + 2 * a[4]) - 2 * a[7] + 2 * a[8]
+                        + co * (-a[6] + a[7] + a[8] - a[9]) - co * co * co * (a[5] - 4 * a[6] + 6 * a[7] - 4 * a[8] + a[9])
+                        + co * co * (a[5] - 5 * a[6] + 9 * a[7] - 7 * a[8] + 2 * a[9]))
+          / (4 * dt * radius);
       field.bt[k] = (ci * a[1] + 2 * a[2] + 2 * a[3] - ci * ci * (a[0] - 3 * a[1] + a[2] + 3 * a[3] - 2 * a[4])
-          + ci * (a[2] - a[3] - a[4]) + ci * ci * ci * (a[0] - 2 * a[1] + 2 * a[3] - a[4])
-          - co * a[6] + (-2 + co) * (1 + co) * a[7] - 2 * a[8]
-          + co * (a[8] + co * (a[5] - 3 * a[6] + 3 * a[8] - 2 * a[9]) + a[9]
-              + co * co * (-a[5] + 2 * a[6] - 2 * a[8] + a[9]))) / (4 * dr);
+                        + ci * (a[2] - a[3] - a[4]) + ci * ci * ci * (a[0] - 2 * a[1] + 2 * a[3] - a[4])
+                        - co * a[6] + (-2 + co) * (1 + co) * a[7] - 2 * a[8]
+                        + co * (a[8] + co * (a[5] - 3 * a[6] + 3 * a[8] - 2 * a[9]) + a[9] + co * co * (-a[5] + 2 * a[6] - 2 * a[8] + a[9])))
+          / (4 * dr);
       if (!std::isfinite(field.br[k]) || !std::isfinite(field.bt[k])) {
-        result.status = Status::kNumericalNonfinite; return result;
+        result.status = Status::kNumericalNonfinite;
+        return result;
       }
       const double theta = (static_cast<double>(k) + 0.5) * dt;
       const double normal = field.br[k] * field.br[k] - field.bt[k] * field.bt[k];
@@ -3641,7 +4684,10 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
     fields.push_back(std::move(field));
   }
   for (const double angle : options.airgap_angles_rad) {
-    if (!std::isfinite(angle)) { result.status = Status::kInvalidArgument; return result; }
+    if (!std::isfinite(angle)) {
+      result.status = Status::kInvalidArgument;
+      return result;
+    }
     const AirGapField& field = fields.front();
     double radial_b_t = 0.0;
     for (size_t harmonic = 0; harmonic < field.harmonic_order.size(); ++harmonic) {
@@ -3673,7 +4719,7 @@ bool NearMixed(double actual, double expected, double absolute_tolerance,
 {
   return std::isfinite(actual) && std::isfinite(expected)
       && std::abs(actual - expected)
-          <= absolute_tolerance + relative_tolerance * std::abs(expected);
+      <= absolute_tolerance + relative_tolerance * std::abs(expected);
 }
 
 bool ReadFemmAns(const std::string& path, FemmReference* reference,
@@ -3702,8 +4748,8 @@ bool ReadFemmAns(const std::string& path, FemmReference* reference,
   for (int node = 0; node < node_count; ++node) {
     int boundary_code = 0;
     if (!(input >> reference->model.nodes[node].x_m
-              >> reference->model.nodes[node].y_m
-              >> reference->expected_a[node] >> boundary_code)
+            >> reference->model.nodes[node].y_m
+            >> reference->expected_a[node] >> boundary_code)
         || !std::isfinite(reference->expected_a[node])) {
       *error = "invalid FEMM solution node";
       return false;
@@ -3722,7 +4768,7 @@ bool ReadFemmAns(const std::string& path, FemmReference* reference,
     double element_current = 0.0;
     Triangle& triangle = reference->model.triangles[element];
     if (!(input >> triangle.node[0] >> triangle.node[1] >> triangle.node[2]
-              >> label >> edge[0] >> edge[1] >> edge[2] >> element_current)
+            >> label >> edge[0] >> edge[1] >> edge[2] >> element_current)
         || label != 0 || !std::isfinite(element_current)) {
       *error = "invalid or unsupported FEMM solution element";
       return false;
@@ -3773,9 +4819,11 @@ bool ReadFemmAns(const std::string& path, FemmReference* reference,
     const double a1 = reference->expected_a[triangle.node[1]];
     const double a2 = reference->expected_a[triangle.node[2]];
     reference->expected_bx[element] = (a0 * (p2.x_m - p1.x_m)
-        + a1 * (p0.x_m - p2.x_m) + a2 * (p1.x_m - p0.x_m)) / determinant;
+                                          + a1 * (p0.x_m - p2.x_m) + a2 * (p1.x_m - p0.x_m))
+        / determinant;
     reference->expected_by[element] = -(a0 * (p1.y_m - p2.y_m)
-        + a1 * (p2.y_m - p0.y_m) + a2 * (p0.y_m - p1.y_m)) / determinant;
+                                          + a1 * (p2.y_m - p0.y_m) + a2 * (p0.y_m - p1.y_m))
+        / determinant;
   }
   if (!NearMixed(area_sum, 1.0, 1e-12, 1e-12)) {
     *error = "fixture source normalization requires one square metre";
@@ -3792,9 +4840,7 @@ bool ReadCircuitReference(const std::string& path, FemmReference* reference,
   std::string voltage_name;
   std::string flux_name;
   double voltage = 0.0;
-  if (!input || !(input >> current_name >> reference->current_a
-                    >> voltage_name >> voltage
-                    >> flux_name >> reference->flux_linkage_wb)
+  if (!input || !(input >> current_name >> reference->current_a >> voltage_name >> voltage >> flux_name >> reference->flux_linkage_wb)
       || current_name != "current_A" || voltage_name != "voltage_drop_V"
       || flux_name != "flux_linkage_Wb" || reference->current_a != 12.0
       || voltage != 0.0 || !std::isfinite(reference->flux_linkage_wb)) {
@@ -3920,7 +4966,7 @@ bool ReadNonlinearFemmReference(const std::string& stem, const std::string& curv
 {
   std::ifstream input(stem + ".ans");
   std::string line;
-  while (std::getline(input, line) && line != "[Solution]") {}
+  while (std::getline(input, line) && line != "[Solution]") { }
   int node_count = 0;
   if (!input || !(input >> node_count) || node_count <= 0) {
     *error = "invalid nonlinear [Solution] node count";
@@ -3931,7 +4977,7 @@ bool ReadNonlinearFemmReference(const std::string& stem, const std::string& curv
   for (int node = 0; node < node_count; ++node) {
     int ignored = 0;
     if (!(input >> reference->model.nodes[node].x_m >> reference->model.nodes[node].y_m
-              >> reference->expected_a[node] >> ignored)) {
+            >> reference->expected_a[node] >> ignored)) {
       *error = "invalid nonlinear solution node";
       return false;
     }
@@ -3952,7 +4998,7 @@ bool ReadNonlinearFemmReference(const std::string& stem, const std::string& curv
     double element_current = 0.0;
     NonlinearTriangle& triangle = reference->model.triangles[element];
     if (!(input >> triangle.node[0] >> triangle.node[1] >> triangle.node[2] >> label[element]
-              >> edge[0] >> edge[1] >> edge[2] >> element_current)
+            >> edge[0] >> edge[1] >> edge[2] >> element_current)
         || label[element] < 0 || label[element] > 3 || !std::isfinite(element_current)) {
       *error = "missing or out-of-range nonlinear block label";
       return false;
@@ -4345,8 +5391,7 @@ int FrozenPostprocessReferenceTest(const std::string& stem, const std::string& c
       max_airgap_error = std::max(max_airgap_error,
           std::abs(actual.airgap_samples[index].radial_b_t
               - postprocess_reference.expected_radial_b_t[index]));
-      pass = pass && NearMixed(actual.airgap_samples[index].radial_b_t,
-          postprocess_reference.expected_radial_b_t[index], 1e-9, 1e-5);
+      pass = pass && NearMixed(actual.airgap_samples[index].radial_b_t, postprocess_reference.expected_radial_b_t[index], 1e-9, 1e-5);
     }
   }
   if (!pass) {
@@ -4504,10 +5549,12 @@ struct MotorSampleRequest {
 
 bool StrictNumberArray(const StrictJson& value, std::vector<double>* output)
 {
-  if (value.type != StrictJson::Type::kArray || output == nullptr) return false;
+  if (value.type != StrictJson::Type::kArray || output == nullptr)
+    return false;
   output->clear();
   for (const StrictJson& member : value.array) {
-    if (member.type != StrictJson::Type::kNumber) return false;
+    if (member.type != StrictJson::Type::kNumber)
+      return false;
     output->push_back(member.number);
   }
   return true;
@@ -4517,10 +5564,8 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
     std::string* error)
 {
   if (request == nullptr || error == nullptr
-      || !ExactObject(root, { "protocol", "mesh_artifact_path", "mesh_artifact_sha256",
-        "base_motor_fem_sha256", "source_fem_sha256", "circuit_currents_A",
-        "selected_group_number", "air_group_number", "airgap_radius_mm", "airgap_angles_deg",
-        "rotor_angle_deg", "displacement_mm" }, error)) return false;
+      || !ExactObject(root, { "protocol", "mesh_artifact_path", "mesh_artifact_sha256", "base_motor_fem_sha256", "source_fem_sha256", "circuit_currents_A", "selected_group_number", "air_group_number", "airgap_radius_mm", "airgap_angles_deg", "rotor_angle_deg", "displacement_mm" }, error))
+    return false;
   const StrictJson* protocol = JsonMember(root, "protocol", StrictJson::Type::kString, error);
   const StrictJson* path = JsonMember(root, "mesh_artifact_path", StrictJson::Type::kString, error);
   const StrictJson* artifact_sha = JsonMember(root, "mesh_artifact_sha256", StrictJson::Type::kString, error);
@@ -4546,14 +5591,19 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
       || !StrictNumberArray(*currents, &request->circuit_currents_a)
       || !StrictNumberArray(*angles, &request->airgap_angles_deg)
       || request->circuit_currents_a.empty() || (!request->airgap_angles_deg.empty() && !(radius->number > 0.0))) {
-    if (error->empty()) *error = "invalid gpu_femm_motor_sample_v1 request";
+    if (error->empty())
+      *error = "invalid gpu_femm_motor_sample_v1 request";
     return false;
   }
-  request->mesh_artifact_path = path->string; request->mesh_artifact_sha256 = artifact_sha->string;
-  request->base_motor_fem_sha256 = base_sha->string; request->source_fem_sha256 = source_sha->string;
+  request->mesh_artifact_path = path->string;
+  request->mesh_artifact_sha256 = artifact_sha->string;
+  request->base_motor_fem_sha256 = base_sha->string;
+  request->source_fem_sha256 = source_sha->string;
   request->selected_group_number = selected_group;
-  request->air_group_number = air_group; request->airgap_radius_mm = radius->number;
-  request->rotor_angle_deg = rotor->number; request->displacement_mm[0] = displacement->array[0].number;
+  request->air_group_number = air_group;
+  request->airgap_radius_mm = radius->number;
+  request->rotor_angle_deg = rotor->number;
+  request->displacement_mm[0] = displacement->array[0].number;
   request->displacement_mm[1] = displacement->array[1].number;
   return true;
 }
@@ -4603,14 +5653,18 @@ bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMesh
 bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact,
     NonlinearModel* model)
 {
-  if (model == nullptr) return false;
+  if (model == nullptr)
+    return false;
   *model = artifact.model;
-  if (!artifact.has_sliding_band) return true;
+  if (!artifact.has_sliding_band)
+    return true;
   const double delta_deg = request.rotor_angle_deg - artifact.rotor_angle_deg;
-  if (!std::isfinite(delta_deg)) return false;
+  if (!std::isfinite(delta_deg))
+    return false;
   for (AirGapElement& age : model->air_gap_elements) {
     const size_t sectors = age.quad_points.size() - 1;
-    if (sectors == 0 || !(age.arc_length_deg > 0.0)) return false;
+    if (sectors == 0 || !(age.arc_length_deg > 0.0))
+      return false;
     // FEMM regenerates AGE point records for every rotor angle.  Its fractional
     // shift is only part of that operation: crossing a ring cell also rotates
     // the inner-side node/weight sequence.  Keep the stator-side records fixed
@@ -4624,7 +5678,8 @@ bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemm
     for (size_t k = 0; k < sectors; ++k) {
       int64_t source_index = static_cast<int64_t>(k) - integer_cells;
       source_index %= count;
-      if (source_index < 0) source_index += count;
+      if (source_index < 0)
+        source_index += count;
       for (int local = 0; local < 2; ++local) {
         age.quad_points[k].node[local] = source[static_cast<size_t>(source_index)].node[local];
         age.quad_points[k].weight[local] = source[static_cast<size_t>(source_index)].weight[local];
@@ -4647,17 +5702,20 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
   if (solution == nullptr || postprocess == nullptr || !RequestMatchesArtifact(request, artifact))
     return Status::kInvalidArgument;
   NonlinearModel model;
-  if (!ApplySlidingBandRotorAngle(request, artifact, &model)) return Status::kInvalidArgument;
+  if (!ApplySlidingBandRotorAngle(request, artifact, &model))
+    return Status::kInvalidArgument;
   NonlinearP1FixtureSolver solver;
   Status status = solver.Initialize(model);
-  if (status != Status::kOk) return status;
+  if (status != Status::kOk)
+    return status;
   NonlinearOptions nonlinear_options;
   nonlinear_options.relative_tolerance = 1e-8;
   nonlinear_options.max_newton_iterations = 128;
   nonlinear_options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
   nonlinear_options.max_linear_iterations = kMotorMaxLinearIterations;
   *solution = solver.Solve(request.circuit_currents_a, nonlinear_options);
-  if (solution->info.status != Status::kOk) return solution->info.status;
+  if (solution->info.status != Status::kOk)
+    return solution->info.status;
   FrozenPostprocessOptions postprocess_options;
   postprocess_options.selected_group_number = request.selected_group_number;
   postprocess_options.air_group_number = request.air_group_number;
@@ -4674,7 +5732,7 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
 void WriteMotorSampleResponseJson(std::ostream& output, Status status, const MotorSampleRequest* request,
     const NonlinearSolveResult* solution, const FrozenPostprocessResult* postprocess)
 {
-  const auto field = [request](const std::string MotorSampleRequest::*member) { return request == nullptr ? "" : request->*member; };
+  const auto field = [request](const std::string MotorSampleRequest::* member) { return request == nullptr ? "" : request->*member; };
   output << std::setprecision(17) << "{\n  \"protocol\": \"gpu_femm_motor_sample_v1\",\n"
          << "  \"mesh_artifact_sha256\": \"" << field(&MotorSampleRequest::mesh_artifact_sha256) << "\",\n"
          << "  \"base_motor_fem_sha256\": \"" << field(&MotorSampleRequest::base_motor_fem_sha256) << "\",\n"
@@ -4686,13 +5744,17 @@ void WriteMotorSampleResponseJson(std::ostream& output, Status status, const Mot
   if (status == Status::kOk && request != nullptr && solution != nullptr && postprocess != nullptr) {
     output << "  \"Fx_N\": " << postprocess->force_x_n << ",\n  \"Fy_N\": " << postprocess->force_y_n
            << ",\n  \"torque_Nm\": " << postprocess->torque_nm << ",\n  \"actual_circuit_currents_A\": [";
-    for (size_t i = 0; i < solution->circuit_currents_a.size(); ++i) output << (i ? ", " : "") << solution->circuit_currents_a[i];
+    for (size_t i = 0; i < solution->circuit_currents_a.size(); ++i)
+      output << (i ? ", " : "") << solution->circuit_currents_a[i];
     output << "],\n  \"circuit_flux_linkage_Wb\": [";
-    for (size_t i = 0; i < solution->circuit_flux_linkage_wb.size(); ++i) output << (i ? ", " : "") << solution->circuit_flux_linkage_wb[i];
+    for (size_t i = 0; i < solution->circuit_flux_linkage_wb.size(); ++i)
+      output << (i ? ", " : "") << solution->circuit_flux_linkage_wb[i];
     output << "],\n  \"airgap_sample_angles_deg\": [";
-    for (size_t i = 0; i < request->airgap_angles_deg.size(); ++i) output << (i ? ", " : "") << request->airgap_angles_deg[i];
+    for (size_t i = 0; i < request->airgap_angles_deg.size(); ++i)
+      output << (i ? ", " : "") << request->airgap_angles_deg[i];
     output << "],\n  \"airgap_radial_flux_density_T\": [";
-    for (size_t i = 0; i < postprocess->airgap_samples.size(); ++i) output << (i ? ", " : "") << postprocess->airgap_samples[i].radial_b_t;
+    for (size_t i = 0; i < postprocess->airgap_samples.size(); ++i)
+      output << (i ? ", " : "") << postprocess->airgap_samples[i].radial_b_t;
     output << "],\n  \"mesh_element_count\": " << solution->bx_t.size() << ",\n  \"convergence\": {\"iterations\": "
            << solution->info.iterations << ", \"residual_l2\": " << solution->info.residual_l2 << "}\n";
   } else {
@@ -4714,7 +5776,8 @@ bool WriteMotorSampleResponse(const std::string& path, Status status, const Moto
     const NonlinearSolveResult* solution, const FrozenPostprocessResult* postprocess)
 {
   std::ofstream output(path, std::ios::trunc);
-  if (!output) return false;
+  if (!output)
+    return false;
   WriteMotorSampleResponseJson(output, status, request, solution, postprocess);
   output << '\n';
   return static_cast<bool>(output);
@@ -4722,27 +5785,46 @@ bool WriteMotorSampleResponse(const std::string& path, Status status, const Moto
 
 int MotorSingleSampleAdapter(const std::string& request_path, const std::string& response_path)
 {
-  std::ifstream request_file(request_path); std::stringstream bytes; bytes << request_file.rdbuf();
-  MotorSampleRequest request; std::string error;
+  std::ifstream request_file(request_path);
+  std::stringstream bytes;
+  bytes << request_file.rdbuf();
+  MotorSampleRequest request;
+  std::string error;
   if (!request_file || !ReadMotorSampleRequestJson(bytes.str(), &request, &error)) {
     WriteMotorSampleResponse(response_path, Status::kInvalidArgument, nullptr, nullptr, nullptr);
-    std::cerr << "FAIL motor single-sample request: " << error << '\n'; return 1;
+    std::cerr << "FAIL motor single-sample request: " << error << '\n';
+    return 1;
   }
-  std::ifstream artifact_file(request.mesh_artifact_path, std::ios::binary); std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
+  std::ifstream artifact_file(request.mesh_artifact_path, std::ios::binary);
+  std::stringstream artifact_bytes;
+  artifact_bytes << artifact_file.rdbuf();
   GpuFemmMeshArtifact artifact;
   Status status = Status::kOk;
-  if (!artifact_file) { status = Status::kInputIo; error = "cannot open mesh artifact"; }
-  else if (Sha256Hex(artifact_bytes.str()) != request.mesh_artifact_sha256) { status = Status::kInvalidArgument; error = "mesh artifact SHA mismatch"; }
-  else if (!ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)) status = Status::kInvalidArgument;
-  else if (!RequestMatchesArtifact(request, artifact)) { status = Status::kInvalidArgument; error = "artifact identity, pose, or circuit-count mismatch"; }
-  NonlinearSolveResult solution; FrozenPostprocessResult postprocess;
+  if (!artifact_file) {
+    status = Status::kInputIo;
+    error = "cannot open mesh artifact";
+  } else if (Sha256Hex(artifact_bytes.str()) != request.mesh_artifact_sha256) {
+    status = Status::kInvalidArgument;
+    error = "mesh artifact SHA mismatch";
+  } else if (!ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error))
+    status = Status::kInvalidArgument;
+  else if (!RequestMatchesArtifact(request, artifact)) {
+    status = Status::kInvalidArgument;
+    error = "artifact identity, pose, or circuit-count mismatch";
+  }
+  NonlinearSolveResult solution;
+  FrozenPostprocessResult postprocess;
   const bool solve_attempted = status == Status::kOk;
   if (solve_attempted)
     status = SolveMeshArtifactSingleSample(request, artifact, &solution, &postprocess);
   if (!WriteMotorSampleResponse(response_path, status, &request,
           solve_attempted ? &solution : nullptr,
-          status == Status::kOk ? &postprocess : nullptr)) return 1;
-  if (status != Status::kOk) { std::cerr << "FAIL motor single-sample: " << error << (error.empty() ? StatusName(status) : "") << '\n'; return 1; }
+          status == Status::kOk ? &postprocess : nullptr))
+    return 1;
+  if (status != Status::kOk) {
+    std::cerr << "FAIL motor single-sample: " << error << (error.empty() ? StatusName(status) : "") << '\n';
+    return 1;
+  }
   return 0;
 }
 
@@ -4761,8 +5843,7 @@ struct MotorBatchRequest {
 
 bool BatchTaskIdValid(const std::string& id)
 {
-  return !id.empty() && id.size() <= 256 && std::all_of(id.begin(), id.end(),
-      [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-' || c == '.'; });
+  return !id.empty() && id.size() <= 256 && std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-' || c == '.'; });
 }
 
 bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* request,
@@ -4771,7 +5852,8 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
   StrictJson root;
   StrictJsonParser parser(json);
   if (request == nullptr || error == nullptr || !parser.Parse(&root, error)
-      || !ExactObject(root, { "protocol", "max_items_per_chunk", "items" }, error)) return false;
+      || !ExactObject(root, { "protocol", "max_items_per_chunk", "items" }, error))
+    return false;
   const StrictJson* protocol = JsonMember(root, "protocol", StrictJson::Type::kString, error);
   const StrictJson* chunk = JsonMember(root, "max_items_per_chunk", StrictJson::Type::kNumber, error);
   const StrictJson* items = JsonMember(root, "items", StrictJson::Type::kArray, error);
@@ -4779,20 +5861,23 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
   if (protocol == nullptr || chunk == nullptr || items == nullptr
       || protocol->string != "gpu_femm_motor_batch_v1" || !JsonInteger(*chunk, &max_items)
       || max_items < 1 || max_items > 4096 || items->array.empty() || items->array.size() > 4096) {
-    if (error->empty()) *error = "invalid gpu_femm_motor_batch_v1 request";
+    if (error->empty())
+      *error = "invalid gpu_femm_motor_batch_v1 request";
     return false;
   }
   request->max_items_per_chunk = max_items;
   request->items.clear();
   std::map<std::string, bool> ids;
   for (const StrictJson& item : items->array) {
-    if (!ExactObject(item, { "task_id", "request" }, error)) return false;
+    if (!ExactObject(item, { "task_id", "request" }, error))
+      return false;
     const StrictJson* id = JsonMember(item, "task_id", StrictJson::Type::kString, error);
     const StrictJson* sample = JsonMember(item, "request", StrictJson::Type::kObject, error);
     MotorBatchItem parsed;
     if (id == nullptr || sample == nullptr || !BatchTaskIdValid(id->string)
         || ids.count(id->string) != 0 || !ReadMotorSampleRequestValue(*sample, &parsed.request, error)) {
-      if (error->empty()) *error = "invalid or duplicate batch task_id";
+      if (error->empty())
+        *error = "invalid or duplicate batch task_id";
       return false;
     }
     parsed.task_id = id->string;
@@ -4806,16 +5891,19 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
 {
   std::ostringstream bytes;
   bytes << std::setprecision(17) << model.depth_m << '|' << model.circuit_count << '|';
-  for (const Node& node : model.nodes) bytes << node.x_m << ',' << node.y_m << ';';
+  for (const Node& node : model.nodes)
+    bytes << node.x_m << ',' << node.y_m << ';';
   for (const NonlinearMaterial& material : model.materials)
     bytes << material.reluctivity_zero_m_per_h << ',' << material.alpha_per_t2 << ','
           << material.source_j_per_a << ',' << material.h_c_a_per_m << ','
           << material.magnetization_deg << ',' << material.bh_curve_index << ','
           << material.circuit_index << ',' << material.group_number << ';';
   for (const NonlinearBhCurve& curve : model.bh_curves) {
-    for (double value : curve.h_a_per_m) bytes << value << ',';
+    for (double value : curve.h_a_per_m)
+      bytes << value << ',';
     bytes << ':';
-    for (double value : curve.b_t) bytes << value << ',';
+    for (double value : curve.b_t)
+      bytes << value << ',';
     bytes << ';';
   }
   for (const NonlinearTriangle& triangle : model.triangles)
@@ -4825,12 +5913,15 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
           << age.inner_radius_m << ',' << age.outer_radius_m << ',' << age.arc_length_deg << ','
           << age.inner_shift << ',' << age.outer_shift << ';';
     for (const AirGapQuadPoint& point : age.quad_points)
-      for (int local = 0; local < 4; ++local) bytes << point.node[local] << ',' << point.weight[local] << ',';
+      for (int local = 0; local < 4; ++local)
+        bytes << point.node[local] << ',' << point.weight[local] << ',';
     bytes << ';';
   }
-  for (int32_t node : model.dirichlet_nodes) bytes << node << ',';
+  for (int32_t node : model.dirichlet_nodes)
+    bytes << node << ',';
   bytes << ':';
-  for (double value : model.dirichlet_a_wb_per_m) bytes << value << ',';
+  for (double value : model.dirichlet_a_wb_per_m)
+    bytes << value << ',';
   return Sha256Hex(bytes.str());
 }
 
@@ -4841,8 +5932,7 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
 std::string CanonicalArtifactPathKey(const std::string& path)
 {
   std::error_code error;
-  const std::filesystem::path resolved =
-      std::filesystem::weakly_canonical(std::filesystem::path(path), error);
+  const std::filesystem::path resolved = std::filesystem::weakly_canonical(std::filesystem::path(path), error);
   std::string key = error ? path : resolved.generic_string();
 #ifdef _WIN32
   std::transform(key.begin(), key.end(), key.begin(),
@@ -4891,7 +5981,8 @@ struct MotorBatchArtifactLoad {
 void LoadMotorBatchArtifact(const std::string& path, MotorBatchArtifactLoad* load)
 {
   std::ifstream artifact_file(path, std::ios::binary);
-  std::stringstream artifact_bytes; artifact_bytes << artifact_file.rdbuf();
+  std::stringstream artifact_bytes;
+  artifact_bytes << artifact_file.rdbuf();
   if (!artifact_file) {
     load->status = Status::kInputIo;
     return;
@@ -4915,7 +6006,8 @@ void LoadMotorBatchArtifact(const std::string& path, MotorBatchArtifactLoad* loa
 std::string MotorBatchOperatorKey(const MotorSampleRequest& request,
     const MotorBatchArtifactLoad& load, const NonlinearModel& model)
 {
-  if (!load.artifact.has_sliding_band) return NonlinearModelFingerprint(model);
+  if (!load.artifact.has_sliding_band)
+    return NonlinearModelFingerprint(model);
   std::ostringstream key;
   key << std::setprecision(17) << "sliding|" << load.artifact_sha256 << '|'
       << request.rotor_angle_deg << '|'
@@ -4988,7 +6080,8 @@ MotorBatchResponseDto MakeMotorBatchResponseDto(Status status, const MotorSample
     dto.residual_l2 = solution->info.residual_l2;
   }
   if (status == Status::kOk && solution != nullptr && postprocess != nullptr) {
-    dto.force_x_n = postprocess->force_x_n; dto.force_y_n = postprocess->force_y_n;
+    dto.force_x_n = postprocess->force_x_n;
+    dto.force_y_n = postprocess->force_y_n;
     dto.torque_nm = postprocess->torque_nm;
     dto.circuit_flux_linkage_wb = solution->circuit_flux_linkage_wb;
     dto.airgap_angles_deg = request.airgap_angles_deg;
@@ -5013,13 +6106,17 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
   if (dto.status == Status::kOk) {
     output << "  \"Fx_N\": " << dto.force_x_n << ",\n  \"Fy_N\": " << dto.force_y_n
            << ",\n  \"torque_Nm\": " << dto.torque_nm << ",\n  \"actual_circuit_currents_A\": [";
-    for (size_t i = 0; i < dto.circuit_currents_a.size(); ++i) output << (i ? ", " : "") << dto.circuit_currents_a[i];
+    for (size_t i = 0; i < dto.circuit_currents_a.size(); ++i)
+      output << (i ? ", " : "") << dto.circuit_currents_a[i];
     output << "],\n  \"circuit_flux_linkage_Wb\": [";
-    for (size_t i = 0; i < dto.circuit_flux_linkage_wb.size(); ++i) output << (i ? ", " : "") << dto.circuit_flux_linkage_wb[i];
+    for (size_t i = 0; i < dto.circuit_flux_linkage_wb.size(); ++i)
+      output << (i ? ", " : "") << dto.circuit_flux_linkage_wb[i];
     output << "],\n  \"airgap_sample_angles_deg\": [";
-    for (size_t i = 0; i < dto.airgap_angles_deg.size(); ++i) output << (i ? ", " : "") << dto.airgap_angles_deg[i];
+    for (size_t i = 0; i < dto.airgap_angles_deg.size(); ++i)
+      output << (i ? ", " : "") << dto.airgap_angles_deg[i];
     output << "],\n  \"airgap_radial_flux_density_T\": [";
-    for (size_t i = 0; i < dto.airgap_radial_flux_density_t.size(); ++i) output << (i ? ", " : "") << dto.airgap_radial_flux_density_t[i];
+    for (size_t i = 0; i < dto.airgap_radial_flux_density_t.size(); ++i)
+      output << (i ? ", " : "") << dto.airgap_radial_flux_density_t[i];
     output << "],\n  \"mesh_element_count\": " << dto.mesh_element_count << ",\n  \"convergence\": {\"iterations\": "
            << dto.iterations << ", \"residual_l2\": " << dto.residual_l2 << "}\n";
   } else {
@@ -5028,7 +6125,10 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
            << "  \"airgap_sample_angles_deg\": [],\n  \"airgap_radial_flux_density_T\": [],\n"
            << "  \"mesh_element_count\": 0,\n  \"convergence\": {\"iterations\": " << dto.iterations
            << ", \"residual_l2\": ";
-    if (std::isfinite(dto.residual_l2)) output << dto.residual_l2; else output << "null";
+    if (std::isfinite(dto.residual_l2))
+      output << dto.residual_l2;
+    else
+      output << "null";
     output << "}\n";
   }
   output << "}";
@@ -5040,9 +6140,11 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
     int actual_parallel_width, int batched_pcg_launches, const MotorBatchTiming* timing)
 {
   std::ofstream output(path, std::ios::trunc);
-  if (!output) return false;
+  if (!output)
+    return false;
   bool pass = request != nullptr && request->items.size() == responses.size();
-  for (const MotorBatchResponseDto& response : responses) pass = pass && response.status == Status::kOk;
+  for (const MotorBatchResponseDto& response : responses)
+    pass = pass && response.status == Status::kOk;
   output << std::setprecision(17) << "{\n  \"protocol\": \"gpu_femm_motor_batch_v1\",\n"
          << "  \"status\": \"" << (pass ? "PASS" : "FAIL") << "\",\n"
          << "  \"solve_status\": \"" << (pass ? "PASS" : "PARTIAL_FAILURE") << "\",\n"
@@ -5061,6 +6163,7 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
            << ", \"artifact_read_validate_seconds\": " << timing->artifact_read_validate_seconds
            << ", \"solver_initialize_seconds\": " << timing->solver_initialize_seconds
            << ", \"host_assembly_seconds\": " << timing->nonlinear.host_assembly_seconds
+           << ", \"device_assembly_seconds\": " << timing->nonlinear.device_assembly_seconds
            << ", \"gpu_upload_seconds\": " << timing->nonlinear.gpu_upload_seconds
            << ", \"gpu_kernel_sync_seconds\": " << timing->nonlinear.gpu_kernel_sync_seconds
            << ", \"gpu_download_seconds\": " << timing->nonlinear.gpu_download_seconds
@@ -5071,30 +6174,34 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
            << timing->measured_before_response_write_seconds << "},\n";
   }
   output << "  \"items\": [\n";
-  if (request != nullptr) for (size_t index = 0; index < request->items.size(); ++index) {
-    output << "    {\"task_id\": \"" << request->items[index].task_id << "\", \"response\": ";
-    WriteMotorBatchItemResponseJson(output, request->items[index].request, responses[index]);
-    output << "}" << (index + 1 == request->items.size() ? "\n" : ",\n");
-  }
+  if (request != nullptr)
+    for (size_t index = 0; index < request->items.size(); ++index) {
+      output << "    {\"task_id\": \"" << request->items[index].task_id << "\", \"response\": ";
+      WriteMotorBatchItemResponseJson(output, request->items[index].request, responses[index]);
+      output << "}" << (index + 1 == request->items.size() ? "\n" : ",\n");
+    }
   output << "  ]\n}\n";
   return static_cast<bool>(output);
 }
 
 int MotorBatchAdapter(const std::string& request_path, const std::string& response_path,
-    bool include_timing = false)
+    bool include_timing = false,
+    NonlinearAssemblyMode assembly_mode = NonlinearAssemblyMode::kAuto)
 {
   const ProfileClock::time_point total_start = ProfileClock::now();
   MotorBatchTiming timing;
-  std::ifstream input(request_path); std::stringstream bytes; bytes << input.rdbuf();
-  MotorBatchRequest request; std::string error;
+  std::ifstream input(request_path);
+  std::stringstream bytes;
+  bytes << input.rdbuf();
+  MotorBatchRequest request;
+  std::string error;
   if (!input || !ReadMotorBatchRequestJson(bytes.str(), &request, &error)) {
     std::cerr << "FAIL motor batch request: " << error << '\n';
     return 1; // No trusted item identity exists to write a resumable response.
   }
   timing.request_read_parse_seconds = ProfileSecondsSince(total_start);
   const ProfileClock::time_point preflight_start = ProfileClock::now();
-  const MotorBatchArtifactLoadPlan artifact_load_plan =
-      MakeMotorBatchArtifactLoadPlan(request);
+  const MotorBatchArtifactLoadPlan artifact_load_plan = MakeMotorBatchArtifactLoadPlan(request);
   std::vector<std::unique_ptr<MotorBatchArtifactLoad>> cached_artifact_loads(
       artifact_load_plan.canonical_paths.size());
   const size_t preflight_slot = artifact_load_plan.item_slots.front();
@@ -5107,6 +6214,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   // artifact during the actual batch execution.
   size_t values_per_item = 0;
   size_t nodes_per_item = 0;
+  size_t triangles_per_item = 0;
+  size_t circuits_per_item = 0;
   {
     const MotorSampleRequest& first = request.items.front().request;
     const MotorBatchArtifactLoad& load = *cached_artifact_loads[preflight_slot];
@@ -5114,7 +6223,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         && load.artifact_sha256 == first.mesh_artifact_sha256
         && RequestMatchesArtifact(first, load.artifact)) {
       NonlinearModel model;
-      if (!ApplySlidingBandRotorAngle(first, load.artifact, &model)) model.nodes.clear();
+      if (!ApplySlidingBandRotorAngle(first, load.artifact, &model))
+        model.nodes.clear();
       std::vector<double> initial_a(model.nodes.size(), 0.0);
       for (size_t boundary = 0; boundary < model.dirichlet_nodes.size(); ++boundary)
         initial_a[model.dirichlet_nodes[boundary]] = model.dirichlet_a_wb_per_m[boundary];
@@ -5122,6 +6232,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       if (AssembleNonlinearNewton(model, initial_a, first.circuit_currents_a, false, &estimate) == Status::kOk) {
         values_per_item = estimate.values.size();
         nodes_per_item = estimate.free_nodes.size();
+        triangles_per_item = model.triangles.size();
+        circuits_per_item = static_cast<size_t>(model.circuit_count);
       }
     }
   }
@@ -5130,23 +6242,22 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   const bool memory_known = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
   constexpr size_t kMotorBatchSafetyReserveBytes = 512ULL * 1024ULL * 1024ULL;
   constexpr int32_t kMotorBatchMaxParallelWidth = 32;
-  // values plus original/inverse diagonal, RHS, and five PCG state vectors.
+  // Values plus original/inverse diagonal, RHS, and five PCG state vectors.
   // The inverse is extra workspace; keep the original diagonal for validation.
-  // Reserve the largest small-batch cooperative reduction/control workspace
-  // as well, even though B>4 remains on the regular one-block path.
+  // Device nonlinear assembly additionally keeps one full nodal state, four
+  // triangle fields (Bx, By, reluctivity, derivative), and the circuit vector
+  // per item. Static topology/contributor routes remain covered by the 512 MiB
+  // safety reserve below.
   const size_t bytes_per_item = values_per_item == 0 || nodes_per_item == 0 ? 0
-      : sizeof(double) * (values_per_item + 8 * nodes_per_item
-          + kPcgCooperativeShardsPerItem + 3)
+                                                                            : sizeof(double) * (values_per_item + 9 * nodes_per_item + 4 * triangles_per_item + circuits_per_item + kPcgCooperativeShardsPerItem + 3)
           + sizeof(int) * 5;
   const int32_t vram_limit = memory_known && bytes_per_item > 0
-      ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth,
-          free_bytes > kMotorBatchSafetyReserveBytes
-              ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1))) : 1;
+      ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth, free_bytes > kMotorBatchSafetyReserveBytes ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1)))
+      : 1;
   // v2 items are partitioned by their exact artifact-and-pose operator below.
   // The chunk cap therefore remains usable for samples that share an angle,
   // while a different angle can never inherit the prior AGE matrix.
-  const int32_t effective_chunk = std::max(1, std::min({ request.max_items_per_chunk, vram_limit,
-      kMotorBatchMaxParallelWidth }));
+  const int32_t effective_chunk = std::max(1, std::min({ request.max_items_per_chunk, vram_limit, kMotorBatchMaxParallelWidth }));
   // Only paths that recur across chunks (plus the already-required preflight
   // path) remain resident.  A mixed request with thousands of distinct
   // artifacts therefore retains bounded host-memory behavior, while one
@@ -5194,7 +6305,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     auto load_artifact = [&]() {
       for (;;) {
         const size_t load_index = next_artifact.fetch_add(1, std::memory_order_relaxed);
-        if (load_index >= load_slots.size()) return;
+        if (load_index >= load_slots.size())
+          return;
         const size_t slot = load_slots[load_index];
         LoadMotorBatchArtifact(artifact_load_plan.representative_paths[slot],
             loaded_artifacts[load_index].get());
@@ -5203,11 +6315,15 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     std::vector<std::thread> artifact_workers;
     artifact_workers.reserve(artifact_worker_count > 0 ? artifact_worker_count - 1 : 0);
     for (size_t worker = 1; worker < artifact_worker_count; ++worker) {
-      try { artifact_workers.emplace_back(load_artifact); }
-      catch (const std::system_error&) { break; }
+      try {
+        artifact_workers.emplace_back(load_artifact);
+      } catch (const std::system_error&) {
+        break;
+      }
     }
     load_artifact();
-    for (std::thread& worker : artifact_workers) worker.join();
+    for (std::thread& worker : artifact_workers)
+      worker.join();
     for (size_t load_index = 0; load_index < load_slots.size(); ++load_index) {
       const size_t slot = load_slots[load_index];
       if (artifact_load_plan.slot_use_counts[slot] > 1) {
@@ -5221,8 +6337,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     for (size_t local = 0; local < candidate_count; ++local) {
       const size_t index = first + local;
       const MotorSampleRequest& item = request.items[index].request;
-      MotorBatchArtifactLoad* load = artifact_by_slot[
-          artifact_load_plan.item_slots[index]];
+      MotorBatchArtifactLoad* load = artifact_by_slot[artifact_load_plan.item_slots[index]];
       responses[index].status = load == nullptr ? Status::kInternalError : load->status;
       if (responses[index].status != Status::kOk)
         continue;
@@ -5234,7 +6349,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       const GpuFemmMeshArtifact& artifact = load->artifact;
       NonlinearModel model;
       if (!ApplySlidingBandRotorAngle(item, artifact, &model)) {
-        responses[index].status = Status::kInvalidArgument; continue;
+        responses[index].status = Status::kInvalidArgument;
+        continue;
       }
       const std::string operator_key = MotorBatchOperatorKey(item, *load, model);
       prepared.push_back({ index, &artifact, std::move(model), item.circuit_currents_a,
@@ -5244,7 +6360,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     // request chunk before initializing it, so only samples with identical
     // v2 artifact-and-pose operators share a CUDA batch.
     for (const std::vector<size_t>& group : GroupMotorBatchPreparedItemsByOperator(prepared)) {
-      if (group.empty()) continue;
+      if (group.empty())
+        continue;
       const MotorBatchPreparedItem& representative = prepared[group.front()];
       if (cached_fingerprint != representative.operator_key) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
@@ -5269,12 +6386,15 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       group_currents.reserve(group.size());
       for (size_t prepared_index : group)
         group_currents.push_back(prepared[prepared_index].currents);
-      NonlinearOptions options; options.relative_tolerance = 1e-8; options.max_newton_iterations = 128;
+      NonlinearOptions options;
+      options.relative_tolerance = 1e-8;
+      options.max_newton_iterations = 128;
       options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
       options.max_linear_iterations = kMotorMaxLinearIterations;
       NonlinearBatchTiming chunk_timing;
       std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
-          group_currents, options, &batched_pcg_launches, &chunk_timing);
+          group_currents, options, &batched_pcg_launches, &chunk_timing,
+          assembly_mode);
       const size_t current_csr_symbolic_reuse_count = cached_solver.csr_symbolic_reuse_count();
       if (current_csr_symbolic_reuse_count >= accounted_csr_symbolic_reuse_count) {
         csr_symbolic_cache_hits += current_csr_symbolic_reuse_count
@@ -5282,6 +6402,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       }
       accounted_csr_symbolic_reuse_count = current_csr_symbolic_reuse_count;
       timing.nonlinear.host_assembly_seconds += chunk_timing.host_assembly_seconds;
+      timing.nonlinear.device_assembly_seconds += chunk_timing.device_assembly_seconds;
       timing.nonlinear.gpu_upload_seconds += chunk_timing.gpu_upload_seconds;
       timing.nonlinear.gpu_kernel_sync_seconds += chunk_timing.gpu_kernel_sync_seconds;
       timing.nonlinear.gpu_download_seconds += chunk_timing.gpu_download_seconds;
@@ -5299,7 +6420,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         FrozenPostprocessOptions post_options;
         post_options.selected_group_number = item.selected_group_number;
         post_options.air_group_number = item.air_group_number;
-        post_options.max_mask_iterations = 4096; post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
+        post_options.max_mask_iterations = 4096;
+        post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
         for (double angle : item.airgap_angles_deg)
           post_options.airgap_angles_rad.push_back(
               angle * 3.141592653589793238462643383279502884 / 180.0);
@@ -5317,9 +6439,12 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   if (!WriteMotorBatchResponse(response_path, &request, responses,
           request.max_items_per_chunk, effective_chunk, cache_hits, chunk_count,
           csr_symbolic_cache_hits, actual_parallel_width, batched_pcg_launches,
-          include_timing ? &timing : nullptr)) return 1;
+          include_timing ? &timing : nullptr))
+    return 1;
   return std::all_of(responses.begin(), responses.end(),
-      [](const MotorBatchResponseDto& response) { return response.status == Status::kOk; }) ? 0 : 1;
+             [](const MotorBatchResponseDto& response) { return response.status == Status::kOk; })
+      ? 0
+      : 1;
 }
 
 bool WriteSingleSampleResponse(const std::string& path, Status status,
@@ -5369,8 +6494,10 @@ bool WriteSingleSampleResponse(const std::string& path, Status status,
 int SingleSampleAdapter(const std::string& request_path, const std::string& response_path)
 {
   std::ifstream protocol_file(request_path);
-  std::stringstream protocol_bytes; protocol_bytes << protocol_file.rdbuf();
-  StrictJson protocol_root; std::string protocol_error;
+  std::stringstream protocol_bytes;
+  protocol_bytes << protocol_file.rdbuf();
+  StrictJson protocol_root;
+  std::string protocol_error;
   if (protocol_file && StrictJsonParser(protocol_bytes.str()).Parse(&protocol_root, &protocol_error)
       && protocol_root.type == StrictJson::Type::kObject) {
     const auto protocol = protocol_root.object.find("protocol");
@@ -5423,7 +6550,6 @@ int SingleSampleAdapter(const std::string& request_path, const std::string& resp
   }
   return 0;
 }
-
 
 Model UnitSquareFixture()
 {
@@ -5652,7 +6778,8 @@ int SelfTest()
   if (age_array_open_at != std::string::npos)
     scalar_sliding_mesh_artifact.replace(age_array_open_at, age_array_open.size(), "\"air_gap_elements\":{");
   const size_t age_array_close_at = scalar_sliding_mesh_artifact.rfind("}]\n    }");
-  if (age_array_close_at != std::string::npos) scalar_sliding_mesh_artifact.erase(age_array_close_at + 1, 1);
+  if (age_array_close_at != std::string::npos)
+    scalar_sliding_mesh_artifact.erase(age_array_close_at + 1, 1);
   GpuFemmMeshArtifact scalar_sliding_artifact;
   expect(ParseGpuFemmMeshArtifactJson(scalar_sliding_mesh_artifact, &scalar_sliding_artifact, &parser_error)
           && scalar_sliding_artifact.has_sliding_band && scalar_sliding_artifact.model.air_gap_elements.size() == 1,
@@ -5684,7 +6811,8 @@ int SelfTest()
           && RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request binds artifact identities and pose");
   MotorSampleRequest sliding_request = parsed_request;
-  sliding_request.rotor_angle_deg = 3.0; sliding_request.displacement_mm[0] = 0.0;
+  sliding_request.rotor_angle_deg = 3.0;
+  sliding_request.displacement_mm[0] = 0.0;
   expect(RequestMatchesArtifact(sliding_request, sliding_artifact),
       "v2 request permits a centered non-reference rotor angle");
   MotorSampleRequest invalid_sliding_postprocess = sliding_request;
@@ -5702,6 +6830,82 @@ int SelfTest()
           && shifted_sliding_model.air_gap_elements[0].quad_points[0].node[0]
               == sliding_artifact.model.air_gap_elements[0].quad_points[0].node[0],
       "v2 request applies FEMM's positive AGE shift and inner-ring remap for rotor angle");
+  const auto device_assembly_matches_host = [](const NonlinearModel& model,
+                                                const std::vector<double>& state, const std::vector<double>& currents,
+                                                bool use_newton) {
+    Assembly host;
+    if (AssembleNonlinearNewton(model, state, currents, use_newton, &host)
+        != Status::kOk)
+      return false;
+    DeviceNonlinearAssemblyPlan plan;
+    GpuCsrSolver device_solver;
+    if (plan.Initialize(model) != Status::kOk
+        || device_solver.Initialize(plan.symbolic_assembly()) != Status::kOk
+        || plan.Assemble({ state }, { currents }, use_newton, &device_solver,
+               nullptr)
+            != Status::kOk)
+      return false;
+    const Assembly& symbolic = plan.symbolic_assembly();
+    if (host.row_offsets != symbolic.row_offsets
+        || host.column_indices != symbolic.column_indices)
+      return false;
+    std::vector<double> values, diagonal, rhs;
+    if (device_solver.CopyPreparedDeviceAssembly(0, &values, &diagonal, &rhs)
+            != Status::kOk
+        || values.size() != host.values.size()
+        || diagonal.size() != host.diagonal.size()
+        || rhs.size() != host.rhs_per_amp.size())
+      return false;
+    for (size_t index = 0; index < values.size(); ++index)
+      if (!NearMixed(values[index], host.values[index], 1e-12, 5e-11))
+        return false;
+    for (size_t row = 0; row < diagonal.size(); ++row) {
+      if (!NearMixed(diagonal[row], host.diagonal[row], 1e-12, 5e-11)
+          || !NearMixed(rhs[row], host.rhs_per_amp[row] + host.rhs_offset[row],
+              1e-12, 5e-11))
+        return false;
+    }
+    for (int repeat = 0; repeat < 10; ++repeat) {
+      if (plan.Assemble({ state }, { currents }, use_newton, &device_solver,
+              nullptr)
+          != Status::kOk)
+        return false;
+      std::vector<double> repeated_values, repeated_diagonal, repeated_rhs;
+      if (device_solver.CopyPreparedDeviceAssembly(0, &repeated_values,
+              &repeated_diagonal, &repeated_rhs)
+              != Status::kOk
+          || repeated_values.size() != values.size()
+          || repeated_diagonal.size() != diagonal.size()
+          || repeated_rhs.size() != rhs.size()
+          || std::memcmp(repeated_values.data(), values.data(),
+                 values.size() * sizeof(double))
+              != 0
+          || std::memcmp(repeated_diagonal.data(), diagonal.data(),
+                 diagonal.size() * sizeof(double))
+              != 0
+          || std::memcmp(repeated_rhs.data(), rhs.data(),
+                 rhs.size() * sizeof(double))
+              != 0)
+        return false;
+    }
+    return true;
+  };
+  NonlinearModel bh_assembly_model = NonlinearThreeRegionFixture();
+  std::vector<double> cold_state(bh_assembly_model.nodes.size(), 0.0);
+  std::vector<double> newton_state = cold_state;
+  newton_state.back() = 0.25;
+  expect(device_assembly_matches_host(bh_assembly_model, cold_state, { 2.0 }, false)
+          && device_assembly_matches_host(
+              bh_assembly_model, newton_state, { 2.0 }, true),
+      "device nonlinear assembly matches host CSR, diagonal, and RHS for cold and BH Newton states");
+  NonlinearModel age_assembly_model = shifted_sliding_model;
+  age_assembly_model.dirichlet_nodes = { 0 };
+  age_assembly_model.dirichlet_a_wb_per_m = { 0.25 };
+  std::vector<double> age_state(age_assembly_model.nodes.size(), 0.05);
+  age_state[0] = 0.25;
+  expect(device_assembly_matches_host(
+             age_assembly_model, age_state, { 2.0, -2.0 }, true),
+      "device nonlinear assembly matches host AGE and nonzero-Dirichlet elimination");
   MotorSampleRequest cell_shift_request = sliding_request;
   cell_shift_request.rotor_angle_deg = 180.0;
   NonlinearModel cell_shift_model;
@@ -5722,12 +6926,15 @@ int SelfTest()
   next_pose_request.rotor_angle_deg = 4.0;
   NonlinearModel same_pose_model, next_pose_model;
   const bool batch_key_models_valid = ApplySlidingBandRotorAngle(same_pose_request, sliding_artifact,
-      &same_pose_model) && ApplySlidingBandRotorAngle(next_pose_request, sliding_artifact,
-      &next_pose_model);
+                                          &same_pose_model)
+      && ApplySlidingBandRotorAngle(next_pose_request, sliding_artifact,
+          &next_pose_model);
   const std::string same_pose_key = batch_key_models_valid
-      ? MotorBatchOperatorKey(same_pose_request, sliding_load, same_pose_model) : "";
+      ? MotorBatchOperatorKey(same_pose_request, sliding_load, same_pose_model)
+      : "";
   const std::string next_pose_key = batch_key_models_valid
-      ? MotorBatchOperatorKey(next_pose_request, sliding_load, next_pose_model) : "";
+      ? MotorBatchOperatorKey(next_pose_request, sliding_load, next_pose_model)
+      : "";
   std::vector<MotorBatchPreparedItem> sliding_prepared;
   if (batch_key_models_valid) {
     sliding_prepared.push_back({ 0, &sliding_artifact, shifted_sliding_model,
@@ -5737,8 +6944,7 @@ int SelfTest()
     sliding_prepared.push_back({ 2, &sliding_artifact, std::move(same_pose_model),
         same_pose_request.circuit_currents_a, same_pose_key });
   }
-  const std::vector<std::vector<size_t>> sliding_groups =
-      GroupMotorBatchPreparedItemsByOperator(sliding_prepared);
+  const std::vector<std::vector<size_t>> sliding_groups = GroupMotorBatchPreparedItemsByOperator(sliding_prepared);
   expect(batch_key_models_valid && same_pose_key != next_pose_key
           && sliding_groups.size() == 2 && sliding_groups[0] == std::vector<size_t>({ 0, 2 })
           && sliding_groups[1] == std::vector<size_t>({ 1 }),
@@ -5792,23 +6998,24 @@ int SelfTest()
   // A rotor-angle remap now changes the assembled operator, so the
   // interleaved-angle test detects accidental reuse of the prior angle.
   std::string batch_sliding_mesh_artifact = sliding_mesh_artifact;
-  const std::string original_batch_quad_points =
-      "\"quad_points\":[{\"n0\":0,\"w0\":1,\"n1\":1,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":1,\"w0\":1,\"n1\":2,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":2,\"w0\":1,\"n1\":3,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
-  const std::string angle_sensitive_batch_quad_points =
-      "\"quad_points\":[{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":0,\"w0\":1,\"n1\":4,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
+  const std::string original_batch_quad_points = "\"quad_points\":[{\"n0\":0,\"w0\":1,\"n1\":1,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":1,\"w0\":1,\"n1\":2,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":2,\"w0\":1,\"n1\":3,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
+  const std::string angle_sensitive_batch_quad_points = "\"quad_points\":[{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":2,\"w2\":1,\"n3\":3,\"w3\":1},{\"n0\":0,\"w0\":1,\"n1\":4,\"w1\":1,\"n2\":3,\"w2\":1,\"n3\":0,\"w3\":1},{\"n0\":4,\"w0\":1,\"n1\":0,\"w1\":1,\"n2\":0,\"w2\":1,\"n3\":1,\"w3\":1}]";
   const size_t batch_quad_points_at = batch_sliding_mesh_artifact.find(original_batch_quad_points);
   if (batch_quad_points_at != std::string::npos)
     batch_sliding_mesh_artifact.replace(batch_quad_points_at, original_batch_quad_points.size(),
         angle_sensitive_batch_quad_points);
   GpuFemmMeshArtifact batch_sliding_artifact;
   expect(ParseGpuFemmMeshArtifactJson(batch_sliding_mesh_artifact, &batch_sliding_artifact,
-          &parser_error), "angle-sensitive v2 batch fixture parses");
+             &parser_error),
+      "angle-sensitive v2 batch fixture parses");
   const std::string sliding_artifact_sha = Sha256Hex(batch_sliding_mesh_artifact);
   std::string selftest_motor_request = motor_request_json;
   const size_t artifact_sha_at = selftest_motor_request.find("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
-  if (artifact_sha_at != std::string::npos) selftest_motor_request.replace(artifact_sha_at, 64, artifact_sha);
+  if (artifact_sha_at != std::string::npos)
+    selftest_motor_request.replace(artifact_sha_at, 64, artifact_sha);
   const size_t artifact_path_at = selftest_motor_request.find("fixture.json");
-  if (artifact_path_at != std::string::npos) selftest_motor_request.replace(artifact_path_at, 12, batch_artifact_path);
+  if (artifact_path_at != std::string::npos)
+    selftest_motor_request.replace(artifact_path_at, 12, batch_artifact_path);
   std::string selftest_sliding_request = motor_request_json;
   const size_t sliding_sha_at = selftest_sliding_request.find(
       "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -5857,7 +7064,8 @@ int SelfTest()
                          << "{\"task_id\":\"fourth\",\"request\":" << selftest_motor_request << "}]}";
     std::string bad_hash_request = selftest_motor_request;
     const size_t hash_at = bad_hash_request.find(artifact_sha);
-    if (hash_at != std::string::npos) bad_hash_request.replace(hash_at, artifact_sha.size(), std::string(64, '0'));
+    if (hash_at != std::string::npos)
+      bad_hash_request.replace(hash_at, artifact_sha.size(), std::string(64, '0'));
     const size_t bad_path_at = bad_hash_request.find(batch_artifact_path);
     if (bad_path_at != std::string::npos)
       bad_hash_request.replace(bad_path_at, batch_artifact_path.size(), "./" + batch_artifact_path);
@@ -5895,8 +7103,7 @@ int SelfTest()
     alias_batch_request.items.push_back({ "canonical_first", selftest_batch_request });
     alias_batch_request.items.push_back({ "canonical_alias", dot_alias_request });
   }
-  const MotorBatchArtifactLoadPlan alias_load_plan =
-      MakeMotorBatchArtifactLoadPlan(alias_batch_request);
+  const MotorBatchArtifactLoadPlan alias_load_plan = MakeMotorBatchArtifactLoadPlan(alias_batch_request);
   expect(selftest_batch_request_valid && alias_load_plan.canonical_paths.size() == 1
           && alias_load_plan.item_slots.size() == 2
           && alias_load_plan.item_slots[0] == alias_load_plan.item_slots[1]
@@ -5910,14 +7117,17 @@ int SelfTest()
       sliding_batch_response_path);
   const int sliding_interleaved_adapter_status = MotorBatchAdapter(sliding_interleaved_request_path,
       sliding_interleaved_response_path);
-  std::ifstream single_response_input(batch_single_response_path); std::stringstream single_response_bytes;
+  std::ifstream single_response_input(batch_single_response_path);
+  std::stringstream single_response_bytes;
   single_response_bytes << single_response_input.rdbuf();
-  std::ifstream batch_response_input(batch_response_path); std::stringstream batch_response_bytes;
+  std::ifstream batch_response_input(batch_response_path);
+  std::stringstream batch_response_bytes;
   batch_response_bytes << batch_response_input.rdbuf();
   std::ifstream batch_default_response_input(batch_default_response_path);
   std::stringstream batch_default_response_bytes;
   batch_default_response_bytes << batch_default_response_input.rdbuf();
-  std::ifstream mixed_response_input(mixed_response_path); std::stringstream mixed_response_bytes;
+  std::ifstream mixed_response_input(mixed_response_path);
+  std::stringstream mixed_response_bytes;
   mixed_response_bytes << mixed_response_input.rdbuf();
   std::ifstream sliding_batch_response_input(sliding_batch_response_path);
   std::stringstream sliding_batch_response_bytes;
@@ -5938,11 +7148,9 @@ int SelfTest()
   const bool mixed_response_valid = mixed_adapter_status == 1
       && StrictJsonParser(mixed_response_bytes.str()).Parse(&mixed_response_json, &parser_error);
   const bool sliding_batch_response_valid = sliding_batch_adapter_status == 0
-      && StrictJsonParser(sliding_batch_response_bytes.str()).Parse(
-          &sliding_batch_response_json, &parser_error);
+      && StrictJsonParser(sliding_batch_response_bytes.str()).Parse(&sliding_batch_response_json, &parser_error);
   const bool sliding_interleaved_response_valid = sliding_interleaved_adapter_status == 0
-      && StrictJsonParser(sliding_interleaved_response_bytes.str()).Parse(
-          &sliding_interleaved_response_json, &parser_error);
+      && StrictJsonParser(sliding_interleaved_response_bytes.str()).Parse(&sliding_interleaved_response_json, &parser_error);
   const StrictJson* batch_status = batch_response_valid ? JsonMember(batch_response_json, "status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_solve_status = batch_response_valid ? JsonMember(batch_response_json, "solve_status", StrictJson::Type::kString, &parser_error) : nullptr;
   const StrictJson* batch_items = batch_response_valid ? JsonMember(batch_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
@@ -5959,8 +7167,10 @@ int SelfTest()
           && batch_response_bytes.str().find("\"batched_pcg_launches\": ") != std::string::npos
           && batch_response_bytes.str().find("\"csr_symbolic_cache_hits\": ") != std::string::npos
           && batch_response_bytes.str().find(
-              "\"schema_version\": \"gpu_femm_motor_batch_timing_v1\"") != std::string::npos
+                 "\"schema_version\": \"gpu_femm_motor_batch_timing_v1\"")
+              != std::string::npos
           && batch_response_bytes.str().find("\"host_assembly_seconds\": ") != std::string::npos
+          && batch_response_bytes.str().find("\"device_assembly_seconds\": ") != std::string::npos
           && batch_response_bytes.str().find("\"postprocess_seconds\": ") != std::string::npos,
       "four-item motor batch adapter preserves PASS, order, and cache evidence");
   const StrictJson* mixed_status = mixed_response_valid ? JsonMember(mixed_response_json, "status", StrictJson::Type::kString, &parser_error) : nullptr;
@@ -5977,7 +7187,8 @@ int SelfTest()
           && mixed_response_bytes.str().find("\"actual_parallel_width\": 3") != std::string::npos,
       "failed item leaves compacted active batch ordered and independently valid");
   const StrictJson* sliding_batch_items = sliding_batch_response_valid
-      ? JsonMember(sliding_batch_response_json, "items", StrictJson::Type::kArray, &parser_error) : nullptr;
+      ? JsonMember(sliding_batch_response_json, "items", StrictJson::Type::kArray, &parser_error)
+      : nullptr;
   expect(sliding_batch_response_valid && sliding_batch_items != nullptr
           && sliding_batch_items->array.size() == 4
           && sliding_batch_items->array[0].object.at("task_id").string == "sliding_first"
@@ -5986,31 +7197,34 @@ int SelfTest()
           && sliding_batch_response_bytes.str().find("\"actual_parallel_width\": 4") != std::string::npos,
       "v2 same-pose batch uses requested chunk width and preserves response order");
   MotorSampleRequest interleaved_requests[4];
-  const bool interleaved_requests_valid =
-      ReadMotorSampleRequestJson(selftest_sliding_request, &interleaved_requests[0], &parser_error)
+  const bool interleaved_requests_valid = ReadMotorSampleRequestJson(selftest_sliding_request, &interleaved_requests[0], &parser_error)
       && ReadMotorSampleRequestJson(selftest_sliding_angle4_request, &interleaved_requests[1], &parser_error)
       && ReadMotorSampleRequestJson(selftest_sliding_angle3_high_current_request,
           &interleaved_requests[2], &parser_error)
       && ReadMotorSampleRequestJson(selftest_sliding_angle4_low_current_request,
           &interleaved_requests[3], &parser_error);
   const auto response_matches_single_v2 = [&parser_error, &batch_sliding_artifact](
-      const StrictJson& response, const MotorSampleRequest& sample_request) {
+                                              const StrictJson& response, const MotorSampleRequest& sample_request) {
     NonlinearSolveResult expected_solution;
     FrozenPostprocessResult expected_postprocess;
     if (SolveMeshArtifactSingleSample(sample_request, batch_sliding_artifact, &expected_solution,
-            &expected_postprocess) != Status::kOk) return false;
+            &expected_postprocess)
+        != Status::kOk)
+      return false;
     const StrictJson* status = JsonMember(response, "status", StrictJson::Type::kString, &parser_error);
     const auto same_number = [&response, &parser_error](const char* field, double expected) {
       const StrictJson* actual = JsonMember(response, field, StrictJson::Type::kNumber, &parser_error);
-      return actual != nullptr && actual->number == expected;
+      return actual != nullptr && NearMixed(actual->number, expected, 1e-12, 1e-9);
     };
     const auto same_array = [&response, &parser_error](const char* field,
-        const std::vector<double>& expected) {
+                                const std::vector<double>& expected) {
       const StrictJson* actual = JsonMember(response, field, StrictJson::Type::kArray, &parser_error);
-      if (actual == nullptr || actual->array.size() != expected.size()) return false;
+      if (actual == nullptr || actual->array.size() != expected.size())
+        return false;
       for (size_t index = 0; index < expected.size(); ++index)
         if (actual->array[index].type != StrictJson::Type::kNumber
-            || actual->array[index].number != expected[index]) return false;
+            || !NearMixed(actual->array[index].number, expected[index], 1e-12, 1e-9))
+          return false;
       return true;
     };
     std::vector<double> expected_radial_flux_density;
@@ -6055,15 +7269,19 @@ int SelfTest()
     const auto same_number = [&parser_error](const StrictJson& left, const StrictJson& right, const char* field) {
       const StrictJson* lhs = JsonMember(left, field, StrictJson::Type::kNumber, &parser_error);
       const StrictJson* rhs = JsonMember(right, field, StrictJson::Type::kNumber, &parser_error);
-      return lhs != nullptr && rhs != nullptr && lhs->number == rhs->number;
+      return lhs != nullptr && rhs != nullptr
+          && NearMixed(lhs->number, rhs->number, 1e-12, 1e-9);
     };
     const auto same_array = [&parser_error](const StrictJson& left, const StrictJson& right, const char* field) {
       const StrictJson* lhs = JsonMember(left, field, StrictJson::Type::kArray, &parser_error);
       const StrictJson* rhs = JsonMember(right, field, StrictJson::Type::kArray, &parser_error);
-      if (lhs == nullptr || rhs == nullptr || lhs->array.size() != rhs->array.size()) return false;
+      if (lhs == nullptr || rhs == nullptr || lhs->array.size() != rhs->array.size())
+        return false;
       for (size_t index = 0; index < lhs->array.size(); ++index)
         if (lhs->array[index].type != StrictJson::Type::kNumber || rhs->array[index].type != StrictJson::Type::kNumber
-            || lhs->array[index].number != rhs->array[index].number) return false;
+            || !NearMixed(lhs->array[index].number, rhs->array[index].number,
+                1e-12, 1e-9))
+          return false;
       return true;
     };
     expect(same_number(single_response_json, first_response, "Fx_N")
@@ -6073,16 +7291,18 @@ int SelfTest()
             && same_array(single_response_json, first_response, "circuit_flux_linkage_Wb")
             && same_array(single_response_json, first_response, "airgap_sample_angles_deg")
             && same_array(single_response_json, first_response, "airgap_radial_flux_density_T"),
-        "batched B=4 item matches every single-sample output exactly");
+        "batched B=4 item matches every single-sample output within parity tolerance");
   }
   const NonlinearTriangle& selected_triangle = parsed_artifact.model.triangles[0];
   const NonlinearTriangle& air_triangle = parsed_artifact.model.triangles[1];
   FrozenPostprocessOptions group_options;
-  group_options.selected_group_number = 20; group_options.air_group_number = 50;
+  group_options.selected_group_number = 20;
+  group_options.air_group_number = 50;
   expect(IsSelectedPostprocessMaterial(parsed_artifact.model.materials[selected_triangle.material], group_options,
              selected_triangle.material)
           && IsAirPostprocessMaterial(parsed_artifact.model.materials[air_triangle.material], group_options,
-             air_triangle.material), "group-based selected and air regions are distinct");
+              air_triangle.material),
+      "group-based selected and air regions are distinct");
   StrictJson duplicate_json;
   StrictJsonParser duplicate_parser("{\"x\":1,\"x\":2}");
   expect(!duplicate_parser.Parse(&duplicate_json, &parser_error),
@@ -6141,9 +7361,12 @@ int SelfTest()
   const double primitive_bx = 2.0, primitive_by = 3.0;
   const double primitive_hx = 0.25, primitive_hy = -0.5;
   const double primitive_fx = ((primitive_bx * primitive_bx - primitive_by * primitive_by)
-      * primitive_hx + 2.0 * primitive_bx * primitive_by * primitive_hy) / (2.0 * kMu0);
+                                      * primitive_hx
+                                  + 2.0 * primitive_bx * primitive_by * primitive_hy)
+      / (2.0 * kMu0);
   const double primitive_fy = (2.0 * primitive_bx * primitive_by * primitive_hx
-      + (primitive_by * primitive_by - primitive_bx * primitive_bx) * primitive_hy) / (2.0 * kMu0);
+                                  + (primitive_by * primitive_by - primitive_bx * primitive_bx) * primitive_hy)
+      / (2.0 * kMu0);
   expect(Near(primitive_fx, -7.25 / (2.0 * kMu0)), "weighted-stress Fx primitive");
   expect(Near(primitive_fy, 0.5 / (2.0 * kMu0)), "weighted-stress Fy primitive");
 
@@ -6201,7 +7424,7 @@ int SelfTest()
   artifact_group_options.airgap_radius_m = 0.75;
   artifact_group_options.airgap_angles_rad = { 0.0 };
   const FrozenPostprocessResult group_postprocess = group_initialize == Status::kOk
-      && group_solution.info.status == Status::kOk
+          && group_solution.info.status == Status::kOk
       ? ComputeFrozenPostprocess(group_postprocess_model, group_solution, artifact_group_options)
       : FrozenPostprocessResult {};
   expect(group_initialize == Status::kOk && group_solution.circuit_flux_linkage_wb.size() == 2
@@ -6224,7 +7447,7 @@ int SelfTest()
     expect(scalable_status == Status::kOk,
         std::string("large sparse linear assembly: ") + StatusName(scalable_status));
     expect(scalable_assembly.free_nodes.size() + scalable_linear.dirichlet_nodes.size()
-            == scalable_linear.nodes.size()
+                == scalable_linear.nodes.size()
             && scalable_assembly.values.size() < scalable_linear.triangles.size() * 9,
         "large linear assembly retains P1 sparsity");
   }
@@ -6265,6 +7488,14 @@ int SelfTest()
   expect(csr_info.status == Status::kOk, "3x3 PCG convergence");
   expect(csr_solution.size() == 3 && Near(csr_solution[0], 1.0) && Near(csr_solution[1], 2.0) && Near(csr_solution[2], 3.0),
       "3x3 PCG reference parity");
+  std::vector<SolveInfo> small_batch_infos;
+  std::vector<std::vector<double>> small_batch_solutions;
+  int small_batch_launches = 0;
+  expect(csr_solver.SolveBatch({ three_by_three, three_by_three },
+             { { 2.0, 4.0, 7.0 }, { 2.0, 4.0, 7.0 } }, 1e-13, 64,
+             &small_batch_infos, &small_batch_solutions, &small_batch_launches)
+          == Status::kOk,
+      "3x3 batch buffer allocation");
 
   // 257 exercises the strided reduction tail beyond one 256-thread block.
   Assembly reduction_tail;
@@ -6276,15 +7507,31 @@ int SelfTest()
   reduction_tail.free_nodes.resize(kReductionTailN);
   std::vector<double> reduction_rhs(kReductionTailN);
   for (int i = 0; i < kReductionTailN; ++i) {
-    reduction_tail.row_offsets[i] = i; reduction_tail.column_indices[i] = i;
-    reduction_tail.free_nodes[i] = i; reduction_rhs[i] = static_cast<double>((i % 11) - 5);
+    reduction_tail.row_offsets[i] = i;
+    reduction_tail.column_indices[i] = i;
+    reduction_tail.free_nodes[i] = i;
+    reduction_rhs[i] = static_cast<double>((i % 11) - 5);
   }
   reduction_tail.row_offsets[kReductionTailN] = kReductionTailN;
+  std::vector<SolveInfo> resized_batch_infos;
+  std::vector<std::vector<double>> resized_batch_solutions;
+  int resized_batch_launches = 0;
+  const Status resized_batch_status = csr_solver.Initialize(reduction_tail) == Status::kOk
+      ? csr_solver.SolveBatch({ reduction_tail, reduction_tail },
+            { reduction_rhs, reduction_rhs }, 1e-13, 16, &resized_batch_infos,
+            &resized_batch_solutions, &resized_batch_launches)
+      : Status::kInternalError;
+  expect(resized_batch_status == Status::kOk
+          && resized_batch_solutions.size() == 2
+          && resized_batch_solutions[0] == reduction_rhs
+          && resized_batch_solutions[1] == reduction_rhs,
+      "batch buffers resize after CSR topology change");
   GpuCsrSolver reduction_solver;
   std::vector<double> reduction_solution;
   const Status reduction_initialize = reduction_solver.Initialize(reduction_tail);
   const SolveInfo reduction_info = reduction_initialize == Status::kOk
-      ? reduction_solver.Solve(reduction_rhs, 1e-13, 16, &reduction_solution) : SolveInfo {};
+      ? reduction_solver.Solve(reduction_rhs, 1e-13, 16, &reduction_solution)
+      : SolveInfo {};
   bool reduction_matches = reduction_info.status == Status::kOk && reduction_solution.size() == reduction_rhs.size();
   for (size_t index = 0; reduction_matches && index < reduction_rhs.size(); ++index)
     reduction_matches = reduction_solution[index] == reduction_rhs[index];
@@ -6496,6 +7743,14 @@ int main(int argc, char** argv)
   }
   if (argc == 4 && std::string(argv[1]) == "--motor-batch-profile") {
     return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true);
+  }
+  if (argc == 4 && std::string(argv[1]) == "--internal-motor-batch-profile-host") {
+    return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true,
+        gpu_femm::NonlinearAssemblyMode::kHost);
+  }
+  if (argc == 4 && std::string(argv[1]) == "--internal-motor-batch-profile-device") {
+    return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true,
+        gpu_femm::NonlinearAssemblyMode::kDevice);
   }
   if (argc == 3 && std::string(argv[1]) == "--mesh-artifact") {
     return gpu_femm::GpuFemmMeshArtifactTest(argv[2]);

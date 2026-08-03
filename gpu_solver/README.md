@@ -137,7 +137,9 @@ unique `task_id` and one complete `gpu_femm_motor_sample_v1` request.
 - Duplicate task IDs and mismatched artifact identities are rejected.
 
 `--motor-batch-profile` returns the same numerical results as `--motor-batch`
-and adds timing for artifact loading, assembly, GPU solve, and postprocessing.
+and adds timing for artifact loading, host or device assembly, GPU solve, and
+postprocessing. `device_assembly_seconds` is zero when the host fallback path
+is used; `host_assembly_seconds` is zero when device assembly is active.
 
 ## Numerical implementation
 
@@ -145,6 +147,11 @@ and adds timing for artifact loading, assembly, GPU solve, and postprocessing.
 - Nonlinear materials use FEMM's DC natural cubic Hermite B-H preprocessing.
 - The first Newton iteration uses the cold secant; later iterations use the
   analytic Jacobian.
+- Batch nonlinear numeric assembly writes CSR values, the Jacobi diagonal, and
+  the right-hand side directly to device memory. Triangle and air-gap
+  contributions use a fixed reduction order.
+- The established host nonlinear assembly remains available and is selected
+  automatically if device-plan setup or execution fails.
 - Linear systems use a GPU-resident CSR Jacobi-PCG solver.
 - Supported GPUs can use cooperative multi-block PCG for small batches on
   large meshes. Other cases use the deterministic fallback kernel.

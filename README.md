@@ -14,6 +14,7 @@ repository for reference and build compatibility.
 - Planar DC magnetics
 - P1 triangle elements and FP64 arithmetic
 - Linear materials and raw-DC nonlinear B-H curves
+- GPU-resident nonlinear matrix and right-hand-side assembly
 - Permanent-magnet coercivity
 - Multiple series-circuit current inputs
 - Fixed Dirichlet A boundaries
@@ -161,7 +162,10 @@ Calculate the artifact hash in PowerShell:
 ## Run a batch
 
 Use a batch when several current vectors share one geometry artifact. The
-solver reuses the decoded artifact and GPU matrix structure.
+solver reuses the decoded artifact and GPU matrix structure. Nonlinear numeric
+assembly stays on the GPU between Newton iterations. If device assembly cannot
+be initialized, the solver uses the established host assembly path for that
+operator and keeps the same request and response format.
 
 ```powershell
 & $solver --motor-batch '.\batch_request.json' '.\batch_response.json'
@@ -199,6 +203,8 @@ For v2 sliding-band artifacts, the air-gap coupling and rotor mapping are
 rebuilt for each requested angle. Items with the same verified artifact and
 exact mechanical pose can share a CUDA batch. Different poses are partitioned
 before the solve, so one angle's air-gap operator is never reused for another.
+The device assembly uses a fixed contributor order, so repeated runs of the
+same request are deterministic.
 
 ## License
 
