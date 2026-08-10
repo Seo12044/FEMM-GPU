@@ -128,6 +128,31 @@ class FemmGpuPrepareTests(unittest.TestCase):
             {"node_a": 2, "node_b": 3, "relation": "antiperiodic"},
         ])
 
+    def test_sector_apex_self_pairs_are_reduced_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mesh.pbc"
+            path.write_text(
+                "4\n0 0 0\n2 3 0\n1 1 1\n4 5 1\n0\n", encoding="ascii"
+            )
+            constraints, self_pairs = (
+                femm_gpu_prepare._parse_node_constraint_records(path, 6)
+            )
+            femm_gpu_prepare._validate_constraint_boundaries(
+                constraints,
+                {1: {(0, 2), (0, 3)}, 2: {(1, 4), (1, 5)}},
+                ["dirichlet", "periodic", "antiperiodic"],
+                self_pairs,
+            )
+
+        self.assertEqual(constraints, [
+            {"node_a": 2, "node_b": 3, "relation": "periodic"},
+            {"node_a": 4, "node_b": 5, "relation": "antiperiodic"},
+        ])
+        self.assertEqual(self_pairs, [
+            {"node": 0, "relation": "periodic"},
+            {"node": 1, "relation": "antiperiodic"},
+        ])
+
     def test_periodic_pair_must_match_used_boundary_marker(self):
         constraints = [{"node_a": 0, "node_b": 1, "relation": "periodic"}]
         with self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "matching FEMM"):

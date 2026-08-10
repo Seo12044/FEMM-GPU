@@ -119,6 +119,9 @@ the reduced GPU CSR buffers before PCG. General periodic constraints use exact
 device-plan or kernel failure use the established host assembler.
 The preparer binds each generated `.pbc` pair to a matching FEMM boundary
 property and checks disconnected boundary-side topology when it is available.
+At a rotational-sector apex, FEMM may emit a node paired with itself. A
+periodic self-pair is removed as an identity constraint; an anti-periodic
+self-pair is reduced exactly to a zero-potential Dirichlet node.
 
 The generic protocol intentionally rejects force/torque, radial air-gap
 sampling, and sliding-band rotation. Those postprocessors currently assume

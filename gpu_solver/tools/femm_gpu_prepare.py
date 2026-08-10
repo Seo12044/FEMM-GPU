@@ -354,8 +354,10 @@ def _indexed_rows(rows: Sequence[list[float]], label: str, minimum_columns: int)
     return [indexed[index] for index in range(len(rows))]
 
 
-def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]:
-    """Strictly parse stock FEMM's three- or four-column ``.pbc`` records."""
+def _parse_node_constraint_records(
+        path: Path, node_count: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse ordinary constraints and FEMM sector-apex self pairs."""
     lines = [line for line in _clean_lines(path) if line.strip()]
     if not lines:
         raise PrepareError("empty Triangle periodic-boundary file")
@@ -381,8 +383,6 @@ def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]
         first, second, kind = int(first), int(second), int(kind)
         if first < 0 or second < 0 or first >= node_count or second >= node_count:
             raise PrepareError("periodic-boundary node ID is outside the Triangle mesh")
-        if first == second:
-            raise PrepareError("periodic-boundary pair cannot reference the same node")
         if kind not in (0, 1):
             raise PrepareError("periodic-boundary type must be 0 (periodic) or 1 (anti-periodic)")
         raw.append((min(first, second), max(first, second), "periodic" if kind == 0 else "antiperiodic"))
@@ -394,7 +394,9 @@ def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]
         if age[0] != 0 or len(tail) != 1:
             raise PrepareError("air-gap element data is not supported by the standalone preparer")
 
-    unique = sorted(set(raw))
+    self_pairs = sorted({(first, relation) for first, second, relation in raw
+                         if first == second})
+    unique = sorted({record for record in raw if record[0] != record[1]})
     by_pair: dict[tuple[int, int], str] = {}
     parent = list(range(node_count))
     parity = [1] * node_count
@@ -420,14 +422,23 @@ def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]
             continue
         parent[root_b] = root_a
         parity[root_b] = wanted * sign_a * sign_b
-    return [{"node_a": first, "node_b": second, "relation": relation}
-            for first, second, relation in unique]
+    return ([{"node_a": first, "node_b": second, "relation": relation}
+             for first, second, relation in unique],
+            [{"node": node, "relation": relation}
+             for node, relation in self_pairs])
+
+
+def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]:
+    """Return solver constraints, omitting reduced sector-apex self pairs."""
+    constraints, _ = _parse_node_constraint_records(path, node_count)
+    return constraints
 
 
 def _validate_constraint_boundaries(
         constraints: Sequence[dict[str, Any]],
         periodic_edges_by_marker: dict[int, set[tuple[int, int]]],
-        boundaries: Sequence[str]) -> None:
+        boundaries: Sequence[str],
+        self_pairs: Sequence[dict[str, Any]] = ()) -> None:
     """Bind every `.pbc` pair to the matching FEMM boundary property."""
     nodes_by_marker = {
         marker: {node for edge in edges for node in edge}
@@ -470,6 +481,17 @@ def _validate_constraint_boundaries(
             )
         for marker in matching:
             paired_nodes_by_marker[marker].update((first, second))
+    for self_pair in self_pairs:
+        node = self_pair["node"]
+        relation = self_pair["relation"]
+        matching = [marker for marker, nodes in nodes_by_marker.items()
+                    if boundaries[marker] == relation and node in nodes]
+        if not matching:
+            raise PrepareError(
+                "periodic-boundary self pair is not on one matching FEMM boundary marker"
+            )
+        for marker in matching:
+            paired_nodes_by_marker[marker].add(node)
     for marker, nodes in nodes_by_marker.items():
         if nodes != paired_nodes_by_marker[marker]:
             raise PrepareError(
@@ -515,7 +537,9 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
             face[1], face[2] = face[2], face[1]
         raw_faces.append((face, label))
 
-    constraints = _parse_node_constraints(mesh_stem.with_suffix(".pbc"), len(nodes_by_id))
+    constraints, self_pairs = _parse_node_constraint_records(
+        mesh_stem.with_suffix(".pbc"), len(nodes_by_id)
+    )
     if model["problem_type"] == "axisymmetric" and any(node[0] < 0 for node in nodes_by_id.values()):
         raise PrepareError("axisymmetric FEMM mesh contains a negative radial coordinate")
     edge_header, edge_rows = _mesh_rows(mesh_stem.with_suffix(".edge"), "edge")
@@ -560,7 +584,11 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
             periodic_edges_by_marker.setdefault(marker, set()).add(edge)
     if mesh_edges != set(triangle_edge_incidence):
         raise PrepareError("Triangle edge file does not match the element topology")
-    _validate_constraint_boundaries(constraints, periodic_edges_by_marker, boundaries)
+    _validate_constraint_boundaries(
+        constraints, periodic_edges_by_marker, boundaries, self_pairs
+    )
+    boundary_nodes.update(pair["node"] for pair in self_pairs
+                          if pair["relation"] == "antiperiodic")
     if model["problem_type"] == "axisymmetric":
         radius_scale = max(1.0, max(abs(node[0]) for node in nodes_by_id.values()))
         axis_tolerance_mm = 1e-12 * radius_scale
@@ -590,7 +618,7 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
         "outer_dirichlet": {"node_indices": sorted(boundary_nodes),
                             "A_Wb_per_m": [0.0] * len(boundary_nodes)},
     }
-    if model["problem_type"] == "axisymmetric" or constraints:
+    if model["problem_type"] == "axisymmetric" or constraints or self_pairs:
         resolved["node_constraints"] = constraints
     return resolved
 
