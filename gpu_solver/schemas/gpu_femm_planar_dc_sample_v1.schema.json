@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://femm.info/schemas/gpu_femm_planar_dc_sample_v1.schema.json",
+  "title": "FEMM GPU planar DC sample request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "mesh_artifact_path",
+    "mesh_artifact_sha256",
+    "circuit_currents_A",
+    "force_group_number",
+    "stress_air_group_number",
+    "airgap_radius_mm",
+    "airgap_angles_deg",
+    "sliding_band_angle_deg",
+    "compute_force_torque",
+    "include_field_solution"
+  ],
+  "properties": {
+    "protocol": {
+      "const": "gpu_femm_planar_dc_sample_v1"
+    },
+    "mesh_artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mesh_artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "circuit_currents_A": {
+      "type": "array",
+      "items": { "type": "number" }
+    },
+    "force_group_number": {
+      "type": "integer",
+      "minimum": -1
+    },
+    "stress_air_group_number": {
+      "type": "integer",
+      "minimum": -1
+    },
+    "airgap_radius_mm": {
+      "type": "number",
+      "minimum": 0
+    },
+    "airgap_angles_deg": {
+      "type": "array",
+      "items": { "type": "number" }
+    },
+    "sliding_band_angle_deg": {
+      "type": "number"
+    },
+    "compute_force_torque": {
+      "type": "boolean"
+    },
+    "include_field_solution": {
+      "type": "boolean"
+    }
+  }
+}

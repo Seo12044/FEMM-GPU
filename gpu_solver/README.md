@@ -12,7 +12,9 @@ start.
 | Command | Purpose |
 |---|---|
 | `--self-test` | Test the analytic models, parsers, batch path, and determinism |
-| `--mesh-artifact <file>` | Validate a `gpu_femm_mesh_v1` or `gpu_femm_mesh_v2` artifact |
+| `--mesh-artifact <file>` | Validate a neutral or legacy GPU FEMM mesh artifact |
+| `--capabilities` | Print the supported physics and neutral protocol as JSON |
+| `--solve <request> <response>` | Solve one project-neutral planar DC problem |
 | `--motor-single-sample <request> <response>` | Solve one motor operating point |
 | `--motor-batch <request> <response>` | Solve a batch of operating points |
 | `--motor-batch-profile <request> <response>` | Solve a batch and record stage timings |
@@ -23,6 +25,63 @@ start.
 
 `gpu_bh_curve_poc --fixture <directory>` tests B-H preprocessing and
 interpolation separately.
+
+## `gpu_femm_planar_dc_mesh_v1`
+
+This neutral artifact contains `source_fem_sha256`, model/mesh/material data,
+and a canonical content identity. It omits the legacy motor base hash and pose.
+The `circuits` array may be empty for a permanent-magnet-only problem.
+
+Create one from a supported FEMM source without MATLAB:
+
+```powershell
+python .\gpu_solver\tools\femm_gpu.py prepare model.fem model.gpu.json `
+  --femm-root C:\femm42 `
+  --mesh-noop .\build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe
+```
+
+The preparer stages a private FEMM runtime, invokes Triangle with the no-op
+solver, validates every resolved material/region/boundary, and writes the JSON
+atomically. It never replaces the installed `fkn.exe`. The exact artifact
+contract is in
+[`schemas/gpu_femm_planar_dc_mesh_v1.schema.json`](schemas/gpu_femm_planar_dc_mesh_v1.schema.json).
+
+## `gpu_femm_planar_dc_sample_v1`
+
+This is the project-neutral single-sample protocol used by `--solve`. It binds
+the request to the complete artifact SHA-256 and supplies circuit currents in
+artifact order. It has no MATLAB, Inventor, motor-model hash, rotor-group, or
+posed-file dependency.
+
+```json
+{
+  "protocol": "gpu_femm_planar_dc_sample_v1",
+  "mesh_artifact_path": "model.gpu_femm_mesh_v1.json",
+  "mesh_artifact_sha256": "<64 lowercase hex characters>",
+  "circuit_currents_A": [2.0, -2.0],
+  "force_group_number": -1,
+  "stress_air_group_number": -1,
+  "airgap_radius_mm": 0.0,
+  "airgap_angles_deg": [],
+  "sliding_band_angle_deg": 0.0,
+  "compute_force_torque": false,
+  "include_field_solution": true
+}
+```
+
+Set both group numbers to `-1` when weighted-stress postprocessing is not
+needed. On a conforming v1 mesh, force, torque, or radial-B sampling requires a
+valid selected/air group pair. A v2 native air-gap element computes force,
+torque, and radial B directly from the air-gap field. Full-field output adds
+`node_A_Wb_per_m`, `element_Bx_T`, and `element_By_T`; leave it disabled for
+compact scalar responses.
+
+`solve_status` and `postprocess_status` are separate. If optional
+postprocessing fails after the field solve succeeds, currents, flux linkage,
+mesh counts, and requested full-field arrays remain in the response.
+
+The exact request schema is in
+[`schemas/gpu_femm_planar_dc_sample_v1.schema.json`](schemas/gpu_femm_planar_dc_sample_v1.schema.json).
 
 ## `gpu_femm_mesh_v1`
 

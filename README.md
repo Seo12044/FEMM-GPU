@@ -27,9 +27,9 @@ repository for reference and build compatibility.
 
 The solver does not support AC or complex problems, axisymmetric models,
 laminated or AC apparent B-H conversion, general periodic node constraints,
-eccentric sliding interfaces, circuit unknowns, or remeshing. This repository
-does not include a general converter from arbitrary `.fem` files to the
-production mesh artifact.
+eccentric sliding interfaces, circuit unknowns, or adaptive remeshing. The
+standalone preparer accepts `.fem` files only when every feature can be mapped
+exactly to this supported subset.
 
 ## Requirements
 
@@ -79,6 +79,7 @@ The executables are written to:
 
 ```text
 build-gpu\gpu_solver\Release\gpu_linear_p1_poc.exe
+build-gpu\gpu_solver\Release\femm_gpu.exe
 build-gpu\gpu_solver\Release\gpu_bh_curve_poc.exe
 build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe
 ```
@@ -89,6 +90,10 @@ then runs its normal Triangle mesh generation, but no CPU magnetic solve is
 performed. The Windows build uses the GUI subsystem so repeated mesh generation
 does not flash console windows. Keep the helper beside
 `gpu_linear_p1_poc.exe`; never copy it into a stock FEMM installation.
+
+`femm_gpu.exe` and `gpu_linear_p1_poc.exe` are byte-identical. The neutral name
+is intended for standalone use; the historical name remains available for
+existing integrations.
 
 ## Test
 
@@ -114,6 +119,52 @@ Run the included nonlinear fixture and inspect the response:
 
 Get-Content '.\build-gpu\single_sample_response.json'
 ```
+
+## Standalone planar DC solve
+
+The standalone interface does not depend on MATLAB, Inventor, or a motor
+project. Check the installed solver first:
+
+```powershell
+$solver = '.\build-gpu\gpu_solver\Release\femm_gpu.exe'
+& $solver --capabilities
+```
+
+Validate an immutable mesh artifact and solve it with the Python standard
+library frontend:
+
+```powershell
+python .\gpu_solver\tools\femm_gpu.py prepare `
+  '.\model.fem' '.\model.gpu.json' `
+  --femm-root 'C:\femm42' `
+  --mesh-noop '.\build-gpu\gpu_solver\Release\gpu_femm_mesh_noop_solver.exe'
+
+python .\gpu_solver\tools\femm_gpu.py --solver $solver `
+  validate '.\model.gpu.json'
+
+python .\gpu_solver\tools\femm_gpu.py --solver $solver `
+  solve '.\model.gpu.json' '.\response.json' `
+  --currents 2 -2 --fields
+```
+
+`prepare` copies the FEMM runtime to a temporary directory and replaces
+`fkn.exe` only in that copy. It uses stock FEMM's Triangle mesher but performs
+no CPU magnetic solve. The input `.fem` and the installed FEMM directory are
+read-only inputs. Unsupported model features stop before the artifact is
+written.
+
+`--fields` writes nodal magnetic vector potential and per-element Bx/By. Use
+`--force-torque --force-group 20 --air-group 30` for weighted-stress force and
+torque on a conforming mesh. Native sliding-band artifacts use
+`--sliding-band-angle-deg` and do not require motor identity fields.
+
+The request contract is
+[`gpu_femm_planar_dc_sample_v1`](gpu_solver/schemas/gpu_femm_planar_dc_sample_v1.schema.json).
+Applications in C++, Python, MATLAB, or another language may invoke
+`femm_gpu.exe --solve request.json response.json` directly.
+
+FEMM model editing remains a separate step. Unsupported AC, axisymmetric, and
+periodic-node models are rejected rather than approximated.
 
 ## Run a motor artifact
 

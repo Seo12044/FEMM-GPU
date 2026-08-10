@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://femm.info/schemas/gpu_femm_planar_dc_mesh_v1.schema.json",
+  "title": "FEMM GPU planar DC mesh artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_fem_sha256",
+    "canonical_identity_sha256",
+    "resolved"
+  ],
+  "properties": {
+    "schema_version": { "const": "gpu_femm_planar_dc_mesh_v1" },
+    "source_fem_sha256": { "$ref": "#/$defs/sha256" },
+    "canonical_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "resolved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_fem_sha256",
+        "model",
+        "nodes_mm",
+        "triangles",
+        "regions",
+        "materials",
+        "circuits",
+        "outer_dirichlet"
+      ],
+      "properties": {
+        "source_fem_sha256": { "$ref": "#/$defs/sha256" },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["depth_mm", "problem_type", "frequency_hz"],
+          "properties": {
+            "depth_mm": { "type": "number", "exclusiveMinimum": 0 },
+            "problem_type": { "const": "planar" },
+            "frequency_hz": { "const": 0 }
+          }
+        },
+        "nodes_mm": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "array",
+            "prefixItems": [{ "type": "number" }, { "type": "number" }],
+            "items": false
+          }
+        },
+        "triangles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["node_indices", "region_ids"],
+          "properties": {
+            "node_indices": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  { "type": "integer", "minimum": 0 },
+                  { "type": "integer", "minimum": 0 },
+                  { "type": "integer", "minimum": 0 }
+                ],
+                "items": false
+              }
+            },
+            "region_ids": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "regions": { "type": "array", "minItems": 1 },
+        "materials": { "type": "array", "minItems": 1 },
+        "circuits": { "type": "array" },
+        "outer_dirichlet": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["node_indices", "A_Wb_per_m"],
+          "properties": {
+            "node_indices": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "integer", "minimum": 0 }
+            },
+            "A_Wb_per_m": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "const": 0 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

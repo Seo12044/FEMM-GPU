@@ -2002,6 +2002,16 @@ constexpr double kNativeFemmAgeToSiReluctivity = 1.0 / kMu0;
 constexpr int kMotorMaxLinearIterations = 16384;
 constexpr double kMotorLinearRelativeTolerance = 1e-12;
 
+NonlinearOptions ProductionSampleOptions()
+{
+  NonlinearOptions options;
+  options.relative_tolerance = 1e-8;
+  options.max_newton_iterations = 128;
+  options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
+  options.max_linear_iterations = kMotorMaxLinearIterations;
+  return options;
+}
+
 struct NonlinearSolveResult {
   SolveInfo info;
   std::vector<double> a_wb_per_m;
@@ -2042,7 +2052,7 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
 {
   if (model.nodes.empty() || model.triangles.empty() || model.materials.empty()
       || !(model.depth_m > 0.0) || !std::isfinite(model.depth_m)
-      || model.circuit_count <= 0
+      || model.circuit_count < 0
       || model.dirichlet_nodes.empty()
       || model.dirichlet_nodes.size() != model.dirichlet_a_wb_per_m.size()) {
     return Status::kInvalidArgument;
@@ -3566,6 +3576,14 @@ bool JsonSha256(const std::string& value)
   return value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isxdigit(c); });
 }
 
+bool JsonLowerSha256(const std::string& value)
+{
+  return value.size() == 64
+      && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+           return std::isdigit(c) || (c >= 'a' && c <= 'f');
+         });
+}
+
 // Small dependency-free SHA-256 implementation.  Artifact fingerprints bind
 // the exact bytes on disk, not a parsed/re-serialized JSON representation.
 class Sha256 {
@@ -3674,6 +3692,7 @@ struct GpuFemmMeshArtifact {
   NonlinearModel model;
   std::vector<double> circuit_currents_a;
   std::vector<int32_t> triangle_group_numbers;
+  std::string schema_version;
   std::string pose_fem_sha256;
   std::string base_motor_fem_sha256;
   std::string canonical_identity_sha256;
@@ -3689,37 +3708,69 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     return false;
   StrictJson root;
   StrictJsonParser parser(text);
-  if (!parser.Parse(&root, error)
-      || !ExactObject(root, { "schema_version", "base_motor_fem_sha256", "source_fem_sha256", "canonical_identity_sha256", "resolved" }, error))
+  if (!parser.Parse(&root, error))
     return false;
   const StrictJson* schema = JsonMember(root, "schema_version", StrictJson::Type::kString, error);
-  const StrictJson* root_base_sha = JsonMember(root, "base_motor_fem_sha256", StrictJson::Type::kString, error);
+  if (schema == nullptr)
+    return false;
+  const bool neutral_schema = schema->string == "gpu_femm_planar_dc_mesh_v1";
+  const bool motor_v1 = schema->string == "gpu_femm_mesh_v1";
+  const bool motor_v2 = schema->string == "gpu_femm_mesh_v2";
+  if ((!neutral_schema && !motor_v1 && !motor_v2)
+      || !(neutral_schema
+              ? ExactObject(root, { "schema_version", "source_fem_sha256",
+                    "canonical_identity_sha256", "resolved" }, error)
+              : ExactObject(root, { "schema_version", "base_motor_fem_sha256",
+                    "source_fem_sha256", "canonical_identity_sha256", "resolved" }, error)))
+    return false;
   const StrictJson* source_sha = JsonMember(root, "source_fem_sha256", StrictJson::Type::kString, error);
+  const StrictJson* root_base_sha = neutral_schema ? source_sha
+      : JsonMember(root, "base_motor_fem_sha256", StrictJson::Type::kString, error);
   const StrictJson* identity = JsonMember(root, "canonical_identity_sha256", StrictJson::Type::kString, error);
   const StrictJson* resolved = JsonMember(root, "resolved", StrictJson::Type::kObject, error);
   if (schema == nullptr || root_base_sha == nullptr || source_sha == nullptr || identity == nullptr || resolved == nullptr
-      || (schema->string != "gpu_femm_mesh_v1" && schema->string != "gpu_femm_mesh_v2") || !JsonSha256(root_base_sha->string) || !JsonSha256(source_sha->string)
-      || !JsonSha256(identity->string)
-      || !(schema->string == "gpu_femm_mesh_v1"
-              ? ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles", "regions", "materials", "circuits", "outer_dirichlet" }, error)
-              : ExactObject(*resolved, { "source_fem_sha256", "base_motor_fem_sha256", "model", "pose", "nodes_mm", "triangles", "regions", "materials", "circuits", "outer_dirichlet", "air_gap_elements" }, error))) {
+      || !(neutral_schema ? JsonLowerSha256(root_base_sha->string)
+                          : JsonSha256(root_base_sha->string))
+      || !(neutral_schema ? JsonLowerSha256(source_sha->string)
+                          : JsonSha256(source_sha->string))
+      || !(neutral_schema ? JsonLowerSha256(identity->string)
+                          : JsonSha256(identity->string))
+      || !(neutral_schema
+              ? ExactObject(*resolved, { "source_fem_sha256", "model", "nodes_mm",
+                    "triangles", "regions", "materials", "circuits",
+                    "outer_dirichlet" }, error)
+              : (motor_v1
+                    ? ExactObject(*resolved, { "source_fem_sha256",
+                          "base_motor_fem_sha256", "model", "pose", "nodes_mm",
+                          "triangles", "regions", "materials", "circuits",
+                          "outer_dirichlet" }, error)
+                    : ExactObject(*resolved, { "source_fem_sha256",
+                          "base_motor_fem_sha256", "model", "pose", "nodes_mm",
+                          "triangles", "regions", "materials", "circuits",
+                          "outer_dirichlet", "air_gap_elements" }, error)))) {
     if (error->empty())
-      *error = "invalid gpu_femm_mesh_v1 header";
+      *error = "invalid GPU FEMM mesh artifact header";
     return false;
   }
   const StrictJson* resolved_sha = JsonMember(*resolved, "source_fem_sha256", StrictJson::Type::kString, error);
-  const StrictJson* base_sha = JsonMember(*resolved, "base_motor_fem_sha256", StrictJson::Type::kString, error);
+  const StrictJson* base_sha = neutral_schema ? resolved_sha
+      : JsonMember(*resolved, "base_motor_fem_sha256", StrictJson::Type::kString, error);
   const StrictJson* model = JsonMember(*resolved, "model", StrictJson::Type::kObject, error);
-  const StrictJson* pose = JsonMember(*resolved, "pose", StrictJson::Type::kObject, error);
+  const StrictJson* pose = neutral_schema ? nullptr
+      : JsonMember(*resolved, "pose", StrictJson::Type::kObject, error);
   const StrictJson* nodes = JsonMember(*resolved, "nodes_mm", StrictJson::Type::kArray, error);
   const StrictJson* triangles = JsonMember(*resolved, "triangles", StrictJson::Type::kObject, error);
   const StrictJson* regions = JsonMember(*resolved, "regions", StrictJson::Type::kArray, error);
   const StrictJson* materials = JsonMember(*resolved, "materials", StrictJson::Type::kArray, error);
   const StrictJson* circuits = JsonMember(*resolved, "circuits", StrictJson::Type::kArray, error);
   const StrictJson* boundary = JsonMember(*resolved, "outer_dirichlet", StrictJson::Type::kObject, error);
-  if (resolved_sha == nullptr || base_sha == nullptr || model == nullptr || pose == nullptr || nodes == nullptr || triangles == nullptr || regions == nullptr
+  if (resolved_sha == nullptr || base_sha == nullptr || model == nullptr
+      || (!neutral_schema && pose == nullptr) || nodes == nullptr || triangles == nullptr || regions == nullptr
       || materials == nullptr || circuits == nullptr || boundary == nullptr
-      || !JsonSha256(resolved_sha->string) || !JsonSha256(base_sha->string)
+      || !(neutral_schema ? JsonLowerSha256(resolved_sha->string)
+                          : JsonSha256(resolved_sha->string))
+      || !(neutral_schema ? JsonLowerSha256(base_sha->string)
+                          : JsonSha256(base_sha->string))
       || resolved_sha->string != source_sha->string || base_sha->string != root_base_sha->string) {
     if (error->empty())
       *error = "source FEM SHA mismatch";
@@ -3735,31 +3786,36 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     *error = "unsupported model physics";
     return false;
   }
-  if (!ExactObject(*pose, { "rotor_angle_deg", "displacement_mm" }, error))
-    return false;
-  const StrictJson* rotor_angle = JsonMember(*pose, "rotor_angle_deg", StrictJson::Type::kNumber, error);
-  const StrictJson* displacement = JsonMember(*pose, "displacement_mm", StrictJson::Type::kArray, error);
-  if (rotor_angle == nullptr || displacement == nullptr || displacement->array.size() != 2
-      || displacement->array[0].type != StrictJson::Type::kNumber
-      || displacement->array[1].type != StrictJson::Type::kNumber) {
-    *error = "invalid pose";
-    return false;
+  const StrictJson* rotor_angle = nullptr;
+  const StrictJson* displacement = nullptr;
+  if (!neutral_schema) {
+    if (!ExactObject(*pose, { "rotor_angle_deg", "displacement_mm" }, error))
+      return false;
+    rotor_angle = JsonMember(*pose, "rotor_angle_deg", StrictJson::Type::kNumber, error);
+    displacement = JsonMember(*pose, "displacement_mm", StrictJson::Type::kArray, error);
+    if (rotor_angle == nullptr || displacement == nullptr || displacement->array.size() != 2
+        || displacement->array[0].type != StrictJson::Type::kNumber
+        || displacement->array[1].type != StrictJson::Type::kNumber) {
+      *error = "invalid pose";
+      return false;
+    }
   }
-  if (nodes->array.size() < 3 || circuits->array.empty() || materials->array.empty()
+  if (nodes->array.size() < 3 || materials->array.empty()
       || regions->array.empty()) {
-    *error = "empty mesh/material/circuit input";
+    *error = "empty mesh/material input";
     return false;
   }
 
   GpuFemmMeshArtifact parsed;
-  const bool is_sliding_band_v2 = schema->string == "gpu_femm_mesh_v2";
+  parsed.schema_version = schema->string;
+  const bool is_sliding_band_v2 = motor_v2;
   parsed.has_sliding_band = is_sliding_band_v2;
   parsed.pose_fem_sha256 = source_sha->string;
   parsed.base_motor_fem_sha256 = base_sha->string;
   parsed.canonical_identity_sha256 = identity->string;
-  parsed.rotor_angle_deg = rotor_angle->number;
-  parsed.displacement_mm[0] = displacement->array[0].number;
-  parsed.displacement_mm[1] = displacement->array[1].number;
+  parsed.rotor_angle_deg = neutral_schema ? 0.0 : rotor_angle->number;
+  parsed.displacement_mm[0] = neutral_schema ? 0.0 : displacement->array[0].number;
+  parsed.displacement_mm[1] = neutral_schema ? 0.0 : displacement->array[1].number;
   parsed.model.depth_m = depth->number * 1e-3;
   for (const StrictJson& pair : nodes->array) {
     if (pair.type != StrictJson::Type::kArray || pair.array.size() != 2
@@ -4063,12 +4119,14 @@ int GpuFemmMeshArtifactTest(const std::string& path)
     std::cerr << "FAIL gpu_femm_mesh_v1: " << error << '\n';
     return 1;
   }
-  std::cout << "PASS gpu_femm_mesh_v1\n"
+  std::cout << "PASS " << artifact.schema_version << "\n"
             << "  nodes=" << artifact.model.nodes.size()
             << " triangles=" << artifact.model.triangles.size()
             << " circuits=" << artifact.model.circuit_count
-            << " pose_fem_sha256=" << artifact.pose_fem_sha256
-            << " base_motor_fem_sha256=" << artifact.base_motor_fem_sha256 << '\n';
+            << " source_fem_sha256=" << artifact.pose_fem_sha256;
+  if (artifact.schema_version != "gpu_femm_planar_dc_mesh_v1")
+    std::cout << " base_motor_fem_sha256=" << artifact.base_motor_fem_sha256;
+  std::cout << '\n';
   return 0;
 }
 
@@ -5547,6 +5605,22 @@ struct MotorSampleRequest {
   double displacement_mm[2] = {};
 };
 
+// Project-neutral planar-DC entry point.  The production motor protocol above
+// remains frozen for the MATLAB adapter; this request exposes the same solver
+// without requiring motor identity, pose, or force-integration fields.
+struct PlanarDcSampleRequest {
+  std::string mesh_artifact_path;
+  std::string mesh_artifact_sha256;
+  std::vector<double> circuit_currents_a;
+  int32_t force_group_number = -1;
+  int32_t stress_air_group_number = -1;
+  double airgap_radius_mm = 0.0;
+  std::vector<double> airgap_angles_deg;
+  double sliding_band_angle_deg = 0.0;
+  bool compute_force_torque = false;
+  bool include_field_solution = false;
+};
+
 bool StrictNumberArray(const StrictJson& value, std::vector<double>* output)
 {
   if (value.type != StrictJson::Type::kArray || output == nullptr)
@@ -5557,6 +5631,56 @@ bool StrictNumberArray(const StrictJson& value, std::vector<double>* output)
       return false;
     output->push_back(member.number);
   }
+  return true;
+}
+
+bool ReadPlanarDcSampleRequestJson(const std::string& json,
+    PlanarDcSampleRequest* request, std::string* error)
+{
+  StrictJson root;
+  StrictJsonParser parser(json);
+  if (request == nullptr || error == nullptr || !parser.Parse(&root, error)
+      || !ExactObject(root, { "protocol", "mesh_artifact_path",
+          "mesh_artifact_sha256", "circuit_currents_A", "force_group_number",
+          "stress_air_group_number", "airgap_radius_mm", "airgap_angles_deg",
+          "sliding_band_angle_deg", "compute_force_torque",
+          "include_field_solution" }, error))
+    return false;
+  const StrictJson* protocol = JsonMember(root, "protocol", StrictJson::Type::kString, error);
+  const StrictJson* path = JsonMember(root, "mesh_artifact_path", StrictJson::Type::kString, error);
+  const StrictJson* artifact_sha = JsonMember(root, "mesh_artifact_sha256", StrictJson::Type::kString, error);
+  const StrictJson* currents = JsonMember(root, "circuit_currents_A", StrictJson::Type::kArray, error);
+  const StrictJson* force_group = JsonMember(root, "force_group_number", StrictJson::Type::kNumber, error);
+  const StrictJson* air_group = JsonMember(root, "stress_air_group_number", StrictJson::Type::kNumber, error);
+  const StrictJson* radius = JsonMember(root, "airgap_radius_mm", StrictJson::Type::kNumber, error);
+  const StrictJson* angles = JsonMember(root, "airgap_angles_deg", StrictJson::Type::kArray, error);
+  const StrictJson* sliding_angle = JsonMember(root, "sliding_band_angle_deg", StrictJson::Type::kNumber, error);
+  const StrictJson* compute_force = JsonMember(root, "compute_force_torque", StrictJson::Type::kBool, error);
+  const StrictJson* include_field = JsonMember(root, "include_field_solution", StrictJson::Type::kBool, error);
+  int32_t selected = -2, air = -2;
+  if (protocol == nullptr || path == nullptr || artifact_sha == nullptr || currents == nullptr
+      || force_group == nullptr || air_group == nullptr || radius == nullptr || angles == nullptr
+      || sliding_angle == nullptr || compute_force == nullptr || include_field == nullptr
+      || protocol->string != "gpu_femm_planar_dc_sample_v1" || path->string.empty()
+      || !JsonLowerSha256(artifact_sha->string) || !JsonInteger(*force_group, &selected)
+      || !JsonInteger(*air_group, &air) || selected < -1 || air < -1
+      || ((selected == -1) != (air == -1)) || (selected >= 0 && selected == air)
+      || !(radius->number >= 0.0)
+      || !StrictNumberArray(*currents, &request->circuit_currents_a)
+      || !StrictNumberArray(*angles, &request->airgap_angles_deg)
+      || (!request->airgap_angles_deg.empty() && !(radius->number > 0.0))) {
+    if (error->empty())
+      *error = "invalid gpu_femm_planar_dc_sample_v1 request";
+    return false;
+  }
+  request->mesh_artifact_path = path->string;
+  request->mesh_artifact_sha256 = artifact_sha->string;
+  request->force_group_number = selected;
+  request->stress_air_group_number = air;
+  request->airgap_radius_mm = radius->number;
+  request->sliding_band_angle_deg = sliding_angle->number;
+  request->compute_force_torque = compute_force->boolean;
+  request->include_field_solution = include_field->boolean;
   return true;
 }
 
@@ -5650,7 +5774,7 @@ bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMesh
       && request.circuit_currents_a.size() == static_cast<size_t>(artifact.model.circuit_count);
 }
 
-bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact,
+bool ApplySlidingBandAngle(double requested_angle_deg, const GpuFemmMeshArtifact& artifact,
     NonlinearModel* model)
 {
   if (model == nullptr)
@@ -5658,7 +5782,7 @@ bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemm
   *model = artifact.model;
   if (!artifact.has_sliding_band)
     return true;
-  const double delta_deg = request.rotor_angle_deg - artifact.rotor_angle_deg;
+  const double delta_deg = requested_angle_deg - artifact.rotor_angle_deg;
   if (!std::isfinite(delta_deg))
     return false;
   for (AirGapElement& age : model->air_gap_elements) {
@@ -5695,6 +5819,12 @@ bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request, const GpuFemm
   return true;
 }
 
+bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request,
+    const GpuFemmMeshArtifact& artifact, NonlinearModel* model)
+{
+  return ApplySlidingBandAngle(request.rotor_angle_deg, artifact, model);
+}
+
 Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
     const GpuFemmMeshArtifact& artifact, NonlinearSolveResult* solution,
     FrozenPostprocessResult* postprocess)
@@ -5708,11 +5838,7 @@ Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
   Status status = solver.Initialize(model);
   if (status != Status::kOk)
     return status;
-  NonlinearOptions nonlinear_options;
-  nonlinear_options.relative_tolerance = 1e-8;
-  nonlinear_options.max_newton_iterations = 128;
-  nonlinear_options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
-  nonlinear_options.max_linear_iterations = kMotorMaxLinearIterations;
+  const NonlinearOptions nonlinear_options = ProductionSampleOptions();
   *solution = solver.Solve(request.circuit_currents_a, nonlinear_options);
   if (solution->info.status != Status::kOk)
     return solution->info.status;
@@ -5823,6 +5949,238 @@ int MotorSingleSampleAdapter(const std::string& request_path, const std::string&
     return 1;
   if (status != Status::kOk) {
     std::cerr << "FAIL motor single-sample: " << error << (error.empty() ? StatusName(status) : "") << '\n';
+    return 1;
+  }
+  return 0;
+}
+
+bool PlanarDcRequestMatchesArtifact(const PlanarDcSampleRequest& request,
+    const GpuFemmMeshArtifact& artifact)
+{
+  if (request.circuit_currents_a.size()
+      != static_cast<size_t>(artifact.model.circuit_count))
+    return false;
+  const auto has_group = [&artifact](int32_t group) {
+    return std::any_of(artifact.model.materials.begin(), artifact.model.materials.end(),
+        [group](const NonlinearMaterial& material) {
+          return material.group_number == group;
+        });
+  };
+  const bool groups_enabled = request.force_group_number >= 0;
+  if (groups_enabled && (!has_group(request.force_group_number)
+      || !has_group(request.stress_air_group_number)))
+    return false;
+  const bool needs_postprocess = request.compute_force_torque
+      || !request.airgap_angles_deg.empty();
+  if (!artifact.has_sliding_band) {
+    // A conforming artifact is already posed.  Rotation is only meaningful
+    // for a native sliding-band artifact, and weighted-stress postprocessing
+    // needs an explicit selected/air group pair.
+    return request.sliding_band_angle_deg == 0.0
+        && (!needs_postprocess || groups_enabled);
+  }
+  if (!request.airgap_angles_deg.empty()) {
+    if (artifact.model.air_gap_elements.empty())
+      return false;
+    for (const AirGapElement& age : artifact.model.air_gap_elements) {
+      const double inner_mm = 1000.0 * age.inner_radius_m;
+      const double outer_mm = 1000.0 * age.outer_radius_m;
+      const double tolerance_mm = 1e-9 * std::max(1.0, std::abs(outer_mm));
+      if (request.airgap_radius_mm < inner_mm - tolerance_mm
+          || request.airgap_radius_mm > outer_mm + tolerance_mm)
+        return false;
+    }
+  }
+  return true;
+}
+
+std::string EscapeJsonString(const std::string& value)
+{
+  std::ostringstream escaped;
+  const char* hex = "0123456789abcdef";
+  for (unsigned char character : value) {
+    switch (character) {
+      case '"': escaped << "\\\""; break;
+      case '\\': escaped << "\\\\"; break;
+      case '\b': escaped << "\\b"; break;
+      case '\f': escaped << "\\f"; break;
+      case '\n': escaped << "\\n"; break;
+      case '\r': escaped << "\\r"; break;
+      case '\t': escaped << "\\t"; break;
+      default:
+        if (character < 0x20)
+          escaped << "\\u00" << hex[character >> 4] << hex[character & 0x0f];
+        else
+          escaped << static_cast<char>(character);
+    }
+  }
+  return escaped.str();
+}
+
+bool WritePlanarDcSampleResponse(const std::string& path, Status status,
+    Status solve_status, bool postprocess_requested, Status postprocess_status,
+    const PlanarDcSampleRequest* request, const NonlinearSolveResult* solution,
+    const FrozenPostprocessResult* postprocess, const std::string& diagnostic)
+{
+  std::ofstream output(path, std::ios::trunc);
+  if (!output)
+    return false;
+  const bool solved = solve_status == Status::kOk && request != nullptr
+      && solution != nullptr;
+  const bool postprocessed = solved && postprocess_requested
+      && postprocess_status == Status::kOk && postprocess != nullptr;
+  const std::string message = status == Status::kOk ? ""
+      : (diagnostic.empty() ? StatusName(status) : diagnostic);
+  output << std::setprecision(17)
+         << "{\n  \"protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
+         << "  \"mesh_artifact_sha256\": \""
+         << (request == nullptr ? "" : request->mesh_artifact_sha256) << "\",\n"
+         << "  \"status\": \"" << (status == Status::kOk ? "PASS" : "FAIL") << "\",\n"
+         << "  \"solve_status\": \"" << StatusName(solve_status) << "\",\n"
+         << "  \"postprocess_status\": \""
+         << (!postprocess_requested ? "NOT_REQUESTED"
+                                    : (solve_status == Status::kOk
+                                            ? StatusName(postprocess_status) : "NOT_RUN"))
+         << "\",\n"
+         << "  \"error_identifier\": \""
+         << (status == Status::kOk ? "" : std::string("GPU_FEMM_") + StatusName(status)) << "\",\n"
+         << "  \"error_message\": \"" << EscapeJsonString(message) << "\",\n";
+  if (postprocessed && request->compute_force_torque) {
+    output << "  \"Fx_N\": " << postprocess->force_x_n
+           << ",\n  \"Fy_N\": " << postprocess->force_y_n
+           << ",\n  \"torque_Nm\": " << postprocess->torque_nm << ",\n";
+  } else {
+    output << "  \"Fx_N\": null,\n  \"Fy_N\": null,\n  \"torque_Nm\": null,\n";
+  }
+  output << "  \"actual_circuit_currents_A\": [";
+  if (solved)
+    for (size_t i = 0; i < solution->circuit_currents_a.size(); ++i)
+      output << (i ? ", " : "") << solution->circuit_currents_a[i];
+  output << "],\n  \"circuit_flux_linkage_Wb\": [";
+  if (solved)
+    for (size_t i = 0; i < solution->circuit_flux_linkage_wb.size(); ++i)
+      output << (i ? ", " : "") << solution->circuit_flux_linkage_wb[i];
+  output << "],\n  \"airgap_sample_angles_deg\": [";
+  if (postprocessed)
+    for (size_t i = 0; i < request->airgap_angles_deg.size(); ++i)
+      output << (i ? ", " : "") << request->airgap_angles_deg[i];
+  output << "],\n  \"airgap_radial_flux_density_T\": [";
+  if (postprocessed)
+    for (size_t i = 0; i < postprocess->airgap_samples.size(); ++i)
+      output << (i ? ", " : "") << postprocess->airgap_samples[i].radial_b_t;
+  output << "],\n  \"mesh_node_count\": "
+         << (solved ? solution->a_wb_per_m.size() : 0)
+         << ",\n  \"mesh_element_count\": "
+         << (solved ? solution->bx_t.size() : 0)
+         << ",\n  \"field_solution_included\": "
+         << (solved && request->include_field_solution ? "true" : "false")
+         << ",\n  \"node_A_Wb_per_m\": [";
+  if (solved && request->include_field_solution)
+    for (size_t i = 0; i < solution->a_wb_per_m.size(); ++i)
+      output << (i ? ", " : "") << solution->a_wb_per_m[i];
+  output << "],\n  \"element_Bx_T\": [";
+  if (solved && request->include_field_solution)
+    for (size_t i = 0; i < solution->bx_t.size(); ++i)
+      output << (i ? ", " : "") << solution->bx_t[i];
+  output << "],\n  \"element_By_T\": [";
+  if (solved && request->include_field_solution)
+    for (size_t i = 0; i < solution->by_t.size(); ++i)
+      output << (i ? ", " : "") << solution->by_t[i];
+  output << "],\n  \"convergence\": {\"iterations\": "
+         << (solution == nullptr ? 0 : solution->info.iterations)
+         << ", \"residual_l2\": ";
+  if (solution != nullptr && std::isfinite(solution->info.residual_l2))
+    output << solution->info.residual_l2;
+  else
+    output << "null";
+  output << "}\n}\n";
+  return static_cast<bool>(output);
+}
+
+int PlanarDcSingleSampleAdapter(const std::string& request_path,
+    const std::string& response_path)
+{
+  std::ifstream request_file(request_path);
+  std::stringstream request_bytes;
+  request_bytes << request_file.rdbuf();
+  PlanarDcSampleRequest request;
+  std::string error;
+  if (!request_file
+      || !ReadPlanarDcSampleRequestJson(request_bytes.str(), &request, &error)) {
+    WritePlanarDcSampleResponse(response_path, Status::kInvalidArgument,
+        Status::kInvalidArgument, false, Status::kOk, nullptr, nullptr, nullptr,
+        error);
+    std::cerr << "FAIL planar-DC request: " << error << '\n';
+    return 1;
+  }
+  std::ifstream artifact_file(request.mesh_artifact_path, std::ios::binary);
+  std::stringstream artifact_bytes;
+  artifact_bytes << artifact_file.rdbuf();
+  GpuFemmMeshArtifact artifact;
+  Status status = Status::kOk;
+  Status solve_status = Status::kOk;
+  Status postprocess_status = Status::kOk;
+  if (!artifact_file) {
+    status = Status::kInputIo;
+    error = "cannot open mesh artifact";
+  } else if (Sha256Hex(artifact_bytes.str()) != request.mesh_artifact_sha256) {
+    status = Status::kInvalidArgument;
+    error = "mesh artifact SHA mismatch";
+  } else if (!ParseGpuFemmMeshArtifactJson(artifact_bytes.str(), &artifact, &error)) {
+    status = Status::kInvalidArgument;
+  } else if (!PlanarDcRequestMatchesArtifact(request, artifact)) {
+    status = Status::kInvalidArgument;
+    error = "artifact physics, circuit count, group, or sliding-band request mismatch";
+  }
+
+  NonlinearModel model;
+  NonlinearSolveResult solution;
+  FrozenPostprocessResult postprocess;
+  bool solve_attempted = false;
+  bool postprocess_attempted = false;
+  if (status == Status::kOk) {
+    if (!ApplySlidingBandAngle(request.sliding_band_angle_deg, artifact, &model)) {
+      status = Status::kInvalidArgument;
+      error = "could not apply the requested sliding-band angle";
+    } else {
+      NonlinearP1FixtureSolver solver;
+      status = solver.Initialize(model);
+      if (status == Status::kOk) {
+        const NonlinearOptions options = ProductionSampleOptions();
+        solve_attempted = true;
+        solution = solver.Solve(request.circuit_currents_a, options);
+        status = solution.info.status;
+      }
+    }
+  }
+  solve_status = status;
+  const bool postprocess_requested = request.compute_force_torque
+      || !request.airgap_angles_deg.empty();
+  if (solve_status == Status::kOk && postprocess_requested) {
+    FrozenPostprocessOptions options;
+    options.selected_group_number = request.force_group_number;
+    options.air_group_number = request.stress_air_group_number;
+    options.max_mask_iterations = 4096;
+    options.airgap_radius_m = request.airgap_radius_mm * 1e-3;
+    for (double angle : request.airgap_angles_deg)
+      options.airgap_angles_rad.push_back(angle
+          * 3.141592653589793238462643383279502884 / 180.0);
+    postprocess_attempted = true;
+    postprocess = artifact.has_sliding_band
+        ? ComputeAirGapElementPostprocess(model, solution, options)
+        : ComputeFrozenPostprocess(model, solution, options);
+    postprocess_status = postprocess.status;
+    status = postprocess_status;
+  }
+  if (!WritePlanarDcSampleResponse(response_path, status, solve_status,
+          postprocess_requested, postprocess_status, &request,
+          solve_attempted ? &solution : nullptr,
+          postprocess_attempted && postprocess_status == Status::kOk ? &postprocess : nullptr,
+          error))
+    return 1;
+  if (status != Status::kOk) {
+    std::cerr << "FAIL planar-DC solve: "
+              << (error.empty() ? StatusName(status) : error) << '\n';
     return 1;
   }
   return 0;
@@ -6386,11 +6744,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       group_currents.reserve(group.size());
       for (size_t prepared_index : group)
         group_currents.push_back(prepared[prepared_index].currents);
-      NonlinearOptions options;
-      options.relative_tolerance = 1e-8;
-      options.max_newton_iterations = 128;
-      options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
-      options.max_linear_iterations = kMotorMaxLinearIterations;
+      const NonlinearOptions options = ProductionSampleOptions();
       NonlinearBatchTiming chunk_timing;
       std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
           group_currents, options, &batched_pcg_launches, &chunk_timing,
@@ -6753,6 +7107,58 @@ int SelfTest()
           && parsed_artifact.base_motor_fem_sha256.size() == 64
           && parsed_artifact.pose_fem_sha256.size() == 64,
       "gpu_femm_mesh_v1 maps multi-circuit labels and identities");
+  std::string neutral_mesh_artifact = mesh_artifact;
+  neutral_mesh_artifact.replace(neutral_mesh_artifact.find("gpu_femm_mesh_v1"),
+      16, "gpu_femm_planar_dc_mesh_v1");
+  const std::string motor_base_field =
+      "\"base_motor_fem_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",";
+  for (size_t found = neutral_mesh_artifact.find(motor_base_field);
+       found != std::string::npos;
+       found = neutral_mesh_artifact.find(motor_base_field))
+    neutral_mesh_artifact.erase(found, motor_base_field.size());
+  const std::string motor_pose_field =
+      "\"pose\":{\"rotor_angle_deg\":3,\"displacement_mm\":[0.1,0]},";
+  const size_t motor_pose_at = neutral_mesh_artifact.find(motor_pose_field);
+  if (motor_pose_at != std::string::npos)
+    neutral_mesh_artifact.erase(motor_pose_at, motor_pose_field.size());
+  GpuFemmMeshArtifact neutral_artifact;
+  expect(ParseGpuFemmMeshArtifactJson(neutral_mesh_artifact, &neutral_artifact,
+             &parser_error)
+          && neutral_artifact.model.circuit_count == 2
+          && neutral_artifact.base_motor_fem_sha256
+              == neutral_artifact.pose_fem_sha256,
+      std::string("project-neutral mesh artifact parser: ") + parser_error);
+  std::string pm_only_artifact = neutral_mesh_artifact;
+  const auto replace_all = [](std::string* value, const std::string& before,
+                               const std::string& after) {
+    for (size_t found = value->find(before); found != std::string::npos;
+         found = value->find(before, found + after.size()))
+      value->replace(found, before.size(), after);
+  };
+  replace_all(&pm_only_artifact, "\"circuit_index\":0,\"turns\":50",
+      "\"circuit_index\":-1,\"turns\":0");
+  replace_all(&pm_only_artifact, "\"circuit_index\":1,\"turns\":-50",
+      "\"circuit_index\":-1,\"turns\":0");
+  const std::string two_circuits =
+      "\"circuits\":[{\"index\":0,\"name\":\"coil_00\",\"type\":\"series\",\"current_A\":2},{\"index\":1,\"name\":\"coil_01\",\"type\":\"series\",\"current_A\":-2}]";
+  replace_all(&pm_only_artifact, two_circuits, "\"circuits\":[]");
+  GpuFemmMeshArtifact pm_only_parsed;
+  expect(ParseGpuFemmMeshArtifactJson(pm_only_artifact, &pm_only_parsed,
+             &parser_error)
+          && pm_only_parsed.model.circuit_count == 0,
+      "project-neutral artifact permits PM-only zero-circuit models");
+  NonlinearP1FixtureSolver pm_only_solver;
+  const Status pm_only_initialize = pm_only_solver.Initialize(pm_only_parsed.model);
+  const NonlinearSolveResult pm_only_solution = pm_only_initialize == Status::kOk
+      ? pm_only_solver.Solve(std::vector<double> {}, ProductionSampleOptions())
+      : NonlinearSolveResult {};
+  expect(pm_only_initialize == Status::kOk
+          && pm_only_solution.info.status == Status::kOk
+          && pm_only_solution.circuit_currents_a.empty()
+          && pm_only_solution.circuit_flux_linkage_wb.empty(),
+      std::string("project-neutral PM-only model solves with an empty current vector (initialize=")
+          + StatusName(pm_only_initialize) + ", solve="
+          + StatusName(pm_only_solution.info.status) + ")");
   double native_age_matrix[10][10] = {};
   expect(BuildNativeFemmAirGapMatrix(0.75, 1.0 / 0.75, 0.25, 0.75, native_age_matrix)
           && native_age_matrix[0][0] > 0.0 && native_age_matrix[7][7] > 0.0
@@ -6810,6 +7216,21 @@ int SelfTest()
   expect(ReadMotorSampleRequestJson(motor_request_json, &parsed_request, &parser_error)
           && RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request binds artifact identities and pose");
+  const std::string planar_request_json = R"json({
+    "protocol":"gpu_femm_planar_dc_sample_v1",
+    "mesh_artifact_path":"fixture.json",
+    "mesh_artifact_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "circuit_currents_A":[2,-2],"force_group_number":-1,
+    "stress_air_group_number":-1,"airgap_radius_mm":0,
+    "airgap_angles_deg":[],"sliding_band_angle_deg":0,
+    "compute_force_torque":false,"include_field_solution":true
+  })json";
+  PlanarDcSampleRequest planar_request;
+  expect(ReadPlanarDcSampleRequestJson(planar_request_json, &planar_request,
+             &parser_error)
+          && PlanarDcRequestMatchesArtifact(planar_request, parsed_artifact)
+          && planar_request.include_field_solution,
+      "project-neutral planar-DC request validates without motor identity fields");
   MotorSampleRequest sliding_request = parsed_request;
   sliding_request.rotor_angle_deg = 3.0;
   sliding_request.displacement_mm[0] = 0.0;
@@ -7735,6 +8156,9 @@ int main(int argc, char** argv)
   if (argc == 4 && std::string(argv[1]) == "--single-sample") {
     return gpu_femm::SingleSampleAdapter(argv[2], argv[3]);
   }
+  if (argc == 4 && std::string(argv[1]) == "--solve") {
+    return gpu_femm::PlanarDcSingleSampleAdapter(argv[2], argv[3]);
+  }
   if (argc == 4 && std::string(argv[1]) == "--motor-single-sample") {
     return gpu_femm::MotorSingleSampleAdapter(argv[2], argv[3]);
   }
@@ -7755,13 +8179,32 @@ int main(int argc, char** argv)
   if (argc == 3 && std::string(argv[1]) == "--mesh-artifact") {
     return gpu_femm::GpuFemmMeshArtifactTest(argv[2]);
   }
+  if (argc == 2 && std::string(argv[1]) == "--capabilities") {
+    std::cout
+        << "{\n"
+        << "  \"schema_version\": \"gpu_femm_capabilities_v1\",\n"
+        << "  \"sample_protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
+        << "  \"problem_types\": [\"planar\"],\n"
+        << "  \"frequency_hz\": [0],\n"
+        << "  \"precision\": \"fp64\",\n"
+        << "  \"nonlinear_bh\": true,\n"
+        << "  \"permanent_magnets\": true,\n"
+        << "  \"native_sliding_band\": true,\n"
+        << "  \"full_field_output\": true,\n"
+        << "  \"ac_complex\": false,\n"
+        << "  \"axisymmetric\": false\n"
+        << "}\n";
+    return 0;
+  }
   std::cerr << "Usage: gpu_linear_p1_poc --self-test | --femm-reference <stem>"
             << " | --nonlinear-reference <stem> <curve_dir>"
             << " | --postprocess-reference <stem> <curve_dir>"
             << " | --single-sample <request.json> <response.json>"
+            << " | --solve <request.json> <response.json>"
             << " | --motor-single-sample <request.json> <response.json>"
             << " | --motor-batch <request.json> <response.json>"
             << " | --motor-batch-profile <request.json> <response.json>"
-            << " | --mesh-artifact <gpu_femm_mesh_v1.json>\n";
+            << " | --mesh-artifact <gpu_femm_mesh_v1.json>"
+            << " | --capabilities\n";
   return 2;
 }

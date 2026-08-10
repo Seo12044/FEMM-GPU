@@ -12,6 +12,14 @@ add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
   src/native_airgap_matrix.cpp
 )
+# Keep the historical executable name for the MATLAB integration and publish
+# a neutral name for standalone users.  Both files are byte-identical.
+add_custom_command(TARGET gpu_linear_p1_poc POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:gpu_linear_p1_poc>
+    $<TARGET_FILE_DIR:gpu_linear_p1_poc>/femm_gpu$<TARGET_FILE_SUFFIX:gpu_linear_p1_poc>
+  VERBATIM
+)
 # Keep the GPU AGE stiffness matrix bit-for-bit derived from FEMM's native
 # fkn implementation.  It is generated at configure time solely from the
 # tracked source, so a future FEMM correction cannot silently diverge here.
@@ -91,6 +99,7 @@ if(GPU_SOLVER_CUDA_ARCHITECTURES)
 endif()
 
 if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
   add_test(NAME gpu_linear_p1_selftest
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --self-test
   )
@@ -123,6 +132,17 @@ if(BUILD_TESTING)
   add_test(NAME gpu_femm_mesh_noop_solver
     COMMAND $<TARGET_FILE:gpu_femm_mesh_noop_solver> ignored-mesh-stem
   )
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME gpu_femm_project_neutral_cli
+      COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_femm_gpu_cli.py"
+        $<TARGET_FILE:gpu_linear_p1_poc>
+    )
+    add_test(NAME gpu_femm_project_neutral_prepare
+      COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_femm_gpu_prepare.py"
+    )
+  endif()
   set_tests_properties(gpu_linear_p1_selftest PROPERTIES
     LABELS "gpu;requires_cuda"
     TIMEOUT 30
@@ -148,4 +168,11 @@ if(BUILD_TESTING)
     LABELS "gpu;mesh_only"
     TIMEOUT 5
   )
+  if(Python3_Interpreter_FOUND)
+    set_tests_properties(gpu_femm_project_neutral_cli
+      gpu_femm_project_neutral_prepare PROPERTIES
+      LABELS "gpu;cli;no_cuda"
+      TIMEOUT 10
+    )
+  endif()
 endif()
