@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 class PrepareError(RuntimeError):
@@ -43,6 +43,7 @@ _UNITS_TO_MM = {
     "inches": 25.4,
     "mils": 0.0254,
     "micrometers": 0.001,
+    "microns": 0.001,
 }
 
 
@@ -83,11 +84,13 @@ def _unquote(value: str) -> str:
 
 
 def _setting(lines: Sequence[str], name: str) -> str:
-    for line in lines:
-        match = _SETTING.match(line)
-        if match and match.group(1) == name:
-            return _unquote(match.group(2))
-    raise PrepareError(f"missing FEMM [{name}] setting")
+    matches = [match for line in lines if (match := _SETTING.match(line))
+               and match.group(1).casefold() == name.casefold()]
+    if not matches:
+        raise PrepareError(f"missing FEMM [{name}] setting")
+    if len(matches) != 1:
+        raise PrepareError(f"duplicate FEMM [{name}] setting or section")
+    return _unquote(matches[0].group(2))
 
 
 def _number(value: str, label: str) -> float:
@@ -108,12 +111,14 @@ def _count(lines: Sequence[str], name: str) -> int:
 
 
 def _section_start(lines: Sequence[str], name: str) -> int:
-    target = name
-    for index, line in enumerate(lines):
-        match = _SETTING.match(line)
-        if match and match.group(1) == target:
-            return index + 1
-    raise PrepareError(f"missing FEMM [{name}] section")
+    matches = [index for index, line in enumerate(lines)
+               if (match := _SETTING.match(line))
+               and match.group(1).casefold() == name.casefold()]
+    if not matches:
+        raise PrepareError(f"missing FEMM [{name}] section")
+    if len(matches) != 1:
+        raise PrepareError(f"duplicate FEMM [{name}] setting or section")
+    return matches[0] + 1
 
 
 def _next_content(lines: Sequence[str], index: int) -> int:
@@ -302,9 +307,9 @@ def _parse_labels(lines: Sequence[str], materials: list[dict[str, Any]], circuit
     return labels, default
 
 
-def _parse_source(path: Path) -> tuple[dict[str, Any], float, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int | None, list[bool]]:
+def _parse_source(path: Path) -> tuple[dict[str, Any], float, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int | None, list[str]]:
     lines = _clean_lines(path)
-    if any(line.strip() == "[Solution]" for line in lines):
+    if any(line.strip().casefold() == "[solution]" for line in lines):
         raise PrepareError("input must be a FEMM .fem source, not a solved .ans file")
     frequency = _number(_setting(lines, "Frequency"), "Frequency")
     problem = _setting(lines, "ProblemType").lower()
@@ -421,17 +426,43 @@ def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]
 
 def _validate_constraint_boundaries(
         constraints: Sequence[dict[str, Any]],
-        periodic_nodes_by_marker: dict[int, set[int]],
+        periodic_edges_by_marker: dict[int, set[tuple[int, int]]],
         boundaries: Sequence[str]) -> None:
     """Bind every `.pbc` pair to the matching FEMM boundary property."""
-    paired_nodes_by_marker = {marker: set() for marker in periodic_nodes_by_marker}
+    nodes_by_marker = {
+        marker: {node for edge in edges for node in edge}
+        for marker, edges in periodic_edges_by_marker.items()
+    }
+    components_by_marker: dict[int, dict[int, int]] = {}
+    for marker, edges in periodic_edges_by_marker.items():
+        adjacency = {node: set() for node in nodes_by_marker[marker]}
+        for first, second in edges:
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+        component_by_node: dict[int, int] = {}
+        for node in adjacency:
+            if node in component_by_node:
+                continue
+            component = len(set(component_by_node.values()))
+            pending = [node]
+            while pending:
+                current = pending.pop()
+                if current in component_by_node:
+                    continue
+                component_by_node[current] = component
+                pending.extend(adjacency[current] - component_by_node.keys())
+        components_by_marker[marker] = component_by_node
+
+    paired_nodes_by_marker = {marker: set() for marker in periodic_edges_by_marker}
     for constraint in constraints:
         first = constraint["node_a"]
         second = constraint["node_b"]
         relation = constraint["relation"]
         matching = [
-            marker for marker, nodes in periodic_nodes_by_marker.items()
+            marker for marker, nodes in nodes_by_marker.items()
             if boundaries[marker] == relation and first in nodes and second in nodes
+            and (len(set(components_by_marker[marker].values())) == 1
+                 or components_by_marker[marker][first] != components_by_marker[marker][second])
         ]
         if not matching:
             raise PrepareError(
@@ -439,7 +470,7 @@ def _validate_constraint_boundaries(
             )
         for marker in matching:
             paired_nodes_by_marker[marker].update((first, second))
-    for marker, nodes in periodic_nodes_by_marker.items():
+    for marker, nodes in nodes_by_marker.items():
         if nodes != paired_nodes_by_marker[marker]:
             raise PrepareError(
                 "a used periodic/anti-periodic FEMM boundary has unpaired mesh nodes"
@@ -499,7 +530,7 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     if any(count not in (1, 2) for count in triangle_edge_incidence.values()):
         raise PrepareError("Triangle mesh contains a non-manifold edge")
     boundary_nodes: set[int] = set()
-    periodic_nodes_by_marker: dict[int, set[int]] = {}
+    periodic_edges_by_marker: dict[int, set[tuple[int, int]]] = {}
     mesh_edges: set[tuple[int, int]] = set()
     for row in edge_rows:
         if len(row) < 4 or any(row[index] != int(row[index]) for index in range(4)):
@@ -526,10 +557,10 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
         if boundaries[marker] == "dirichlet":
             boundary_nodes.update((first, second))
         else:
-            periodic_nodes_by_marker.setdefault(marker, set()).update((first, second))
+            periodic_edges_by_marker.setdefault(marker, set()).add(edge)
     if mesh_edges != set(triangle_edge_incidence):
         raise PrepareError("Triangle edge file does not match the element topology")
-    _validate_constraint_boundaries(constraints, periodic_nodes_by_marker, boundaries)
+    _validate_constraint_boundaries(constraints, periodic_edges_by_marker, boundaries)
     if model["problem_type"] == "axisymmetric":
         radius_scale = max(1.0, max(abs(node[0]) for node in nodes_by_id.values()))
         axis_tolerance_mm = 1e-12 * radius_scale
@@ -564,7 +595,8 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     return resolved
 
 
-def _write_artifact(path: Path, resolved: dict[str, Any], overwrite: bool) -> None:
+def _write_artifact(path: Path, resolved: dict[str, Any], overwrite: bool,
+                    before_publish: Callable[[], None] | None = None) -> None:
     path = path.resolve()
     if path.exists() and not overwrite:
         raise PrepareError(f"output already exists (use --overwrite): {path}")
@@ -588,6 +620,8 @@ def _write_artifact(path: Path, resolved: dict[str, Any], overwrite: bool) -> No
             stream.write("\n")
         if path.exists() and not overwrite:
             raise PrepareError(f"output already exists (use --overwrite): {path}")
+        if before_publish is not None:
+            before_publish()
         _atomic_replace(temporary, path)
         temporary = None
     except BaseException:
@@ -611,16 +645,16 @@ def _stage_and_mesh(source: Path, femm_root: Path, noop_solver: Path, timeout_s:
     _require_file(bin_dir / "triangle.exe", "stock Triangle executable")
     noop_solver = _require_file(noop_solver, "GPU mesh no-op helper")
     temporary = tempfile.TemporaryDirectory(prefix="femm_gpu_prepare_")
-    root = Path(temporary.name)
-    runtime = root / "runtime"
-    shutil.copytree(bin_dir, runtime)
-    shutil.copy2(noop_solver, runtime / "fkn.exe")
-    working = root / "model.fem"
-    shutil.copy2(source, working)
-    lua = runtime / "mesh_only.lua"
-    lua_path = str(working).replace("\\", "/").replace('"', '\\"')
-    lua.write_text(f'open("{lua_path}")\nmi_analyze(0)\nmi_close()\nquit()\n', encoding="ascii")
     try:
+        root = Path(temporary.name)
+        runtime = root / "runtime"
+        shutil.copytree(bin_dir, runtime)
+        shutil.copy2(noop_solver, runtime / "fkn.exe")
+        working = root / "model.fem"
+        shutil.copy2(source, working)
+        lua = runtime / "mesh_only.lua"
+        lua_path = str(working).replace("\\", "/").replace('"', '\\"')
+        lua.write_text(f'open("{lua_path}")\nmi_analyze(0)\nmi_close()\nquit()\n', encoding="ascii")
         # Pass the path as one raw argument. subprocess supplies Windows command
         # line quoting; embedding quotes here would escape them and FEMM would
         # wait without loading the script.
@@ -629,6 +663,9 @@ def _stage_and_mesh(source: Path, femm_root: Path, noop_solver: Path, timeout_s:
     except subprocess.TimeoutExpired as error:
         temporary.cleanup()
         raise PrepareError(f"stock FEMM mesh generation timed out after {timeout_s:g} s") from error
+    except Exception:
+        temporary.cleanup()
+        raise
     if run.returncode != 0:
         temporary.cleanup()
         detail = (run.stdout + "\n" + run.stderr).strip()
@@ -657,9 +694,19 @@ def prepare(source: Path, output: Path, femm_root: Path, noop_solver: Path, time
     )
     if output.is_relative_to(protected_femm_root):
         raise PrepareError("output artifact must be outside the stock FEMM installation")
+    source_sha256 = _sha256(source)
     temporary, stem = _stage_and_mesh(source, femm_root, noop_solver, timeout_s)
     try:
-        _write_artifact(output, _build_resolved(source, stem), overwrite)
+        staged_source = stem.with_suffix(".fem")
+        if _sha256(staged_source) != source_sha256 or _sha256(source) != source_sha256:
+            raise PrepareError("input FEMM source changed during mesh preparation")
+        resolved = _build_resolved(staged_source, stem)
+        def verify_source_unchanged() -> None:
+            if _sha256(source) != source_sha256:
+                raise PrepareError("input FEMM source changed during mesh preparation")
+
+        verify_source_unchanged()
+        _write_artifact(output, resolved, overwrite, verify_source_unchanged)
     finally:
         temporary.cleanup()
 

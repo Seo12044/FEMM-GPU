@@ -269,7 +269,12 @@ def command_solve(args: argparse.Namespace) -> int:
     solver = require_solver(args.solver)
     protocol = artifact_protocol(Path(args.artifact).resolve(strict=True))
     if protocol == GENERIC_PROTOCOL and (
-        args.force_torque or args.airgap_angles_deg or args.sliding_band_angle_deg != 0.0
+        args.force_torque
+        or args.force_group != -1
+        or args.air_group != -1
+        or args.airgap_radius_mm != 0.0
+        or args.airgap_angles_deg
+        or args.sliding_band_angle_deg != 0.0
     ):
         raise ValueError(
             "generic periodic/axisymmetric artifacts do not support force, air-gap, or sliding-band postprocessing"

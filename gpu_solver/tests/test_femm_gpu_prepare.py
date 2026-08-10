@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).parents[1] / "tools" / "femm_gpu_prepare.py"
@@ -118,7 +119,7 @@ class FemmGpuPrepareTests(unittest.TestCase):
                 stem.with_suffix(".pbc"), 4
             )
             femm_gpu_prepare._validate_constraint_boundaries(
-                constraints, {1: {0, 1}, 2: {2, 3}},
+                constraints, {1: {(0, 1)}, 2: {(2, 3)}},
                 ["dirichlet", "periodic", "antiperiodic"],
             )
 
@@ -131,8 +132,126 @@ class FemmGpuPrepareTests(unittest.TestCase):
         constraints = [{"node_a": 0, "node_b": 1, "relation": "periodic"}]
         with self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "matching FEMM"):
             femm_gpu_prepare._validate_constraint_boundaries(
-                constraints, {1: {0, 2}}, ["dirichlet", "periodic"]
+                constraints, {1: {(0, 2)}}, ["dirichlet", "periodic"]
             )
+
+    def test_periodic_pairs_cross_disconnected_boundary_sides(self):
+        constraints = [
+            {"node_a": 0, "node_b": 1, "relation": "periodic"},
+            {"node_a": 2, "node_b": 3, "relation": "periodic"},
+        ]
+        with self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "matching FEMM"):
+            femm_gpu_prepare._validate_constraint_boundaries(
+                constraints, {1: {(0, 1), (2, 3)}},
+                ["dirichlet", "periodic"],
+            )
+
+    def test_periodic_boundary_property_can_serve_multiple_side_pairs(self):
+        constraints = [
+            {"node_a": 0, "node_b": 2, "relation": "periodic"},
+            {"node_a": 1, "node_b": 3, "relation": "periodic"},
+            {"node_a": 4, "node_b": 6, "relation": "periodic"},
+            {"node_a": 5, "node_b": 7, "relation": "periodic"},
+        ]
+        femm_gpu_prepare._validate_constraint_boundaries(
+            constraints, {1: {(0, 1), (2, 3), (4, 5), (6, 7)}},
+            ["dirichlet", "periodic"],
+        )
+
+    def test_settings_are_case_insensitive_and_duplicates_are_rejected(self):
+        self.assertEqual(femm_gpu_prepare._setting(["[frequency] = 0"], "Frequency"), "0")
+        with self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "duplicate"):
+            femm_gpu_prepare._setting(
+                ["[Frequency] = 0", "[frequency] = 1"], "Frequency"
+            )
+
+    def test_stock_femm_microns_unit_alias_is_supported(self):
+        fixture = Path(__file__).parent / "fixtures" / "linear_square_v1" / "linear_square.fem"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "microns.fem"
+            source.write_text(
+                fixture.read_text(encoding="utf-8").replace(
+                    "[LengthUnits] =  meters", "[lengthunits] =  microns"
+                ),
+                encoding="utf-8",
+            )
+            _, scale, *_ = femm_gpu_prepare._parse_source(source)
+        self.assertEqual(scale, 0.001)
+
+    def test_stage_setup_failure_cleans_temporary_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            femm_root = root / "stock"
+            femm_root.mkdir()
+            (femm_root / "femm.exe").write_bytes(b"")
+            (femm_root / "triangle.exe").write_bytes(b"")
+            source = root / "source.fem"
+            source.write_text("source", encoding="ascii")
+            noop = root / "noop.exe"
+            noop.write_bytes(b"")
+            staging = tempfile.TemporaryDirectory()
+            staging_path = Path(staging.name)
+            with mock.patch.object(
+                    femm_gpu_prepare.tempfile, "TemporaryDirectory",
+                    return_value=staging), mock.patch.object(
+                    femm_gpu_prepare.shutil, "copytree",
+                    side_effect=OSError("injected copy failure")):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    femm_gpu_prepare._stage_and_mesh(source, femm_root, noop, 1)
+            self.assertFalse(staging_path.exists())
+
+    def test_prepare_rejects_source_changed_during_mesh_generation(self):
+        fixture = Path(__file__).parent / "fixtures" / "linear_square_v1" / "linear_square.fem"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.fem"
+            source.write_bytes(fixture.read_bytes())
+            output = root / "artifact.json"
+
+            def fake_stage(path, *_args):
+                staging = tempfile.TemporaryDirectory()
+                staged = Path(staging.name) / "model.fem"
+                staged.write_bytes(path.read_bytes())
+                path.write_bytes(path.read_bytes() + b"\nchanged\n")
+                return staging, staged.with_suffix("")
+
+            with mock.patch.object(femm_gpu_prepare, "_stage_and_mesh", side_effect=fake_stage), \
+                    self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "changed"):
+                femm_gpu_prepare.prepare(
+                    source, output, root / "stock", root / "noop.exe", 1, False
+                )
+            self.assertFalse(output.exists())
+
+    def test_prepare_rechecks_source_immediately_before_publication(self):
+        fixture = Path(__file__).parent / "fixtures" / "linear_square_v1" / "linear_square.fem"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.fem"
+            source.write_bytes(fixture.read_bytes())
+            output = root / "artifact.json"
+
+            def fake_stage(path, *_args):
+                staging = tempfile.TemporaryDirectory()
+                staged = Path(staging.name) / "model.fem"
+                staged.write_bytes(path.read_bytes())
+                return staging, staged.with_suffix("")
+
+            resolved = {"source_fem_sha256": femm_gpu_prepare._sha256(source)}
+            original_dump = femm_gpu_prepare.json.dump
+
+            def mutate_while_serializing(*args, **kwargs):
+                result = original_dump(*args, **kwargs)
+                source.write_bytes(source.read_bytes() + b"\nchanged\n")
+                return result
+
+            with mock.patch.object(femm_gpu_prepare, "_stage_and_mesh", side_effect=fake_stage), \
+                    mock.patch.object(femm_gpu_prepare, "_build_resolved", return_value=resolved), \
+                    mock.patch.object(femm_gpu_prepare.json, "dump", side_effect=mutate_while_serializing), \
+                    self.assertRaisesRegex(femm_gpu_prepare.PrepareError, "changed"):
+                femm_gpu_prepare.prepare(
+                    source, output, root / "stock", root / "noop.exe", 1, False
+                )
+            self.assertFalse(output.exists())
 
     def test_axisymmetric_artifact_adds_axis_nodes_to_zero_a_boundary(self):
         fixture = Path(__file__).parent / "fixtures" / "linear_square_v1" / "linear_square.fem"

@@ -24,6 +24,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include "axisymmetric_p1.h"
 #include "native_airgap_matrix.h"
 #include "signed_node_constraints.h"
@@ -2149,10 +2154,12 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
     for (const Node& node : model.nodes)
       radius_scale_m = std::max(radius_scale_m, node.x_m);
     const double axis_tolerance_m = 1e-12 * radius_scale_m;
-    for (size_t node = 0; node < model.nodes.size(); ++node)
+    for (size_t node = 0; node < model.nodes.size(); ++node) {
+      const int32_t root = dofs.node_root[node];
       if (model.nodes[node].x_m <= axis_tolerance_m
-          && !dofs.root_fixed[dofs.node_root[node]])
+          && (!dofs.root_fixed[root] || dofs.root_value[root] != 0.0))
         return Status::kBoundaryInvalid;
+    }
   }
   return Status::kOk;
 }
@@ -3451,6 +3458,7 @@ struct StrictJson {
   Type type = Type::kNull;
   bool boolean = false;
   double number = 0.0;
+  std::string number_text;
   std::string string;
   std::vector<StrictJson> array;
   std::map<std::string, StrictJson> object;
@@ -3617,8 +3625,9 @@ class StrictJsonParser {
         return false;
       }
     }
+    value->number_text = text_.substr(begin, position_ - begin);
     try {
-      value->number = std::stod(text_.substr(begin, position_ - begin));
+      value->number = std::stod(value->number_text);
     } catch (...) {
       *error = "JSON number conversion failed";
       return false;
@@ -3874,6 +3883,76 @@ std::string Sha256Hex(const std::string& bytes)
   return sha.FinalHex();
 }
 
+void AppendCanonicalJson(const StrictJson& value, std::string* output)
+{
+  switch (value.type) {
+  case StrictJson::Type::kNull:
+    output->append("null");
+    return;
+  case StrictJson::Type::kBool:
+    output->append(value.boolean ? "true" : "false");
+    return;
+  case StrictJson::Type::kNumber:
+    output->append(value.number_text);
+    return;
+  case StrictJson::Type::kString: {
+    static const char* hex = "0123456789abcdef";
+    output->push_back('"');
+    for (unsigned char character : value.string) {
+      switch (character) {
+      case '"': output->append("\\\""); break;
+      case '\\': output->append("\\\\"); break;
+      case '\b': output->append("\\b"); break;
+      case '\f': output->append("\\f"); break;
+      case '\n': output->append("\\n"); break;
+      case '\r': output->append("\\r"); break;
+      case '\t': output->append("\\t"); break;
+      default:
+        if (character < 0x20) {
+          output->append("\\u00");
+          output->push_back(hex[character >> 4]);
+          output->push_back(hex[character & 0x0f]);
+        } else {
+          output->push_back(static_cast<char>(character));
+        }
+      }
+    }
+    output->push_back('"');
+    return;
+  }
+  case StrictJson::Type::kArray:
+    output->push_back('[');
+    for (size_t index = 0; index < value.array.size(); ++index) {
+      if (index != 0)
+        output->push_back(',');
+      AppendCanonicalJson(value.array[index], output);
+    }
+    output->push_back(']');
+    return;
+  case StrictJson::Type::kObject:
+    output->push_back('{');
+    for (auto iterator = value.object.begin(); iterator != value.object.end(); ++iterator) {
+      if (iterator != value.object.begin())
+        output->push_back(',');
+      StrictJson key;
+      key.type = StrictJson::Type::kString;
+      key.string = iterator->first;
+      AppendCanonicalJson(key, output);
+      output->push_back(':');
+      AppendCanonicalJson(iterator->second, output);
+    }
+    output->push_back('}');
+    return;
+  }
+}
+
+std::string CanonicalJsonSha256(const StrictJson& value)
+{
+  std::string canonical;
+  AppendCanonicalJson(value, &canonical);
+  return Sha256Hex(canonical);
+}
+
 struct GpuFemmMeshArtifact {
   NonlinearModel model;
   std::vector<double> circuit_currents_a;
@@ -3942,6 +4021,10 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
                           "outer_dirichlet", "air_gap_elements" }, error)))) {
     if (error->empty())
       *error = "invalid GPU FEMM mesh artifact header";
+    return false;
+  }
+  if (neutral_schema && CanonicalJsonSha256(*resolved) != identity->string) {
+    *error = "canonical artifact identity mismatch";
     return false;
   }
   const StrictJson* resolved_sha = JsonMember(*resolved, "source_fem_sha256", StrictJson::Type::kString, error);
@@ -6211,7 +6294,12 @@ bool PlanarDcRequestMatchesArtifact(const PlanarDcSampleRequest& request,
   // periodic reduction and cylindrical operators are not yet implemented in
   // the legacy weighted-stress/air-gap postprocessors.
   if (generic_request)
-    return !needs_postprocess && request.sliding_band_angle_deg == 0.0;
+    return !needs_postprocess
+        && request.force_group_number == -1
+        && request.stress_air_group_number == -1
+        && request.airgap_radius_mm == 0.0
+        && request.airgap_angles_deg.empty()
+        && request.sliding_band_angle_deg == 0.0;
   if (!artifact.has_sliding_band) {
     // A conforming artifact is already posed.  Rotation is only meaningful
     // for a native sliding-band artifact, and weighted-stress postprocessing
@@ -6365,7 +6453,43 @@ bool WritePlanarDcSampleResponse(const std::string& path, Status status,
   return static_cast<bool>(output);
 }
 
-int PlanarDcSingleSampleAdapter(const std::string& request_path,
+std::string CanonicalArtifactPathKey(const std::string& path)
+{
+  std::error_code error;
+  const std::filesystem::path resolved = std::filesystem::weakly_canonical(
+      std::filesystem::path(path), error);
+  std::string key = error ? path : resolved.generic_string();
+#ifdef _WIN32
+  std::transform(key.begin(), key.end(), key.begin(),
+      [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+#endif
+  return key;
+}
+
+bool SameFilesystemObject(const std::string& first, const std::string& second)
+{
+  std::error_code error;
+  if (std::filesystem::exists(first, error) && !error
+      && std::filesystem::exists(second, error) && !error
+      && std::filesystem::equivalent(first, second, error) && !error)
+    return true;
+  return CanonicalArtifactPathKey(first) == CanonicalArtifactPathKey(second);
+}
+
+bool AtomicReplaceFile(const std::filesystem::path& source,
+    const std::filesystem::path& destination)
+{
+#ifdef _WIN32
+  return MoveFileExW(source.c_str(), destination.c_str(),
+      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+  std::error_code error;
+  std::filesystem::rename(source, destination, error);
+  return !error;
+#endif
+}
+
+int PlanarDcSingleSampleAdapterDirect(const std::string& request_path,
     const std::string& response_path)
 {
   std::ifstream request_file(request_path);
@@ -6452,6 +6576,43 @@ int PlanarDcSingleSampleAdapter(const std::string& request_path,
     return 1;
   }
   return 0;
+}
+
+int PlanarDcSingleSampleAdapter(const std::string& request_path,
+    const std::string& response_path)
+{
+  if (SameFilesystemObject(request_path, response_path)) {
+    std::cerr << "FAIL magnetostatic solve: response must not overwrite request\n";
+    return 1;
+  }
+
+  std::ifstream request_file(request_path);
+  std::stringstream request_bytes;
+  request_bytes << request_file.rdbuf();
+  PlanarDcSampleRequest request;
+  std::string parse_error;
+  if (request_file
+      && ReadPlanarDcSampleRequestJson(request_bytes.str(), &request, &parse_error)
+      && SameFilesystemObject(request.mesh_artifact_path, response_path)) {
+    std::cerr << "FAIL magnetostatic solve: response must not overwrite mesh artifact\n";
+    return 1;
+  }
+
+  static std::atomic<uint64_t> sequence { 0 };
+  std::filesystem::path temporary(response_path);
+  temporary += ".tmp."
+      + std::to_string(ProfileClock::now().time_since_epoch().count()) + "."
+      + std::to_string(sequence.fetch_add(1));
+  const int result = PlanarDcSingleSampleAdapterDirect(
+      request_path, temporary.string());
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(temporary, error)
+      || !AtomicReplaceFile(temporary, std::filesystem::path(response_path))) {
+    std::filesystem::remove(temporary, error);
+    std::cerr << "FAIL magnetostatic solve: could not atomically publish response\n";
+    return 1;
+  }
+  return result;
 }
 
 // Phase 4 keeps the existing single-sample request as the item identity.  The
@@ -6555,18 +6716,6 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
 // identity, rather than to the spelling used by an individual request.  The
 // original request path is retained as the read path so failed opens preserve
 // the established per-request INPUT_IO behavior.
-std::string CanonicalArtifactPathKey(const std::string& path)
-{
-  std::error_code error;
-  const std::filesystem::path resolved = std::filesystem::weakly_canonical(std::filesystem::path(path), error);
-  std::string key = error ? path : resolved.generic_string();
-#ifdef _WIN32
-  std::transform(key.begin(), key.end(), key.begin(),
-      [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-#endif
-  return key;
-}
-
 struct MotorBatchArtifactLoadPlan {
   std::vector<std::string> canonical_paths;
   std::vector<std::string> representative_paths;
@@ -7389,6 +7538,27 @@ int SelfTest()
   const size_t motor_pose_at = neutral_mesh_artifact.find(motor_pose_field);
   if (motor_pose_at != std::string::npos)
     neutral_mesh_artifact.erase(motor_pose_at, motor_pose_field.size());
+  const auto rebind_neutral_identity = [](std::string* document) {
+    StrictJson root;
+    std::string error;
+    StrictJsonParser parser(*document);
+    if (!parser.Parse(&root, &error))
+      return false;
+    const StrictJson* identity = JsonMember(
+        root, "canonical_identity_sha256", StrictJson::Type::kString, &error);
+    const StrictJson* resolved = JsonMember(
+        root, "resolved", StrictJson::Type::kObject, &error);
+    if (identity == nullptr || resolved == nullptr)
+      return false;
+    const std::string replacement = CanonicalJsonSha256(*resolved);
+    const size_t position = document->find(identity->string);
+    if (position == std::string::npos)
+      return false;
+    document->replace(position, identity->string.size(), replacement);
+    return true;
+  };
+  expect(rebind_neutral_identity(&neutral_mesh_artifact),
+      "self-test neutral artifact identity is rebound");
   GpuFemmMeshArtifact neutral_artifact;
   expect(ParseGpuFemmMeshArtifactJson(neutral_mesh_artifact, &neutral_artifact,
              &parser_error)
@@ -7410,6 +7580,8 @@ int SelfTest()
   const std::string two_circuits =
       "\"circuits\":[{\"index\":0,\"name\":\"coil_00\",\"type\":\"series\",\"current_A\":2},{\"index\":1,\"name\":\"coil_01\",\"type\":\"series\",\"current_A\":-2}]";
   replace_all(&pm_only_artifact, two_circuits, "\"circuits\":[]");
+  expect(rebind_neutral_identity(&pm_only_artifact),
+      "self-test PM-only artifact identity is rebound");
   GpuFemmMeshArtifact pm_only_parsed;
   expect(ParseGpuFemmMeshArtifactJson(pm_only_artifact, &pm_only_parsed,
              &parser_error)
@@ -7559,12 +7731,33 @@ int SelfTest()
       "gpu_femm_magnetostatic_mesh_v1");
   replace_all(&generic_mesh_artifact, v1_boundary,
       v1_boundary + ",\"node_constraints\":[{\"node_a\":0,\"node_b\":1,\"relation\":\"periodic\"}]");
+  expect(rebind_neutral_identity(&generic_mesh_artifact),
+      "self-test generic artifact identity is rebound");
+  StrictJson generic_document;
+  StrictJsonParser generic_document_parser(generic_mesh_artifact);
+  std::string generic_document_error;
+  expect(generic_document_parser.Parse(&generic_document, &generic_document_error),
+      "self-test rebound generic document parses");
+  const StrictJson* generic_identity_value = JsonMember(generic_document,
+      "canonical_identity_sha256", StrictJson::Type::kString, &generic_document_error);
+  const std::string generic_identity = generic_identity_value == nullptr
+      ? std::string() : generic_identity_value->string;
   GpuFemmMeshArtifact generic_artifact;
   expect(ParseGpuFemmMeshArtifactJson(generic_mesh_artifact,
              &generic_artifact, &parser_error)
           && generic_artifact.model.node_constraints.size() == 1
           && generic_artifact.model.node_constraints[0].sign == 1,
       std::string("generic periodic artifact parser: ") + parser_error);
+  std::string corrupted_generic_artifact = generic_mesh_artifact;
+  if (!generic_identity.empty()) {
+    const size_t identity_at = corrupted_generic_artifact.find(generic_identity);
+    if (identity_at != std::string::npos)
+      corrupted_generic_artifact[identity_at] = generic_identity[0] == '0' ? '1' : '0';
+  }
+  GpuFemmMeshArtifact rejected_generic_artifact;
+  expect(!ParseGpuFemmMeshArtifactJson(corrupted_generic_artifact,
+             &rejected_generic_artifact, &parser_error),
+      "generic artifact rejects a corrupted canonical identity");
   std::string generic_request_json = planar_request_json;
   replace_all(&generic_request_json, "gpu_femm_planar_dc_sample_v1",
       "gpu_femm_magnetostatic_sample_v1");
@@ -7576,6 +7769,19 @@ int SelfTest()
   generic_request.compute_force_torque = true;
   expect(!PlanarDcRequestMatchesArtifact(generic_request, generic_artifact),
       "generic request rejects legacy force/air-gap postprocessing");
+  generic_request.compute_force_torque = false;
+  generic_request.force_group_number = 20;
+  expect(!PlanarDcRequestMatchesArtifact(generic_request, generic_artifact),
+      "generic request rejects dormant legacy group controls");
+  generic_request.force_group_number = -1;
+  generic_request.airgap_radius_mm = 1.0;
+  expect(!PlanarDcRequestMatchesArtifact(generic_request, generic_artifact),
+      "generic request rejects a dormant legacy air-gap radius");
+  NonlinearModel invalid_axis_boundary = neutral_artifact.model;
+  invalid_axis_boundary.problem_type = MagneticProblemType::kAxisymmetric;
+  invalid_axis_boundary.dirichlet_a_wb_per_m[0] = 1.0;
+  expect(ValidateNonlinearModel(invalid_axis_boundary) == Status::kBoundaryInvalid,
+      "axisymmetric models require a zero potential on the symmetry axis");
   MotorSampleRequest sliding_request = parsed_request;
   sliding_request.rotor_angle_deg = 3.0;
   sliding_request.displacement_mm[0] = 0.0;
@@ -8502,6 +8708,10 @@ int main(int argc, char** argv)
     return gpu_femm::SingleSampleAdapter(argv[2], argv[3]);
   }
   if (argc == 4 && std::string(argv[1]) == "--solve") {
+    if (gpu_femm::SameFilesystemObject(argv[0], argv[3])) {
+      std::cerr << "FAIL magnetostatic solve: response must not overwrite solver executable\n";
+      return 1;
+    }
     return gpu_femm::PlanarDcSingleSampleAdapter(argv[2], argv[3]);
   }
   if (argc == 4 && std::string(argv[1]) == "--motor-single-sample") {

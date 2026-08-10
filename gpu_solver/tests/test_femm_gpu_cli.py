@@ -183,6 +183,25 @@ class FemmGpuCliTests(unittest.TestCase):
             )
         self.assertEqual(validated["field_components"], ["Br", "Bz"])
 
+    def test_generic_solve_rejects_all_legacy_postprocess_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "mesh.json"
+            output = root / "response.json"
+            self._write_artifact(artifact, femm_gpu.GENERIC_ARTIFACT_SCHEMA)
+            mutations = (
+                ("force_group", 1),
+                ("air_group", 2),
+                ("airgap_radius_mm", 1.0),
+            )
+            for field, value in mutations:
+                args = self._solve_args(artifact, output)
+                setattr(args, field, value)
+                with self.subTest(field=field), mock.patch.object(
+                        femm_gpu, "require_solver", return_value=Path("fake")), \
+                        self.assertRaisesRegex(ValueError, "do not support"):
+                    femm_gpu.command_solve(args)
+
     def _assert_frozen_generic_reference(
             self, fixture_name, problem_type, max_potential_l2, max_flux_relative):
         root = Path(__file__).parent / "fixtures" / f"{fixture_name}_v1"
@@ -283,6 +302,40 @@ class FemmGpuCliTests(unittest.TestCase):
         self.assertEqual(document["status"], "FAIL")
         self.assertEqual(document["solve_status"], "INVALID_ARGUMENT")
         self.assertTrue(document["error_message"])
+
+    @unittest.skipIf(SOLVER is None, "solver executable was not supplied")
+    def test_direct_solver_never_overwrites_request_or_artifact(self):
+        fixture = (Path(__file__).parent / "fixtures" / "periodic_strip_v1"
+                   / "periodic_strip.gpu.json")
+        summary = {}
+        for line in (fixture.parent / "periodic_strip.summary.txt").read_text(
+                encoding="utf-8").splitlines():
+            key, value = line.split("=", 1)
+            summary[key] = float(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.json"
+            artifact.write_bytes(fixture.read_bytes())
+            request = root / "request.json"
+            request.write_text(json.dumps(femm_gpu.make_request(
+                artifact, [summary["circuit_current_A"]]
+            )), encoding="utf-8")
+            request_before = request.read_bytes()
+            artifact_before = artifact.read_bytes()
+
+            request_collision = subprocess.run(
+                [str(SOLVER), "--solve", str(request), str(request)],
+                check=False, capture_output=True, text=True,
+            )
+            artifact_collision = subprocess.run(
+                [str(SOLVER), "--solve", str(request), str(artifact)],
+                check=False, capture_output=True, text=True,
+            )
+
+            self.assertNotEqual(request_collision.returncode, 0)
+            self.assertNotEqual(artifact_collision.returncode, 0)
+            self.assertEqual(request.read_bytes(), request_before)
+            self.assertEqual(artifact.read_bytes(), artifact_before)
 
 
 if __name__ == "__main__":

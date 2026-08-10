@@ -44,7 +44,10 @@ The preparer stages a private FEMM runtime, invokes Triangle with the no-op
 solver, validates every resolved material/region/boundary, and writes the JSON
 atomically. Output paths inside the stock FEMM installation or equal to the
 input model are rejected, even with `--overwrite`. It never replaces the
-installed `fkn.exe`. The exact artifact contract is in
+installed `fkn.exe`. The input is fingerprinted before meshing, parsed from
+the staged copy, and checked again immediately before publication. The solver
+recomputes the canonical identity for project-neutral artifacts instead of
+trusting the stored value. The exact artifact contract is in
 [`schemas/gpu_femm_planar_dc_mesh_v1.schema.json`](schemas/gpu_femm_planar_dc_mesh_v1.schema.json).
 
 ## `gpu_femm_planar_dc_sample_v1`
@@ -83,6 +86,9 @@ mesh counts, and requested full-field arrays remain in the response.
 The Python frontend validates the protocol, artifact hash, status fields, and
 array sizes in a temporary response before atomically publishing it. A missing
 or malformed solver response leaves any existing output file unchanged.
+Direct `gpu_linear_p1_poc.exe --solve` calls also publish through a sibling
+temporary file and reject response paths that alias the request, artifact, or
+solver executable.
 
 The exact request schema is in
 [`schemas/gpu_femm_planar_dc_sample_v1.schema.json`](schemas/gpu_femm_planar_dc_sample_v1.schema.json).
@@ -108,6 +114,8 @@ in Wb. Internally, the solver uses conventional P1 A-phi interpolation and a
 seven-point triangle quadrature. Matrix assembly runs on the host; the reduced
 FP64 system is solved by the existing CUDA CSR PCG backend. General periodic
 constraints use a signed degree-of-freedom map and exact `T^T K T` reduction.
+The preparer binds each generated `.pbc` pair to a matching FEMM boundary
+property and checks disconnected boundary-side topology when it is available.
 
 The generic protocol intentionally rejects force/torque, radial air-gap
 sampling, and sliding-band rotation. Those postprocessors currently assume
@@ -289,6 +297,10 @@ output failure. The JSON `solve_status` uses these stable names:
 - `periodic_strip_v1`: general periodic-node reduction against stock FEMM
 - `antiperiodic_strip_v1`: signed anti-periodic reduction against stock FEMM
 - `axisymmetric_coil_v1`: axisymmetric potential and flux against stock FEMM
+
+The axisymmetric frozen reference is a linear coil case. Permanent-magnet and
+nonlinear axisymmetric models are accepted by the same material path but do
+not yet have separate stock-FEMM parity fixtures.
 
 The solver and numerical reference tests execute CUDA kernels. The preparer
 parser and mesh no-op helper tests do not require a GPU.

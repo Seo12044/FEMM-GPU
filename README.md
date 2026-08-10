@@ -178,6 +178,8 @@ and
 [`gpu_femm_magnetostatic_sample_v1`](gpu_solver/schemas/gpu_femm_magnetostatic_sample_v1.schema.json).
 Applications in C++, Python, MATLAB, or another language may invoke
 `femm_gpu.exe --solve request.json response.json` directly.
+Direct solves publish responses atomically and refuse request, artifact, or
+solver-executable path collisions.
 
 FEMM model editing remains a separate step. Unsupported features are rejected
 rather than approximated.
