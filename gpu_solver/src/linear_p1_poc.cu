@@ -2480,19 +2480,35 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
 // numeric CSR values/diagonal/RHS directly into GpuCsrSolver's batch buffers.
 // Host Newton state updates intentionally remain below; this keeps the new
 // path narrow and makes the existing host assembler an exact fallback.
+// One representation covers the planar one-point operator and the
+// axisymmetric seven-point operator.  Geometry is precomputed on the host
+// once; Newton iterations only evaluate material state and write numbers.
 struct DeviceNonlinearTriangle {
   int32_t node[3];
-  double area_m2;
-  double b_x[3];
-  double b_y[3];
+  int32_t quadrature_count;
+  double weight[7];
+  double b_x[7][3];
+  double b_y[7][3];
+  double shape[7][3];
   double reluctivity_zero;
   double alpha;
   int32_t curve_offset;
   int32_t curve_count;
   double cold_secant;
   int32_t circuit_index;
-  double coil;
-  double pm[3];
+};
+
+struct DeviceMatrixContributor {
+  int32_t triangle;
+  int8_t local_row;
+  int8_t local_column;
+  int8_t sign;
+};
+
+struct DeviceRhsContributor {
+  int32_t triangle;
+  int8_t local_row;
+  int8_t sign;
 };
 
 __device__ bool DeviceBhEvaluation(const DeviceNonlinearTriangle& triangle,
@@ -2543,47 +2559,51 @@ __global__ void DeviceNonlinearElementKernel(const DeviceNonlinearTriangle* tria
     size_t triangle_count, const double* old_a, size_t node_count,
     const double* curve_b, const double* curve_h, const double* curve_slope,
     bool use_newton, double* bx_values, double* by_values, double* nu_values,
-    double* derivative_values, int* valid)
+    double* derivative_values, size_t quadrature_stride, int* valid)
 {
   const size_t triangle = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t item = blockIdx.y;
   if (triangle >= triangle_count)
     return;
-  const DeviceNonlinearTriangle properties = triangles[triangle];
+  const DeviceNonlinearTriangle* properties = triangles + triangle;
   const double* a = old_a + item * node_count;
-  double bx = 0.0, by = 0.0;
-  for (int local = 0; local < 3; ++local) {
-    bx += a[properties.node[local]] * properties.b_x[local];
-    by += a[properties.node[local]] * properties.b_y[local];
+  for (int point = 0; point < properties->quadrature_count; ++point) {
+    double bx = 0.0, by = 0.0;
+    for (int local = 0; local < 3; ++local) {
+      bx += a[properties->node[local]] * properties->b_x[point][local];
+      by += a[properties->node[local]] * properties->b_y[point][local];
+    }
+    const double magnitude = hypot(bx, by);
+    double nu = 0.0, derivative = 0.0;
+    bool ok = isfinite(magnitude);
+    if (ok && properties->curve_count >= 0) {
+      if (!use_newton) {
+        nu = properties->cold_secant;
+        derivative = 0.0;
+      } else
+        ok = DeviceBhEvaluation(*properties, curve_b, curve_h, curve_slope,
+            magnitude, &nu, &derivative);
+    } else if (ok) {
+      nu = properties->reluctivity_zero
+          * (1.0 + properties->alpha * magnitude * magnitude);
+      derivative = use_newton
+          ? properties->reluctivity_zero * properties->alpha : 0.0;
+    }
+    const size_t index = (item * triangle_count + triangle) * quadrature_stride + point;
+    bx_values[index] = bx;
+    by_values[index] = by;
+    nu_values[index] = nu;
+    derivative_values[index] = derivative;
+    if (!ok || !(nu > 0.0) || !isfinite(derivative))
+      atomicExch(valid, 0);
   }
-  const double magnitude = hypot(bx, by);
-  double nu = 0.0, derivative = 0.0;
-  bool ok = isfinite(magnitude);
-  if (ok && properties.curve_count >= 0) {
-    if (!use_newton) {
-      nu = properties.cold_secant;
-      derivative = 0.0;
-    } else
-      ok = DeviceBhEvaluation(properties, curve_b, curve_h, curve_slope,
-          magnitude, &nu, &derivative);
-  } else if (ok) {
-    nu = properties.reluctivity_zero * (1.0 + properties.alpha * magnitude * magnitude);
-    derivative = use_newton ? properties.reluctivity_zero * properties.alpha : 0.0;
-  }
-  const size_t index = item * triangle_count + triangle;
-  bx_values[index] = bx;
-  by_values[index] = by;
-  nu_values[index] = nu;
-  derivative_values[index] = derivative;
-  if (!ok || !(nu > 0.0) || !isfinite(derivative))
-    atomicExch(valid, 0);
 }
 
 __global__ void DeviceNonlinearValuesKernel(const DeviceNonlinearTriangle* triangles,
-    const int32_t* contributor_offsets, const int32_t* contributors, size_t nnz,
+    const int32_t* contributor_offsets, const DeviceMatrixContributor* contributors, size_t nnz,
     const double* base_values, const double* bx_values, const double* by_values,
     const double* nu_values, const double* derivative_values, size_t triangle_count,
-    bool use_newton, double* values)
+    size_t quadrature_stride, bool use_newton, double* values)
 {
   const size_t slot = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t item = blockIdx.y;
@@ -2594,21 +2614,22 @@ __global__ void DeviceNonlinearValuesKernel(const DeviceNonlinearTriangle* trian
   // The contributor list is fixed in host element/i/j emission order. One
   // lane owns a slot, so no atomic or schedule-dependent reduction is used.
   for (int32_t position = contributor_offsets[slot]; position < contributor_offsets[slot + 1]; ++position) {
-    const int32_t encoded = contributors[position];
-    const size_t triangle_index = static_cast<size_t>(encoded / 9);
-    const int local_i = (encoded % 9) / 3, local_j = encoded % 3;
-    const DeviceNonlinearTriangle triangle = triangles[triangle_index];
-    const double bx = bx_values[element_base + triangle_index];
-    const double by = by_values[element_base + triangle_index];
-    const double gradient = triangle.b_x[local_i] * triangle.b_x[local_j]
-        + triangle.b_y[local_i] * triangle.b_y[local_j];
-    const double k = triangle.area_m2 * nu_values[element_base + triangle_index] * gradient;
-    const double c = use_newton ? 2.0 * triangle.area_m2
-            * derivative_values[element_base + triangle_index]
-            * (bx * triangle.b_x[local_i] + by * triangle.b_y[local_i])
-            * (bx * triangle.b_x[local_j] + by * triangle.b_y[local_j])
-                                : 0.0;
-    sum += k + c;
+    const DeviceMatrixContributor contributor = contributors[position];
+    const size_t triangle_index = static_cast<size_t>(contributor.triangle);
+    const int local_i = contributor.local_row, local_j = contributor.local_column;
+    const DeviceNonlinearTriangle* triangle = triangles + triangle_index;
+    for (int point = 0; point < triangle->quadrature_count; ++point) {
+      const size_t index = (element_base + triangle_index) * quadrature_stride + point;
+      const double bx = bx_values[index], by = by_values[index];
+      const double gradient = triangle->b_x[point][local_i] * triangle->b_x[point][local_j]
+          + triangle->b_y[point][local_i] * triangle->b_y[point][local_j];
+      const double k = triangle->weight[point] * nu_values[index] * gradient;
+      const double b_i = bx * triangle->b_x[point][local_i] + by * triangle->b_y[point][local_i];
+      const double b_j = bx * triangle->b_x[point][local_j] + by * triangle->b_y[point][local_j];
+      const double c = use_newton ? 2.0 * triangle->weight[point]
+              * derivative_values[index] * b_i * b_j : 0.0;
+      sum += static_cast<double>(contributor.sign) * (k + c);
+    }
   }
   // Host assembly emits every triangle before AGE contributions.  Preserve
   // that phase ordering even though the fixed AGE terms are pre-accumulated.
@@ -2617,12 +2638,12 @@ __global__ void DeviceNonlinearValuesKernel(const DeviceNonlinearTriangle* trian
 }
 
 __global__ void DeviceNonlinearRhsKernel(const DeviceNonlinearTriangle* triangles,
-    const int32_t* contributor_offsets, const int32_t* contributors, size_t free_count,
+    const int32_t* contributor_offsets, const DeviceRhsContributor* contributors, size_t free_count,
     const double* pm_rhs, const double* circuit_rhs, int circuit_count,
     const double* currents, const double* age_rhs, const double* old_a,
     const double* boundary_values, const double* bx_values, const double* by_values,
     const double* nu_values, const double* derivative_values, size_t triangle_count,
-    size_t node_count, bool use_newton, double* rhs)
+    size_t quadrature_stride, size_t node_count, bool use_newton, double* rhs)
 {
   const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t item = blockIdx.y;
@@ -2634,26 +2655,27 @@ __global__ void DeviceNonlinearRhsKernel(const DeviceNonlinearTriangle* triangle
         * circuit_rhs[static_cast<size_t>(circuit) * free_count + row];
   const size_t element_base = item * triangle_count;
   for (int32_t position = contributor_offsets[row]; position < contributor_offsets[row + 1]; ++position) {
-    const int32_t encoded = contributors[position];
-    const size_t triangle_index = static_cast<size_t>(encoded / 3);
-    const int local_i = encoded % 3;
-    const DeviceNonlinearTriangle triangle = triangles[triangle_index];
-    const double bx = bx_values[element_base + triangle_index];
-    const double by = by_values[element_base + triangle_index];
-    for (int local_j = 0; local_j < 3; ++local_j) {
-      const double b_i = bx * triangle.b_x[local_i] + by * triangle.b_y[local_i];
-      const double b_j = bx * triangle.b_x[local_j] + by * triangle.b_y[local_j];
-      const double k = triangle.area_m2 * nu_values[element_base + triangle_index]
-          * (triangle.b_x[local_i] * triangle.b_x[local_j]
-              + triangle.b_y[local_i] * triangle.b_y[local_j]);
-      const double c = use_newton ? 2.0 * triangle.area_m2
-              * derivative_values[element_base + triangle_index] * b_i * b_j
-                                  : 0.0;
-      const int32_t node = triangle.node[local_j];
-      if (use_newton)
-        sum += c * old_a[item * node_count + node];
-      if (boundary_values[node] != 0.0)
-        sum -= (k + c) * boundary_values[node];
+    const DeviceRhsContributor contributor = contributors[position];
+    const size_t triangle_index = static_cast<size_t>(contributor.triangle);
+    const int local_i = contributor.local_row;
+    const DeviceNonlinearTriangle* triangle = triangles + triangle_index;
+    for (int point = 0; point < triangle->quadrature_count; ++point) {
+      const size_t index = (element_base + triangle_index) * quadrature_stride + point;
+      const double bx = bx_values[index], by = by_values[index];
+      const double b_i = bx * triangle->b_x[point][local_i] + by * triangle->b_y[point][local_i];
+      for (int local_j = 0; local_j < 3; ++local_j) {
+        const double b_j = bx * triangle->b_x[point][local_j] + by * triangle->b_y[point][local_j];
+        const double k = triangle->weight[point] * nu_values[index]
+            * (triangle->b_x[point][local_i] * triangle->b_x[point][local_j]
+                + triangle->b_y[point][local_i] * triangle->b_y[point][local_j]);
+        const double c = use_newton ? 2.0 * triangle->weight[point]
+                * derivative_values[index] * b_i * b_j : 0.0;
+        const int32_t node = triangle->node[local_j];
+        if (use_newton)
+          sum += static_cast<double>(contributor.sign) * c * old_a[item * node_count + node];
+        if (boundary_values[node] != 0.0)
+          sum -= static_cast<double>(contributor.sign) * (k + c) * boundary_values[node];
+      }
     }
   }
   rhs[item * free_count + row] = sum;
@@ -2686,28 +2708,31 @@ class DeviceNonlinearAssemblyPlan {
   {
     if (ValidateNonlinearModel(model) != Status::kOk)
       return Status::kInvalidArgument;
-    if (model.problem_type != MagneticProblemType::kPlanar
-        || !model.node_constraints.empty())
-      return Status::kUnsupportedFeature;
     node_count_ = model.nodes.size();
     circuit_count_ = model.circuit_count;
+    quadrature_stride_ = model.problem_type == MagneticProblemType::kPlanar ? 1 : 7;
+    SignedDofMap dofs;
+    if (BuildSignedDofMap(node_count_, model.node_constraints,
+            model.dirichlet_nodes, model.dirichlet_a_wb_per_m, &dofs)
+        != SignedDofStatus::kOk)
+      return Status::kBoundaryInvalid;
+    std::vector<int32_t> node_to_free(node_count_, -1);
+    std::vector<int8_t> node_sign = dofs.node_sign;
     std::vector<bool> boundary(node_count_, false);
     std::vector<double> boundary_values(node_count_, 0.0);
-    for (size_t index = 0; index < model.dirichlet_nodes.size(); ++index) {
-      boundary[model.dirichlet_nodes[index]] = true;
-      boundary_values[model.dirichlet_nodes[index]] = model.dirichlet_a_wb_per_m[index];
+    for (size_t node = 0; node < node_count_; ++node) {
+      const int32_t root = dofs.node_root[node];
+      node_to_free[node] = dofs.root_to_free[root];
+      boundary[node] = node_to_free[node] < 0;
+      if (boundary[node])
+        boundary_values[node] = static_cast<double>(node_sign[node])
+            * dofs.root_value[root];
     }
-    std::vector<int32_t> free_index(node_count_, -1), free_nodes;
-    for (size_t node = 0; node < node_count_; ++node)
-      if (!boundary[node]) {
-        free_index[node] = static_cast<int32_t>(free_nodes.size());
-        free_nodes.push_back(static_cast<int32_t>(node));
-      }
-    free_count_ = free_nodes.size();
+    free_count_ = dofs.free_roots.size();
     std::vector<std::map<int32_t, int32_t>> structural(free_count_);
-    const auto add_structure = [&structural, &free_index](int32_t row, int32_t column) {
-      if (free_index[row] >= 0 && free_index[column] >= 0)
-        structural[free_index[row]][free_index[column]] = -1;
+    const auto add_structure = [&structural, &node_to_free](int32_t row, int32_t column) {
+      if (node_to_free[row] >= 0 && node_to_free[column] >= 0)
+        structural[node_to_free[row]][node_to_free[column]] = -1;
     };
     for (const NonlinearTriangle& triangle : model.triangles)
       for (int i = 0; i < 3; ++i)
@@ -2724,8 +2749,10 @@ class DeviceNonlinearAssemblyPlan {
       }
     }
     Assembly symbolic;
-    symbolic.free_nodes = free_nodes;
+    symbolic.free_nodes = dofs.free_roots;
     symbolic.boundary_values = boundary_values;
+    symbolic.node_to_free = node_to_free;
+    symbolic.node_sign = node_sign;
     symbolic.row_offsets.assign(free_count_ + 1, 0);
     std::vector<int32_t> diagonal_slots(free_count_, -1);
     for (size_t row = 0; row < free_count_; ++row) {
@@ -2746,7 +2773,8 @@ class DeviceNonlinearAssemblyPlan {
     symbolic.rhs_per_amp.assign(free_count_, 0.0);
     symbolic.rhs_offset.assign(free_count_, 0.0);
     nnz_ = symbolic.values.size();
-    std::vector<std::vector<int32_t>> contributors(nnz_), rhs_contributors(free_count_);
+    std::vector<std::vector<DeviceMatrixContributor>> contributors(nnz_);
+    std::vector<std::vector<DeviceRhsContributor>> rhs_contributors(free_count_);
     std::vector<DeviceNonlinearTriangle> triangles;
     triangles.reserve(model.triangles.size());
     std::vector<double> pm_rhs(free_count_, 0.0), circuit_rhs(static_cast<size_t>(circuit_count_) * free_count_, 0.0);
@@ -2763,34 +2791,65 @@ class DeviceNonlinearAssemblyPlan {
       const NonlinearTriangle& triangle = model.triangles[element];
       const NonlinearMaterial& material = model.materials[triangle.material];
       Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
-      NonlinearElementTerms terms;
-      if (!BuildElementTerms(p, &terms))
-        return Status::kMeshInvalid;
       DeviceNonlinearTriangle device {};
-      device.area_m2 = terms.area_m2;
       device.reluctivity_zero = material.reluctivity_zero_m_per_h;
       device.alpha = material.alpha_per_t2;
       device.curve_offset = material.bh_curve_index >= 0 ? curve_offsets[material.bh_curve_index] : -1;
       device.curve_count = material.bh_curve_index >= 0 ? curve_counts[material.bh_curve_index] : -1;
       device.cold_secant = material.bh_curve_index >= 0 ? model.bh_curves[material.bh_curve_index].cold_secant_reluctivity_m_per_h : 0.0;
       device.circuit_index = material.circuit_index;
-      device.coil = terms.area_m2 * material.source_j_per_a / 3.0;
       const double theta = material.magnetization_deg * 3.141592653589793238462643383279502884 / 180.0, hcx = material.h_c_a_per_m * std::cos(theta), hcy = material.h_c_a_per_m * std::sin(theta);
+      if (model.problem_type == MagneticProblemType::kPlanar) {
+        NonlinearElementTerms terms;
+        if (!BuildElementTerms(p, &terms))
+          return Status::kMeshInvalid;
+        device.quadrature_count = 1;
+        device.weight[0] = terms.area_m2;
+        for (int local = 0; local < 3; ++local) {
+          device.b_x[0][local] = terms.b_x[local];
+          device.b_y[0][local] = terms.b_y[local];
+          device.shape[0][local] = 1.0 / 3.0;
+        }
+      } else {
+        const double radius[3] = { p[0].x_m, p[1].x_m, p[2].x_m };
+        const double axial[3] = { p[0].y_m, p[1].y_m, p[2].y_m };
+        AxisymmetricP1Element axisymmetric;
+        if (!BuildAxisymmetricP1Element(radius, axial, &axisymmetric))
+          return Status::kMeshInvalid;
+        device.quadrature_count = static_cast<int32_t>(axisymmetric.points.size());
+        constexpr double kTwoPi = 6.283185307179586476925286766559005768;
+        for (int point = 0; point < device.quadrature_count; ++point) {
+          const AxisymmetricP1Point& source = axisymmetric.points[point];
+          device.weight[point] = kTwoPi * source.radius_m * source.weight_area_m2;
+          for (int local = 0; local < 3; ++local) {
+            device.b_x[point][local] = source.br_basis_per_m[local];
+            device.b_y[point][local] = source.bz_basis_per_m[local];
+            device.shape[point][local] = source.shape[local];
+          }
+        }
+      }
       for (int i = 0; i < 3; ++i) {
         device.node[i] = triangle.node[i];
-        device.b_x[i] = terms.b_x[i];
-        device.b_y[i] = terms.b_y[i];
-        device.pm[i] = terms.area_m2 * (hcx * terms.b_x[i] + hcy * terms.b_y[i]);
-        const int32_t row = free_index[triangle.node[i]];
+        double pm = 0.0, coil = 0.0;
+        for (int point = 0; point < device.quadrature_count; ++point) {
+          pm += device.weight[point] * (hcx * device.b_x[point][i]
+              + hcy * device.b_y[point][i]);
+          coil += device.weight[point] * material.source_j_per_a * device.shape[point][i];
+        }
+        const int32_t row = node_to_free[triangle.node[i]];
         if (row >= 0) {
-          rhs_contributors[row].push_back(static_cast<int32_t>(element * 3 + i));
-          pm_rhs[row] += device.pm[i];
+          rhs_contributors[row].push_back({ static_cast<int32_t>(element),
+              static_cast<int8_t>(i), node_sign[triangle.node[i]] });
+          pm_rhs[row] += static_cast<double>(node_sign[triangle.node[i]]) * pm;
           if (device.circuit_index >= 0)
-            circuit_rhs[static_cast<size_t>(device.circuit_index) * free_count_ + row] += device.coil;
+            circuit_rhs[static_cast<size_t>(device.circuit_index) * free_count_ + row]
+                += static_cast<double>(node_sign[triangle.node[i]]) * coil;
         }
         for (int j = 0; j < 3; ++j)
-          if (free_index[triangle.node[i]] >= 0 && free_index[triangle.node[j]] >= 0)
-            contributors[structural[free_index[triangle.node[i]]][free_index[triangle.node[j]]]].push_back(static_cast<int32_t>(element * 9 + i * 3 + j));
+          if (node_to_free[triangle.node[i]] >= 0 && node_to_free[triangle.node[j]] >= 0)
+            contributors[structural[node_to_free[triangle.node[i]]][node_to_free[triangle.node[j]]]].push_back({
+                static_cast<int32_t>(element), static_cast<int8_t>(i), static_cast<int8_t>(j),
+                static_cast<int8_t>(node_sign[triangle.node[i]] * node_sign[triangle.node[j]]) });
       }
       triangles.push_back(device);
     }
@@ -2825,15 +2884,19 @@ class DeviceNonlinearAssemblyPlan {
         for (int i = 0; i < 10; ++i)
           for (int j = 0; j < 10; ++j) {
             const double value = matrix[i][j] * weight[i] * weight[j] * kNativeFemmAgeToSiReluctivity;
-            const int32_t row = free_index[node[i]], column = free_index[node[j]];
+            const int32_t row = node_to_free[node[i]], column = node_to_free[node[j]];
             if (row >= 0 && column >= 0)
-              age_values[structural[row][column]] += value;
+              age_values[structural[row][column]] += static_cast<double>(node_sign[node[i]]
+                  * node_sign[node[j]]) * value;
             else if (row >= 0 && boundary[node[j]])
-              age_rhs[row] -= value * boundary_values[node[j]];
+              age_rhs[row] -= static_cast<double>(node_sign[node[i]]) * value
+                  * boundary_values[node[j]];
           }
       }
     }
-    std::vector<int32_t> matrix_offsets(nnz_ + 1, 0), matrix_entries, rhs_offsets(free_count_ + 1, 0), rhs_entries;
+    std::vector<int32_t> matrix_offsets(nnz_ + 1, 0), rhs_offsets(free_count_ + 1, 0);
+    std::vector<DeviceMatrixContributor> matrix_entries;
+    std::vector<DeviceRhsContributor> rhs_entries;
     for (size_t slot = 0; slot < nnz_; ++slot) {
       matrix_offsets[slot] = static_cast<int32_t>(matrix_entries.size());
       matrix_entries.insert(matrix_entries.end(), contributors[slot].begin(), contributors[slot].end());
@@ -2847,7 +2910,7 @@ class DeviceNonlinearAssemblyPlan {
     Status status = Status::kOk;
     if ((status = d_triangles_.allocate(triangles.size())) != Status::kOk || (status = d_curve_b_.allocate(curve_b.size())) != Status::kOk || (status = d_curve_h_.allocate(curve_h.size())) != Status::kOk || (status = d_curve_slope_.allocate(curve_slope.size())) != Status::kOk || (status = d_matrix_offsets_.allocate(matrix_offsets.size())) != Status::kOk || (status = d_matrix_entries_.allocate(matrix_entries.size())) != Status::kOk || (status = d_rhs_offsets_.allocate(rhs_offsets.size())) != Status::kOk || (status = d_rhs_entries_.allocate(rhs_entries.size())) != Status::kOk || (status = d_base_values_.allocate(age_values.size())) != Status::kOk || (status = d_age_rhs_.allocate(age_rhs.size())) != Status::kOk || (status = d_pm_rhs_.allocate(pm_rhs.size())) != Status::kOk || (status = d_circuit_rhs_.allocate(circuit_rhs.size())) != Status::kOk || (status = d_boundary_values_.allocate(boundary_values.size())) != Status::kOk || (status = d_diagonal_slots_.allocate(diagonal_slots.size())) != Status::kOk || (status = d_valid_.allocate(1)) != Status::kOk)
       return status;
-    if ((status = CopyToDevice(d_triangles_.get(), triangles.data(), triangles.size() * sizeof(DeviceNonlinearTriangle))) != Status::kOk || (status = CopyToDevice(d_curve_b_.get(), curve_b.data(), curve_b.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_h_.get(), curve_h.data(), curve_h.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_slope_.get(), curve_slope.data(), curve_slope.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_matrix_offsets_.get(), matrix_offsets.data(), matrix_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_matrix_entries_.get(), matrix_entries.data(), matrix_entries.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_rhs_offsets_.get(), rhs_offsets.data(), rhs_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_rhs_entries_.get(), rhs_entries.data(), rhs_entries.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_base_values_.get(), age_values.data(), age_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_age_rhs_.get(), age_rhs.data(), age_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_pm_rhs_.get(), pm_rhs.data(), pm_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_circuit_rhs_.get(), circuit_rhs.data(), circuit_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_boundary_values_.get(), boundary_values.data(), boundary_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_diagonal_slots_.get(), diagonal_slots.data(), diagonal_slots.size() * sizeof(int32_t))) != Status::kOk)
+    if ((status = CopyToDevice(d_triangles_.get(), triangles.data(), triangles.size() * sizeof(DeviceNonlinearTriangle))) != Status::kOk || (status = CopyToDevice(d_curve_b_.get(), curve_b.data(), curve_b.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_h_.get(), curve_h.data(), curve_h.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_curve_slope_.get(), curve_slope.data(), curve_slope.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_matrix_offsets_.get(), matrix_offsets.data(), matrix_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_matrix_entries_.get(), matrix_entries.data(), matrix_entries.size() * sizeof(DeviceMatrixContributor))) != Status::kOk || (status = CopyToDevice(d_rhs_offsets_.get(), rhs_offsets.data(), rhs_offsets.size() * sizeof(int32_t))) != Status::kOk || (status = CopyToDevice(d_rhs_entries_.get(), rhs_entries.data(), rhs_entries.size() * sizeof(DeviceRhsContributor))) != Status::kOk || (status = CopyToDevice(d_base_values_.get(), age_values.data(), age_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_age_rhs_.get(), age_rhs.data(), age_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_pm_rhs_.get(), pm_rhs.data(), pm_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_circuit_rhs_.get(), circuit_rhs.data(), circuit_rhs.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_boundary_values_.get(), boundary_values.data(), boundary_values.size() * sizeof(double))) != Status::kOk || (status = CopyToDevice(d_diagonal_slots_.get(), diagonal_slots.data(), diagonal_slots.size() * sizeof(int32_t))) != Status::kOk)
       return status;
     symbolic_ = std::move(symbolic);
     initialized_ = true;
@@ -2882,9 +2945,9 @@ class DeviceNonlinearAssemblyPlan {
     const dim3 blocks_elements(static_cast<unsigned int>((triangles + 255) / 256), static_cast<unsigned int>(count));
     const dim3 blocks_values(static_cast<unsigned int>((nnz_ + 255) / 256), static_cast<unsigned int>(count));
     const dim3 blocks_rows(static_cast<unsigned int>((free_count_ + 255) / 256), static_cast<unsigned int>(count));
-    DeviceNonlinearElementKernel<<<blocks_elements, 256>>>(d_triangles_.get(), triangles, d_old_.get(), node_count_, d_curve_b_.get(), d_curve_h_.get(), d_curve_slope_.get(), use_newton, d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), d_valid_.get());
-    DeviceNonlinearValuesKernel<<<blocks_values, 256>>>(d_triangles_.get(), d_matrix_offsets_.get(), d_matrix_entries_.get(), nnz_, d_base_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, use_newton, solver->device_batch_values());
-    DeviceNonlinearRhsKernel<<<blocks_rows, 256>>>(d_triangles_.get(), d_rhs_offsets_.get(), d_rhs_entries_.get(), free_count_, d_pm_rhs_.get(), d_circuit_rhs_.get(), circuit_count_, d_currents_.get(), d_age_rhs_.get(), d_old_.get(), d_boundary_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, node_count_, use_newton, solver->device_batch_rhs());
+    DeviceNonlinearElementKernel<<<blocks_elements, 256>>>(d_triangles_.get(), triangles, d_old_.get(), node_count_, d_curve_b_.get(), d_curve_h_.get(), d_curve_slope_.get(), use_newton, d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), quadrature_stride_, d_valid_.get());
+    DeviceNonlinearValuesKernel<<<blocks_values, 256>>>(d_triangles_.get(), d_matrix_offsets_.get(), d_matrix_entries_.get(), nnz_, d_base_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, quadrature_stride_, use_newton, solver->device_batch_values());
+    DeviceNonlinearRhsKernel<<<blocks_rows, 256>>>(d_triangles_.get(), d_rhs_offsets_.get(), d_rhs_entries_.get(), free_count_, d_pm_rhs_.get(), d_circuit_rhs_.get(), circuit_count_, d_currents_.get(), d_age_rhs_.get(), d_old_.get(), d_boundary_values_.get(), d_bx_.get(), d_by_.get(), d_nu_.get(), d_derivative_.get(), triangles, quadrature_stride_, node_count_, use_newton, solver->device_batch_rhs());
     DeviceNonlinearDiagonalKernel<<<blocks_rows, 256>>>(d_diagonal_slots_.get(), free_count_, nnz_, solver->device_batch_values(), solver->device_batch_diagonal(), solver->device_batch_inverse_diagonal(), d_valid_.get());
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess || cudaMemcpy(&valid, d_valid_.get(), sizeof(valid), cudaMemcpyDeviceToHost) != cudaSuccess)
       return Status::kInternalError;
@@ -2901,18 +2964,21 @@ class DeviceNonlinearAssemblyPlan {
       return Status::kOk;
     const size_t triangles = d_triangles_.count();
     Status status = Status::kOk;
-    if ((status = d_old_.allocate(count * node_count_)) != Status::kOk || (status = d_currents_.allocate(count * static_cast<size_t>(circuit_count_))) != Status::kOk || (status = d_bx_.allocate(count * triangles)) != Status::kOk || (status = d_by_.allocate(count * triangles)) != Status::kOk || (status = d_nu_.allocate(count * triangles)) != Status::kOk || (status = d_derivative_.allocate(count * triangles)) != Status::kOk)
+    if ((status = d_old_.allocate(count * node_count_)) != Status::kOk || (status = d_currents_.allocate(count * static_cast<size_t>(circuit_count_))) != Status::kOk || (status = d_bx_.allocate(count * triangles * quadrature_stride_)) != Status::kOk || (status = d_by_.allocate(count * triangles * quadrature_stride_)) != Status::kOk || (status = d_nu_.allocate(count * triangles * quadrature_stride_)) != Status::kOk || (status = d_derivative_.allocate(count * triangles * quadrature_stride_)) != Status::kOk)
       return status;
     state_capacity_ = count;
     return Status::kOk;
   }
   bool initialized_ = false;
   size_t node_count_ = 0, free_count_ = 0, nnz_ = 0, state_capacity_ = 0;
+  size_t quadrature_stride_ = 1;
   int circuit_count_ = 0;
   Assembly symbolic_;
   DeviceBuffer<DeviceNonlinearTriangle> d_triangles_;
   DeviceBuffer<double> d_curve_b_, d_curve_h_, d_curve_slope_, d_base_values_, d_age_rhs_, d_pm_rhs_, d_circuit_rhs_, d_boundary_values_;
-  DeviceBuffer<int32_t> d_matrix_offsets_, d_matrix_entries_, d_rhs_offsets_, d_rhs_entries_, d_diagonal_slots_;
+  DeviceBuffer<int32_t> d_matrix_offsets_, d_rhs_offsets_, d_diagonal_slots_;
+  DeviceBuffer<DeviceMatrixContributor> d_matrix_entries_;
+  DeviceBuffer<DeviceRhsContributor> d_rhs_entries_;
   DeviceBuffer<int> d_valid_;
   DeviceBuffer<double> d_old_, d_currents_, d_bx_, d_by_, d_nu_, d_derivative_;
 };
@@ -3081,11 +3147,20 @@ class NonlinearP1FixtureSolver {
       for (size_t boundary = 0; boundary < model_.dirichlet_nodes.size(); ++boundary)
         states[item][model_.dirichlet_nodes[boundary]] = model_.dirichlet_a_wb_per_m[boundary];
     }
-    const bool device_assembly_supported =
-        model_.problem_type == MagneticProblemType::kPlanar
-        && model_.node_constraints.empty();
-    bool device_assembly_active = requested_mode != NonlinearAssemblyMode::kHost
-        && device_assembly_supported;
+    // The plan owns the signed reduction and both P1 operators.  For tiny
+    // one-off models its allocation/setup cost exceeds host assembly, so auto
+    // keeps the reference path until there is enough quadrature work. Forced
+    // device mode remains available for parity and profiling.
+    const bool device_assembly_supported = true;
+    const size_t quadrature_per_triangle =
+        model_.problem_type == MagneticProblemType::kAxisymmetric ? 7 : 1;
+    constexpr size_t kMinimumDeviceAssemblyQuadratureWork = 4096;
+    const bool device_assembly_worthwhile = model_.triangles.size()
+        * quadrature_per_triangle * currents.size()
+        >= kMinimumDeviceAssemblyQuadratureWork;
+    bool device_assembly_active = requested_mode == NonlinearAssemblyMode::kDevice
+        || (requested_mode == NonlinearAssemblyMode::kAuto
+            && device_assembly_supported && device_assembly_worthwhile);
     if (requested_mode == NonlinearAssemblyMode::kDevice
         && !device_assembly_supported) {
       for (size_t item = 0; item < results.size(); ++item)
@@ -3102,6 +3177,15 @@ class NonlinearP1FixtureSolver {
           : plan_status;
       if (setup_status == Status::kOk) {
         csr_initialized_ = true;
+        // A fixed signed root may prescribe values on nodes other than the
+        // literal Dirichlet record.  The device Newton state must start from
+        // the same expanded boundary vector as the host reduced assembler.
+        const std::vector<double>& boundary = device_assembly_->symbolic_assembly().boundary_values;
+        for (size_t item = 0; item < states.size(); ++item)
+          if (active[item])
+            for (size_t node = 0; node < boundary.size(); ++node)
+              if (boundary[node] != 0.0)
+                states[item][node] = boundary[node];
       } else if (requested_mode == NonlinearAssemblyMode::kAuto) {
         device_assembly_.reset();
         csr_initialized_ = false;
@@ -3362,6 +3446,17 @@ class NonlinearP1FixtureSolver {
           timing->finalize_seconds += ProfileSecondsSince(finalize_start);
       }
     return results;
+  }
+
+  // Private-to-this-translation-unit callers use this for a single generic
+  // CLI solve.  Keeping Solve() untouched preserves the established host
+  // reference path and warm-start semantics.
+  NonlinearSolveResult SolveAccelerated(const std::vector<double>& currents,
+      const NonlinearOptions& options, NonlinearAssemblyMode mode)
+  {
+    std::vector<NonlinearSolveResult> results = SolveBatch({ currents }, options,
+        nullptr, nullptr, mode);
+    return results.empty() ? NonlinearSolveResult {} : std::move(results.front());
   }
 
   private:
@@ -6490,7 +6585,8 @@ bool AtomicReplaceFile(const std::filesystem::path& source,
 }
 
 int PlanarDcSingleSampleAdapterDirect(const std::string& request_path,
-    const std::string& response_path)
+    const std::string& response_path,
+    NonlinearAssemblyMode assembly_mode = NonlinearAssemblyMode::kAuto)
 {
   std::ifstream request_file(request_path);
   std::stringstream request_bytes;
@@ -6540,7 +6636,9 @@ int PlanarDcSingleSampleAdapterDirect(const std::string& request_path,
       if (status == Status::kOk) {
         const NonlinearOptions options = ProductionSampleOptions();
         solve_attempted = true;
-        solution = solver.Solve(request.circuit_currents_a, options);
+        solution = assembly_mode == NonlinearAssemblyMode::kHost
+            ? solver.Solve(request.circuit_currents_a, options)
+            : solver.SolveAccelerated(request.circuit_currents_a, options, assembly_mode);
         status = solution.info.status;
       }
     }
@@ -6579,7 +6677,8 @@ int PlanarDcSingleSampleAdapterDirect(const std::string& request_path,
 }
 
 int PlanarDcSingleSampleAdapter(const std::string& request_path,
-    const std::string& response_path)
+    const std::string& response_path,
+    NonlinearAssemblyMode assembly_mode = NonlinearAssemblyMode::kAuto)
 {
   if (SameFilesystemObject(request_path, response_path)) {
     std::cerr << "FAIL magnetostatic solve: response must not overwrite request\n";
@@ -6604,7 +6703,7 @@ int PlanarDcSingleSampleAdapter(const std::string& request_path,
       + std::to_string(ProfileClock::now().time_since_epoch().count()) + "."
       + std::to_string(sequence.fetch_add(1));
   const int result = PlanarDcSingleSampleAdapterDirect(
-      request_path, temporary.string());
+      request_path, temporary.string(), assembly_mode);
   std::error_code error;
   if (!std::filesystem::is_regular_file(temporary, error)
       || !AtomicReplaceFile(temporary, std::filesystem::path(response_path))) {
@@ -7870,6 +7969,26 @@ int SelfTest()
           && device_assembly_matches_host(
               bh_assembly_model, newton_state, { 2.0 }, true),
       "device nonlinear assembly matches host CSR, diagonal, and RHS for cold and BH Newton states");
+  NonlinearModel signed_assembly_model = NonlinearThreeRegionFixture();
+  signed_assembly_model.dirichlet_nodes = { 0 };
+  signed_assembly_model.dirichlet_a_wb_per_m = { 0.1 };
+  signed_assembly_model.node_constraints = { { 0, 2, -1 }, { 1, 3, -1 } };
+  std::vector<double> signed_state(signed_assembly_model.nodes.size(), 0.0);
+  signed_state[0] = 0.1;
+  signed_state[2] = -0.1;
+  signed_state[1] = 0.2;
+  signed_state[3] = -0.2;
+  signed_state[4] = 0.15;
+  expect(device_assembly_matches_host(
+             signed_assembly_model, signed_state, { 2.0 }, true),
+      "device assembly applies signed periodic reduction and fixed-root expansion");
+  NonlinearModel axisymmetric_assembly_model = NonlinearThreeRegionFixture();
+  axisymmetric_assembly_model.problem_type = MagneticProblemType::kAxisymmetric;
+  std::vector<double> axisymmetric_state(axisymmetric_assembly_model.nodes.size(), 0.0);
+  axisymmetric_state.back() = 0.25;
+  expect(device_assembly_matches_host(
+             axisymmetric_assembly_model, axisymmetric_state, { 2.0 }, true),
+      "device assembly matches host axisymmetric seven-point P1 Newton operator");
   NonlinearModel age_assembly_model = shifted_sliding_model;
   age_assembly_model.dirichlet_nodes = { 0 };
   age_assembly_model.dirichlet_a_wb_per_m = { 0.25 };
@@ -8714,6 +8833,14 @@ int main(int argc, char** argv)
     }
     return gpu_femm::PlanarDcSingleSampleAdapter(argv[2], argv[3]);
   }
+  if (argc == 4 && std::string(argv[1]) == "--internal-solve-host") {
+    return gpu_femm::PlanarDcSingleSampleAdapter(argv[2], argv[3],
+        gpu_femm::NonlinearAssemblyMode::kHost);
+  }
+  if (argc == 4 && std::string(argv[1]) == "--internal-solve-device") {
+    return gpu_femm::PlanarDcSingleSampleAdapter(argv[2], argv[3],
+        gpu_femm::NonlinearAssemblyMode::kDevice);
+  }
   if (argc == 4 && std::string(argv[1]) == "--motor-single-sample") {
     return gpu_femm::MotorSingleSampleAdapter(argv[2], argv[3]);
   }
@@ -8750,7 +8877,7 @@ int main(int argc, char** argv)
         << "  \"full_field_output\": true,\n"
         << "  \"ac_complex\": false,\n"
         << "  \"axisymmetric\": true,\n"
-        << "  \"axisymmetric_assembly\": \"host\",\n"
+        << "  \"axisymmetric_assembly\": \"device\",\n"
         << "  \"generic_force_airgap_postprocessing\": false\n"
         << "}\n";
     return 0;

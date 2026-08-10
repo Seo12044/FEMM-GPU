@@ -274,6 +274,50 @@ class FemmGpuCliTests(unittest.TestCase):
         )
 
     @unittest.skipIf(SOLVER is None, "solver executable was not supplied")
+    def test_generic_device_assembly_matches_host_reference(self):
+        fields = (
+            "node_potential",
+            "element_B_component_1_T",
+            "element_B_component_2_T",
+            "circuit_flux_linkage_Wb",
+        )
+        for name in ("periodic_strip", "antiperiodic_strip", "axisymmetric_coil"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = (Path(__file__).parent / "fixtures" / f"{name}_v1"
+                            / f"{name}.gpu.json")
+                request = femm_gpu.make_request(
+                    artifact, [12.0], include_field_solution=True,
+                    protocol=femm_gpu.GENERIC_PROTOCOL,
+                )
+                request_path = root / "request.json"
+                request_path.write_text(json.dumps(request), encoding="utf-8")
+                responses = {}
+                for mode in ("host", "device", "device_repeat"):
+                    flag = ("--internal-solve-host" if mode == "host"
+                            else "--internal-solve-device")
+                    output = root / f"{mode}.json"
+                    run = subprocess.run(
+                        [str(SOLVER), flag, str(request_path), str(output)],
+                        check=False, capture_output=True, text=True,
+                    )
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    responses[mode] = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(responses["host"]["status"], "PASS")
+                self.assertEqual(
+                    responses["host"]["convergence"]["iterations"],
+                    responses["device"]["convergence"]["iterations"],
+                )
+                for field in fields:
+                    self.assertEqual(len(responses["host"][field]),
+                                     len(responses["device"][field]))
+                    for expected, actual in zip(
+                            responses["host"][field], responses["device"][field]):
+                        self.assertAlmostEqual(expected, actual, delta=1e-12)
+                    self.assertEqual(responses["device"][field],
+                                     responses["device_repeat"][field])
+
+    @unittest.skipIf(SOLVER is None, "solver executable was not supplied")
     def test_capabilities_and_invalid_request_are_machine_readable(self):
         capabilities = subprocess.run(
             [str(SOLVER), "--capabilities"],
@@ -286,6 +330,7 @@ class FemmGpuCliTests(unittest.TestCase):
         self.assertIn("gpu_femm_magnetostatic_sample_v1", document["sample_protocols"])
         self.assertEqual(document["problem_types"], ["planar", "axisymmetric"])
         self.assertTrue(document["general_periodic_node_constraints"])
+        self.assertEqual(document["axisymmetric_assembly"], "device")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             request = root / "request.json"

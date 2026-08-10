@@ -30,8 +30,10 @@ repository for reference and build compatibility.
 The solver does not support AC or complex problems, laminated or AC apparent
 B-H conversion, eccentric sliding interfaces, circuit unknowns, or adaptive
 remeshing. Axisymmetric and general periodic models use host matrix assembly
-followed by the same CUDA FP64 PCG solve; their force, torque, air-gap sampling,
-and sliding-band postprocessing are not supported. The
+only for small-workload selection or automatic fallback. Larger models assemble
+their numeric matrix and right-hand side on the GPU before the CUDA FP64 PCG
+solve. Their force, torque, air-gap sampling, and sliding-band postprocessing
+are not supported. The
 standalone preparer accepts `.fem` files only when every feature can be mapped
 exactly to this supported subset.
 

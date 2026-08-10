@@ -111,9 +111,12 @@ responses use:
 
 For axisymmetric models, the nodal potential is FEMM's poloidal flux function
 in Wb. Internally, the solver uses conventional P1 A-phi interpolation and a
-seven-point triangle quadrature. Matrix assembly runs on the host; the reduced
-FP64 system is solved by the existing CUDA CSR PCG backend. General periodic
-constraints use a signed degree-of-freedom map and exact `T^T K T` reduction.
+seven-point triangle quadrature. Geometry, quadrature, and the signed degree-of-
+freedom map are prepared once on the host. For sufficiently large workloads,
+the numeric matrix, diagonal, and right-hand side are assembled directly into
+the reduced GPU CSR buffers before PCG. General periodic constraints use exact
+`T^T K T` signs in deterministic contributor lists. Small models and any
+device-plan or kernel failure use the established host assembler.
 The preparer binds each generated `.pbc` pair to a matching FEMM boundary
 property and checks disconnected boundary-side topology when it is available.
 
@@ -241,6 +244,14 @@ and adds timing for artifact loading, host or device assembly, GPU solve, and
 postprocessing. `device_assembly_seconds` is zero when the host fallback path
 is used; `host_assembly_seconds` is zero when device assembly is active.
 
+Standalone host/device parity and timing can be checked without changing the
+public `--solve` command:
+
+```powershell
+gpu_linear_p1_poc.exe --internal-solve-host request.json response-host.json
+gpu_linear_p1_poc.exe --internal-solve-device request.json response-device.json
+```
+
 ## Numerical implementation
 
 - Field values and solver storage use `double`.
@@ -253,9 +264,11 @@ is used; `host_assembly_seconds` is zero when device assembly is active.
 - The established host nonlinear assembly remains available and is selected
   automatically if device-plan setup or execution fails.
 - Linear systems use a GPU-resident CSR Jacobi-PCG solver.
-- Axisymmetric and general periodic operators assemble on the host and use the
-  same GPU-resident PCG solve. Planar models without these constraints retain
-  the existing device-assembly path.
+- Planar, axisymmetric, and signed-periodic numeric operators share the same
+  deterministic device-assembly plan. Axisymmetric elements use seven stored
+  quadrature points; signed constraints assemble directly in reduced CSR.
+- Auto mode keeps small one-off workloads on the host and retries the exact
+  Newton iteration there if device-plan setup or execution fails.
 - Supported GPUs can use cooperative multi-block PCG for small batches on
   large meshes. Other cases use the deterministic fallback kernel.
 - V1 force and torque use a default weighted-stress mask; radial air-gap B uses
