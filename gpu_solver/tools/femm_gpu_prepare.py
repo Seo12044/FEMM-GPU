@@ -1,4 +1,4 @@
-"""Create an immutable GPU FEMM artifact from a planar DC ``.fem`` model.
+"""Create an immutable GPU FEMM artifact from a supported DC ``.fem`` model.
 
 The preprocessor is deliberately separate from the CUDA executable.  It uses
 stock FEMM only for its Triangle mesh generator, in a private temporary copy
@@ -6,10 +6,11 @@ of the FEMM runtime.  The copied ``fkn.exe`` is replaced by the supplied
 ``gpu_femm_mesh_noop_solver.exe`` so no CPU magnetic solve is performed and
 the installed FEMM directory is never changed.
 
-Supported input is intentionally the same conservative subset accepted by the
-GPU solver: planar, 0 Hz magnetics; isotropic raw-DC materials; real series
-current circuits; constant PM directions; and zero-A Dirichlet boundaries.
-Every other FEMM feature fails before writing an artifact.
+Supported input is intentionally conservative: DC magnetics; isotropic raw-DC
+materials; real series current circuits; constant PM directions; zero-A
+Dirichlet boundaries; and FEMM periodic/anti-periodic node pairs. The
+preparer emits the legacy planar artifact only when possible, otherwise it
+uses the generic magnetostatic artifact.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -42,6 +44,18 @@ _UNITS_TO_MM = {
     "mils": 0.0254,
     "micrometers": 0.001,
 }
+
+
+def _atomic_replace(source: Path, destination: Path) -> None:
+    """Tolerate short-lived Windows scanner/indexer sharing conflicts."""
+    for attempt in range(5):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
 
 
 def _sha256(path: Path) -> str:
@@ -222,15 +236,20 @@ def _parse_circuits(lines: Sequence[str]) -> list[dict[str, Any]]:
     return result
 
 
-def _parse_boundaries(lines: Sequence[str]) -> list[bool]:
-    result: list[bool] = []
+def _parse_boundaries(lines: Sequence[str]) -> list[str]:
+    """Classify supported FEMM boundary markers without losing PBC type."""
+    result: list[str] = []
     for block in _property_blocks(lines, "BdryProps", "<BeginBdry>", "<EndBdry>"):
-        if (_required_number(block, "BdryType", "boundary") != 0
+        boundary_type = _required_number(block, "BdryType", "boundary")
+        if boundary_type in (4, 5):
+            result.append("periodic" if boundary_type == 4 else "antiperiodic")
+            continue
+        if (boundary_type != 0
                 or _required_number(block, "A_0", "boundary") != 0
                 or _required_number(block, "A_1", "boundary") != 0
                 or _required_number(block, "A_2", "boundary") != 0):
-            raise PrepareError("only zero-A Dirichlet boundary markers are supported")
-        result.append(True)
+            raise PrepareError("only zero-A Dirichlet and periodic/anti-periodic boundary markers are supported")
+        result.append("dirichlet")
     return result
 
 
@@ -292,18 +311,18 @@ def _parse_source(path: Path) -> tuple[dict[str, Any], float, list[dict[str, Any
     units = _setting(lines, "LengthUnits").lower()
     coordinates = _setting(lines, "Coordinates").lower()
     depth = _number(_setting(lines, "Depth"), "Depth")
-    if frequency != 0 or problem != "planar":
-        raise PrepareError("only planar, DC (0 Hz) FEMM models are supported")
+    if frequency != 0 or problem not in ("planar", "axisymmetric"):
+        raise PrepareError("only planar or axisymmetric DC (0 Hz) FEMM models are supported")
     if units not in _UNITS_TO_MM or depth <= 0 or coordinates != "cartesian":
         raise PrepareError("FEMM requires supported LengthUnits, positive Depth, and cartesian coordinates")
     if _count(lines, "PointProps") != 0:
-        raise PrepareError("point properties are not supported by planar DC GPU FEMM")
+        raise PrepareError("point properties are not supported by GPU FEMM")
     materials = _parse_materials(lines)
     circuits = _parse_circuits(lines)
     labels, default = _parse_labels(lines, materials, circuits)
     if not labels:
         raise PrepareError("FEMM model has no block labels")
-    return ({"depth_mm": depth * _UNITS_TO_MM[units], "problem_type": "planar", "frequency_hz": 0},
+    return ({"depth_mm": depth * _UNITS_TO_MM[units], "problem_type": problem, "frequency_hz": 0},
             _UNITS_TO_MM[units], materials, circuits, labels, default, _parse_boundaries(lines))
 
 
@@ -328,6 +347,103 @@ def _indexed_rows(rows: Sequence[list[float]], label: str, minimum_columns: int)
     if sorted(indexed) != list(range(len(rows))):
         raise PrepareError(f"Triangle {label} IDs must be contiguous and zero based")
     return [indexed[index] for index in range(len(rows))]
+
+
+def _parse_node_constraints(path: Path, node_count: int) -> list[dict[str, Any]]:
+    """Strictly parse stock FEMM's three- or four-column ``.pbc`` records."""
+    lines = [line for line in _clean_lines(path) if line.strip()]
+    if not lines:
+        raise PrepareError("empty Triangle periodic-boundary file")
+    header = _numeric_row(lines[0], "periodic-boundary header")
+    if len(header) != 1 or header[0] < 0 or header[0] != int(header[0]):
+        raise PrepareError("periodic-boundary header must be one non-negative integer")
+    count = int(header[0])
+    if len(lines) < count + 1:
+        raise PrepareError("truncated periodic-boundary file")
+    raw: list[tuple[int, int, str]] = []
+    for row_index, line in enumerate(lines[1:count + 1]):
+        values = _numeric_row(line, "periodic-boundary row")
+        if len(values) == 3:
+            first, second, kind = values
+        elif len(values) == 4:
+            record, first, second, kind = values
+            if record < 0 or record != int(record):
+                raise PrepareError(f"invalid periodic-boundary record ID at row {row_index + 1}")
+        else:
+            raise PrepareError("periodic-boundary rows must contain 3 or 4 integers")
+        if any(value != int(value) for value in (first, second, kind)):
+            raise PrepareError("periodic-boundary node IDs and type must be integers")
+        first, second, kind = int(first), int(second), int(kind)
+        if first < 0 or second < 0 or first >= node_count or second >= node_count:
+            raise PrepareError("periodic-boundary node ID is outside the Triangle mesh")
+        if first == second:
+            raise PrepareError("periodic-boundary pair cannot reference the same node")
+        if kind not in (0, 1):
+            raise PrepareError("periodic-boundary type must be 0 (periodic) or 1 (anti-periodic)")
+        raw.append((min(first, second), max(first, second), "periodic" if kind == 0 else "antiperiodic"))
+    tail = lines[count + 1:]
+    if tail:
+        age = _numeric_row(tail[0], "air-gap count")
+        if len(age) != 1 or age[0] < 0 or age[0] != int(age[0]):
+            raise PrepareError("invalid air-gap count after periodic-boundary records")
+        if age[0] != 0 or len(tail) != 1:
+            raise PrepareError("air-gap element data is not supported by the standalone preparer")
+
+    unique = sorted(set(raw))
+    by_pair: dict[tuple[int, int], str] = {}
+    parent = list(range(node_count))
+    parity = [1] * node_count
+
+    def find(node: int) -> tuple[int, int]:
+        if parent[node] == node:
+            return node, 1
+        root, sign = find(parent[node])
+        parity[node] *= sign
+        parent[node] = root
+        return root, parity[node]
+
+    for first, second, relation in unique:
+        previous = by_pair.setdefault((first, second), relation)
+        if previous != relation:
+            raise PrepareError("the same node pair is both periodic and anti-periodic")
+        root_a, sign_a = find(first)
+        root_b, sign_b = find(second)
+        wanted = 1 if relation == "periodic" else -1
+        if root_a == root_b:
+            if sign_a * sign_b != wanted:
+                raise PrepareError("periodic/anti-periodic node constraints are contradictory")
+            continue
+        parent[root_b] = root_a
+        parity[root_b] = wanted * sign_a * sign_b
+    return [{"node_a": first, "node_b": second, "relation": relation}
+            for first, second, relation in unique]
+
+
+def _validate_constraint_boundaries(
+        constraints: Sequence[dict[str, Any]],
+        periodic_nodes_by_marker: dict[int, set[int]],
+        boundaries: Sequence[str]) -> None:
+    """Bind every `.pbc` pair to the matching FEMM boundary property."""
+    paired_nodes_by_marker = {marker: set() for marker in periodic_nodes_by_marker}
+    for constraint in constraints:
+        first = constraint["node_a"]
+        second = constraint["node_b"]
+        relation = constraint["relation"]
+        matching = [
+            marker for marker, nodes in periodic_nodes_by_marker.items()
+            if boundaries[marker] == relation and first in nodes and second in nodes
+        ]
+        if not matching:
+            raise PrepareError(
+                "periodic-boundary pair is not on one matching FEMM boundary marker"
+            )
+        for marker in matching:
+            paired_nodes_by_marker[marker].update((first, second))
+    for marker, nodes in periodic_nodes_by_marker.items():
+        if nodes != paired_nodes_by_marker[marker]:
+            raise PrepareError(
+                "a used periodic/anti-periodic FEMM boundary has unpaired mesh nodes"
+            )
 
 
 def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
@@ -368,9 +484,9 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
             face[1], face[2] = face[2], face[1]
         raw_faces.append((face, label))
 
-    pbc_header, _ = _mesh_rows(mesh_stem.with_suffix(".pbc"), "periodic-boundary")
-    if not pbc_header or pbc_header[0] != 0:
-        raise PrepareError("periodic or anti-periodic boundary constraints are not supported")
+    constraints = _parse_node_constraints(mesh_stem.with_suffix(".pbc"), len(nodes_by_id))
+    if model["problem_type"] == "axisymmetric" and any(node[0] < 0 for node in nodes_by_id.values()):
+        raise PrepareError("axisymmetric FEMM mesh contains a negative radial coordinate")
     edge_header, edge_rows = _mesh_rows(mesh_stem.with_suffix(".edge"), "edge")
     if len(edge_header) < 2 or edge_header[1] != 1:
         raise PrepareError("invalid Triangle edge header")
@@ -383,6 +499,7 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     if any(count not in (1, 2) for count in triangle_edge_incidence.values()):
         raise PrepareError("Triangle mesh contains a non-manifold edge")
     boundary_nodes: set[int] = set()
+    periodic_nodes_by_marker: dict[int, set[int]] = {}
     mesh_edges: set[tuple[int, int]] = set()
     for row in edge_rows:
         if len(row) < 4 or any(row[index] != int(row[index]) for index in range(4)):
@@ -406,9 +523,18 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
         marker = -(encoded + 2)
         if marker < 0 or marker >= len(boundaries):
             raise PrepareError("Triangle edge has an invalid FEMM boundary marker")
-        boundary_nodes.update((first, second))
+        if boundaries[marker] == "dirichlet":
+            boundary_nodes.update((first, second))
+        else:
+            periodic_nodes_by_marker.setdefault(marker, set()).update((first, second))
     if mesh_edges != set(triangle_edge_incidence):
         raise PrepareError("Triangle edge file does not match the element topology")
+    _validate_constraint_boundaries(constraints, periodic_nodes_by_marker, boundaries)
+    if model["problem_type"] == "axisymmetric":
+        radius_scale = max(1.0, max(abs(node[0]) for node in nodes_by_id.values()))
+        axis_tolerance_mm = 1e-12 * radius_scale
+        boundary_nodes.update(node_id for node_id, node in nodes_by_id.items()
+                              if abs(node[0]) <= axis_tolerance_mm)
     if not boundary_nodes:
         raise PrepareError("no zero-A Dirichlet boundary nodes were found")
 
@@ -421,7 +547,7 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
                         "material_id": label["material_id"], "circuit_index": label["circuit_index"],
                         "turns": label["turns"], "pm_magnetization_deg": label["pm_magnetization_deg"]})
     source_sha = _sha256(source)
-    return {
+    resolved = {
         "source_fem_sha256": source_sha,
         "model": model,
         "nodes_mm": [nodes_by_id[index] for index in range(len(nodes_by_id))],
@@ -433,6 +559,9 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
         "outer_dirichlet": {"node_indices": sorted(boundary_nodes),
                             "A_Wb_per_m": [0.0] * len(boundary_nodes)},
     }
+    if model["problem_type"] == "axisymmetric" or constraints:
+        resolved["node_constraints"] = constraints
+    return resolved
 
 
 def _write_artifact(path: Path, resolved: dict[str, Any], overwrite: bool) -> None:
@@ -441,22 +570,29 @@ def _write_artifact(path: Path, resolved: dict[str, Any], overwrite: bool) -> No
         raise PrepareError(f"output already exists (use --overwrite): {path}")
     canonical = json.dumps(resolved, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     document = {
-        "schema_version": "gpu_femm_planar_dc_mesh_v1",
+        "schema_version": ("gpu_femm_magnetostatic_mesh_v1"
+                           if "node_constraints" in resolved
+                           else "gpu_femm_planar_dc_mesh_v1"),
         "source_fem_sha256": resolved["source_fem_sha256"],
         "canonical_identity_sha256": hashlib.sha256(canonical).hexdigest(),
         "resolved": resolved,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, suffix=".tmp") as stream:
-        json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
-        temporary = Path(stream.name)
+    temporary: Path | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                delete=False, suffix=".tmp") as stream:
+            temporary = Path(stream.name)
+            json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
         if path.exists() and not overwrite:
             raise PrepareError(f"output already exists (use --overwrite): {path}")
-        os.replace(temporary, path)
+        _atomic_replace(temporary, path)
+        temporary = None
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         raise
 
 
@@ -530,8 +666,11 @@ def prepare(source: Path, output: Path, femm_root: Path, noop_solver: Path, time
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="femm_gpu_prepare", description=__doc__)
-    parser.add_argument("input_fem", type=Path, help="immutable planar-DC FEMM source model")
-    parser.add_argument("output_artifact", type=Path, help="new gpu_femm_planar_dc_mesh_v1 JSON artifact")
+    parser.add_argument("input_fem", type=Path, help="immutable DC FEMM source model")
+    parser.add_argument(
+        "output_artifact", type=Path,
+        help="new legacy-planar or generic magnetostatic JSON artifact",
+    )
     parser.add_argument("--femm-root", type=Path, required=True, help="stock FEMM root or its bin directory")
     parser.add_argument("--mesh-noop", type=Path, required=True, help="gpu_femm_mesh_noop_solver.exe beside the GPU solver")
     parser.add_argument("--timeout-s", type=float, default=120.0)

@@ -1,6 +1,6 @@
 # FEMM-GPU
 
-FEMM-GPU is a CUDA solver for two-dimensional planar magnetostatic problems.
+FEMM-GPU is a CUDA solver for planar and axisymmetric DC magnetostatic problems.
 It reads a preprocessed P1 triangle mesh, materials, circuits, and boundary
 conditions from a JSON artifact. Results are written as JSON and include field
 values, flux linkage, force, torque, and radial air-gap flux density.
@@ -18,6 +18,8 @@ repository for reference and build compatibility.
 - Permanent-magnet coercivity
 - Multiple series-circuit current inputs
 - Fixed Dirichlet A boundaries
+- General periodic and anti-periodic node constraints
+- Axisymmetric r-z models with explicit Br/Bz output
 - Native FEMM periodic air-gap elements for centered sliding-band rotation
 - Circuit flux linkage
 - Weighted-stress force and torque
@@ -25,9 +27,11 @@ repository for reference and build compatibility.
 - Single-sample and shared-geometry batch solves
 - Deterministic PCG results for identical inputs
 
-The solver does not support AC or complex problems, axisymmetric models,
-laminated or AC apparent B-H conversion, general periodic node constraints,
-eccentric sliding interfaces, circuit unknowns, or adaptive remeshing. The
+The solver does not support AC or complex problems, laminated or AC apparent
+B-H conversion, eccentric sliding interfaces, circuit unknowns, or adaptive
+remeshing. Axisymmetric and general periodic models use host matrix assembly
+followed by the same CUDA FP64 PCG solve; their force, torque, air-gap sampling,
+and sliding-band postprocessing are not supported. The
 standalone preparer accepts `.fem` files only when every feature can be mapped
 exactly to this supported subset.
 
@@ -120,7 +124,7 @@ Run the included nonlinear fixture and inspect the response:
 Get-Content '.\build-gpu\single_sample_response.json'
 ```
 
-## Standalone planar DC solve
+## Standalone magnetostatic solve
 
 The standalone interface does not depend on MATLAB, Inventor, or a motor
 project. Check the installed solver first:
@@ -153,18 +157,30 @@ no CPU magnetic solve. The input `.fem` and the installed FEMM directory are
 read-only inputs. Unsupported model features stop before the artifact is
 written.
 
-`--fields` writes nodal magnetic vector potential and per-element Bx/By. Use
+For a legacy planar artifact, `--fields` writes `node_A_Wb_per_m` and
+per-element Bx/By. A model containing general periodic constraints or an
+axisymmetric problem uses the generic magnetostatic protocol instead. Its
+response writes `node_potential` with explicit quantity/unit metadata and
+per-element component arrays. Axisymmetric nodal values are FEMM's poloidal
+flux function in Wb, and field components are Br/Bz.
+
+Use
 `--force-torque --force-group 20 --air-group 30` for weighted-stress force and
 torque on a conforming mesh. Native sliding-band artifacts use
 `--sliding-band-angle-deg` and do not require motor identity fields.
+These postprocessing options are rejected for generic artifacts.
 
 The request contract is
 [`gpu_femm_planar_dc_sample_v1`](gpu_solver/schemas/gpu_femm_planar_dc_sample_v1.schema.json).
+The generic contracts are
+[`gpu_femm_magnetostatic_mesh_v1`](gpu_solver/schemas/gpu_femm_magnetostatic_mesh_v1.schema.json)
+and
+[`gpu_femm_magnetostatic_sample_v1`](gpu_solver/schemas/gpu_femm_magnetostatic_sample_v1.schema.json).
 Applications in C++, Python, MATLAB, or another language may invoke
 `femm_gpu.exe --solve request.json response.json` directly.
 
-FEMM model editing remains a separate step. Unsupported AC, axisymmetric, and
-periodic-node models are rejected rather than approximated.
+FEMM model editing remains a separate step. Unsupported features are rejected
+rather than approximated.
 
 ## Run a motor artifact
 

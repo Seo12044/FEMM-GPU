@@ -1,8 +1,8 @@
 # GPU solver CLI and file formats
 
-`gpu_linear_p1_poc` is a CUDA FP64 planar P1 magnetostatic solver. Its command
-line interface uses files for both input and output. It does not modify an
-installed FEMM directory.
+`gpu_linear_p1_poc` is a CUDA FP64 planar and axisymmetric P1 magnetostatic
+solver. Its command line interface uses files for both input and output. It
+does not modify an installed FEMM directory.
 
 See the repository [README](../README.md) for build instructions and a quick
 start.
@@ -14,7 +14,7 @@ start.
 | `--self-test` | Test the analytic models, parsers, batch path, and determinism |
 | `--mesh-artifact <file>` | Validate a neutral or legacy GPU FEMM mesh artifact |
 | `--capabilities` | Print the supported physics and neutral protocol as JSON |
-| `--solve <request> <response>` | Solve one project-neutral planar DC problem |
+| `--solve <request> <response>` | Solve one project-neutral DC magnetostatic problem |
 | `--motor-single-sample <request> <response>` | Solve one motor operating point |
 | `--motor-batch <request> <response>` | Solve a batch of operating points |
 | `--motor-batch-profile <request> <response>` | Solve a batch and record stage timings |
@@ -86,6 +86,35 @@ or malformed solver response leaves any existing output file unchanged.
 
 The exact request schema is in
 [`schemas/gpu_femm_planar_dc_sample_v1.schema.json`](schemas/gpu_femm_planar_dc_sample_v1.schema.json).
+
+## Generic axisymmetric and periodic artifacts
+
+The preparer emits `gpu_femm_magnetostatic_mesh_v1` when the FEMM source is
+axisymmetric or contains ordinary periodic/anti-periodic boundaries. The
+artifact adds `resolved.node_constraints`; each entry states
+`A(node_b)=A(node_a)` or `A(node_b)=-A(node_a)`. Cycles are checked for sign
+contradictions before the artifact is written and again before assembly.
+
+`--solve` automatically selects `gpu_femm_magnetostatic_sample_v1` for this
+artifact. The request fields and command line are otherwise unchanged. Generic
+responses use:
+
+- `node_potential`, with `node_potential_quantity` and `node_potential_unit`
+- `element_B_component_1_T` and `element_B_component_2_T`
+- `field_components` equal to `Bx, By` for planar or `Br, Bz` for axisymmetric
+
+For axisymmetric models, the nodal potential is FEMM's poloidal flux function
+in Wb. Internally, the solver uses conventional P1 A-phi interpolation and a
+seven-point triangle quadrature. Matrix assembly runs on the host; the reduced
+FP64 system is solved by the existing CUDA CSR PCG backend. General periodic
+constraints use a signed degree-of-freedom map and exact `T^T K T` reduction.
+
+The generic protocol intentionally rejects force/torque, radial air-gap
+sampling, and sliding-band rotation. Those postprocessors currently assume
+the legacy planar operator. The schemas are
+[`schemas/gpu_femm_magnetostatic_mesh_v1.schema.json`](schemas/gpu_femm_magnetostatic_mesh_v1.schema.json)
+and
+[`schemas/gpu_femm_magnetostatic_sample_v1.schema.json`](schemas/gpu_femm_magnetostatic_sample_v1.schema.json).
 
 ## `gpu_femm_mesh_v1`
 
@@ -216,6 +245,9 @@ is used; `host_assembly_seconds` is zero when device assembly is active.
 - The established host nonlinear assembly remains available and is selected
   automatically if device-plan setup or execution fails.
 - Linear systems use a GPU-resident CSR Jacobi-PCG solver.
+- Axisymmetric and general periodic operators assemble on the host and use the
+  same GPU-resident PCG solve. Planar models without these constraints retain
+  the existing device-assembly path.
 - Supported GPUs can use cooperative multi-block PCG for small batches on
   large meshes. Other cases use the deterministic fallback kernel.
 - V1 force and torque use a default weighted-stress mask; radial air-gap B uses
@@ -249,10 +281,14 @@ output failure. The JSON `solve_status` uses these stable names:
 
 ## Test fixtures
 
-`tests/fixtures` contains three fixed references:
+`tests/fixtures` contains six fixed references:
 
 - `linear_square_v1`: linear field and flux
 - `nonlinear_pm_coil_v1`: nonlinear steel, PM, coil, force, torque, and air-gap field
 - `35PN230_v1`: B-H preprocessing and interpolation
+- `periodic_strip_v1`: general periodic-node reduction against stock FEMM
+- `antiperiodic_strip_v1`: signed anti-periodic reduction against stock FEMM
+- `axisymmetric_coil_v1`: axisymmetric potential and flux against stock FEMM
 
-All CTest cases, including the analytic self-test, execute CUDA kernels.
+The solver and numerical reference tests execute CUDA kernels. The preparer
+parser and mesh no-op helper tests do not require a GPU.

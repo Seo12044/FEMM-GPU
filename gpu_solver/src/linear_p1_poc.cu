@@ -24,7 +24,9 @@
 #include <utility>
 #include <vector>
 
+#include "axisymmetric_p1.h"
 #include "native_airgap_matrix.h"
+#include "signed_node_constraints.h"
 
 // Legacy CUDA/MSVC compatibility headers reserve these otherwise ordinary
 // FEMM local-variable names.  They are not used as macros in this source.
@@ -1038,6 +1040,8 @@ struct Assembly {
   std::vector<std::vector<double>> source_load_per_circuit;
   std::vector<int32_t> free_nodes;
   std::vector<double> boundary_values;
+  std::vector<int32_t> node_to_free;
+  std::vector<int8_t> node_sign;
 };
 
 // Element traversal is deliberately the accumulation order: map insertion
@@ -1949,6 +1953,11 @@ struct NonlinearTriangle {
   int32_t material = -1;
 };
 
+enum class MagneticProblemType {
+  kPlanar,
+  kAxisymmetric,
+};
+
 // FEMM's native Air Gap Element (AGE) represents the annular air band without
 // re-triangulating it.  The four node/weight pairs map each annulus endpoint
 // to the independently meshed rotor and stator rings.
@@ -1977,8 +1986,10 @@ struct NonlinearModel {
   std::vector<AirGapElement> air_gap_elements;
   std::vector<int32_t> dirichlet_nodes;
   std::vector<double> dirichlet_a_wb_per_m;
+  std::vector<SignedNodeConstraint> node_constraints;
   int32_t circuit_count = 1;
   double depth_m = 0.0;
+  MagneticProblemType problem_type = MagneticProblemType::kPlanar;
 };
 
 struct NonlinearOptions {
@@ -2051,7 +2062,8 @@ bool BuildElementTerms(const Node p[3], NonlinearElementTerms* terms)
 Status ValidateNonlinearModel(const NonlinearModel& model)
 {
   if (model.nodes.empty() || model.triangles.empty() || model.materials.empty()
-      || !(model.depth_m > 0.0) || !std::isfinite(model.depth_m)
+      || (model.problem_type == MagneticProblemType::kPlanar
+          && (!(model.depth_m > 0.0) || !std::isfinite(model.depth_m)))
       || model.circuit_count < 0
       || model.dirichlet_nodes.empty()
       || model.dirichlet_nodes.size() != model.dirichlet_a_wb_per_m.size()) {
@@ -2068,7 +2080,8 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
   if (model.dirichlet_nodes.size() == model.nodes.size())
     return Status::kBoundaryInvalid;
   for (const Node& node : model.nodes) {
-    if (!std::isfinite(node.x_m) || !std::isfinite(node.y_m))
+    if (!std::isfinite(node.x_m) || !std::isfinite(node.y_m)
+        || (model.problem_type == MagneticProblemType::kAxisymmetric && node.x_m < 0.0))
       return Status::kMeshInvalid;
   }
   for (const NonlinearMaterial& material : model.materials) {
@@ -2107,6 +2120,8 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
       return Status::kMeshInvalid;
   }
   for (const AirGapElement& age : model.air_gap_elements) {
+    if (model.problem_type != MagneticProblemType::kPlanar)
+      return Status::kUnsupportedFeature;
     const size_t elements = age.quad_points.size() - 1;
     if (age.quad_points.size() < 3 || !(age.inner_radius_m > 0.0)
         || !(age.outer_radius_m > age.inner_radius_m) || !(age.arc_length_deg > 0.0)
@@ -2123,7 +2138,141 @@ Status ValidateNonlinearModel(const NonlinearModel& model)
     if (!(dt > 0.0) || !std::isfinite(dt))
       return Status::kMeshInvalid;
   }
+  SignedDofMap dofs;
+  const SignedDofStatus dof_status = BuildSignedDofMap(model.nodes.size(),
+      model.node_constraints, model.dirichlet_nodes,
+      model.dirichlet_a_wb_per_m, &dofs);
+  if (dof_status != SignedDofStatus::kOk || dofs.free_roots.empty())
+    return Status::kBoundaryInvalid;
+  if (model.problem_type == MagneticProblemType::kAxisymmetric) {
+    double radius_scale_m = 1e-3;
+    for (const Node& node : model.nodes)
+      radius_scale_m = std::max(radius_scale_m, node.x_m);
+    const double axis_tolerance_m = 1e-12 * radius_scale_m;
+    for (size_t node = 0; node < model.nodes.size(); ++node)
+      if (model.nodes[node].x_m <= axis_tolerance_m
+          && !dofs.root_fixed[dofs.node_root[node]])
+        return Status::kBoundaryInvalid;
+  }
   return Status::kOk;
+}
+
+Status ReduceSignedSystem(const NonlinearModel& model, const SparseRows& full_matrix,
+    const std::vector<double>& full_rhs, Assembly* assembly)
+{
+  if (assembly == nullptr || full_matrix.size() != model.nodes.size()
+      || full_rhs.size() != model.nodes.size())
+    return Status::kInvalidArgument;
+  SignedDofMap dofs;
+  if (BuildSignedDofMap(model.nodes.size(), model.node_constraints,
+          model.dirichlet_nodes, model.dirichlet_a_wb_per_m, &dofs)
+      != SignedDofStatus::kOk || dofs.free_roots.empty())
+    return Status::kBoundaryInvalid;
+
+  const size_t free_count = dofs.free_roots.size();
+  SparseRows reduced(free_count);
+  std::vector<double> reduced_rhs(free_count, 0.0);
+  std::vector<double> rhs_offset(free_count, 0.0);
+  assembly->boundary_values.assign(model.nodes.size(), 0.0);
+  assembly->node_to_free.assign(model.nodes.size(), -1);
+  assembly->node_sign = dofs.node_sign;
+  for (size_t node = 0; node < model.nodes.size(); ++node) {
+    const int32_t root = dofs.node_root[node];
+    assembly->node_to_free[node] = dofs.root_to_free[root];
+    if (dofs.root_fixed[root])
+      assembly->boundary_values[node] = static_cast<double>(dofs.node_sign[node])
+          * dofs.root_value[root];
+  }
+  for (size_t node = 0; node < model.nodes.size(); ++node) {
+    const int32_t row = assembly->node_to_free[node];
+    if (row < 0)
+      continue;
+    const double row_sign = static_cast<double>(dofs.node_sign[node]);
+    reduced_rhs[row] += row_sign * full_rhs[node];
+    for (const auto& entry : full_matrix[node]) {
+      const int32_t column_node = entry.first;
+      const int32_t column = assembly->node_to_free[column_node];
+      if (column < 0) {
+        rhs_offset[row] -= row_sign * entry.second
+            * assembly->boundary_values[column_node];
+      } else {
+        const double value = row_sign * static_cast<double>(dofs.node_sign[column_node])
+            * entry.second;
+        const Status added = AddSparseEntry(&reduced, row, column, value);
+        if (added != Status::kOk)
+          return added;
+      }
+    }
+  }
+  if (ValidateSparseRows(reduced) != Status::kOk)
+    return Status::kNumericalNonfinite;
+
+  assembly->free_nodes = dofs.free_roots;
+  assembly->row_offsets.assign(free_count + 1, 0);
+  assembly->column_indices.clear();
+  assembly->values.clear();
+  assembly->diagonal.assign(free_count, 0.0);
+  assembly->rhs_per_amp = std::move(reduced_rhs);
+  assembly->rhs_offset = std::move(rhs_offset);
+  for (size_t row = 0; row < free_count; ++row) {
+    assembly->row_offsets[row] = static_cast<int32_t>(assembly->values.size());
+    for (const auto& entry : reduced[row]) {
+      if (entry.second == 0.0)
+        continue;
+      assembly->column_indices.push_back(entry.first);
+      assembly->values.push_back(entry.second);
+      if (entry.first == static_cast<int32_t>(row))
+        assembly->diagonal[row] = entry.second;
+    }
+    if (!(assembly->diagonal[row] > 0.0)
+        || !std::isfinite(assembly->diagonal[row])
+        || !std::isfinite(assembly->rhs_per_amp[row])
+        || !std::isfinite(assembly->rhs_offset[row]))
+      return Status::kAssemblyFailed;
+  }
+  assembly->row_offsets[free_count] = static_cast<int32_t>(assembly->values.size());
+  return Status::kOk;
+}
+
+std::vector<double> ExpandAssemblySolution(const Assembly& assembly,
+    const std::vector<double>& free_solution)
+{
+  std::vector<double> expanded = assembly.boundary_values;
+  if (!assembly.node_to_free.empty()) {
+    for (size_t node = 0; node < expanded.size(); ++node) {
+      const int32_t row = assembly.node_to_free[node];
+      if (row >= 0 && static_cast<size_t>(row) < free_solution.size())
+        expanded[node] = static_cast<double>(assembly.node_sign[node]) * free_solution[row];
+    }
+  } else {
+    for (size_t row = 0; row < free_solution.size(); ++row)
+      expanded[assembly.free_nodes[row]] = free_solution[row];
+  }
+  return expanded;
+}
+
+bool EvaluateNonlinearMaterial(const NonlinearModel& model,
+    const NonlinearMaterial& material, double b_magnitude, bool use_newton,
+    double* reluctivity, double* reluctivity_derivative)
+{
+  if (reluctivity == nullptr || reluctivity_derivative == nullptr)
+    return false;
+  const NonlinearBhEvaluation bh = material.bh_curve_index >= 0
+      ? EvaluateNonlinearBh(model.bh_curves[material.bh_curve_index], b_magnitude)
+      : NonlinearBhEvaluation {};
+  *reluctivity = material.bh_curve_index >= 0 ? bh.reluctivity_m_per_h
+      : material.reluctivity_zero_m_per_h
+          * (1.0 + material.alpha_per_t2 * b_magnitude * b_magnitude);
+  *reluctivity_derivative = use_newton
+      ? (material.bh_curve_index >= 0 ? bh.dv_db2
+                                      : material.reluctivity_zero_m_per_h
+            * material.alpha_per_t2)
+      : 0.0;
+  if (!use_newton && material.bh_curve_index >= 0)
+    *reluctivity = model.bh_curves[material.bh_curve_index]
+        .cold_secant_reluctivity_m_per_h;
+  return *reluctivity > 0.0 && std::isfinite(*reluctivity)
+      && std::isfinite(*reluctivity_derivative);
 }
 
 Status AssembleNonlinearNewton(const NonlinearModel& model,
@@ -2152,62 +2301,99 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
     const NonlinearMaterial& material = model.materials[triangle.material];
     Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
       model.nodes[triangle.node[2]] };
-    NonlinearElementTerms terms;
-    if (!BuildElementTerms(p, &terms))
-      return Status::kMeshInvalid;
-    double bx = 0.0;
-    double by = 0.0;
-    for (int i = 0; i < 3; ++i) {
-      bx += a_old[triangle.node[i]] * terms.b_x[i];
-      by += a_old[triangle.node[i]] * terms.b_y[i];
-    }
-    const double b_magnitude = std::hypot(bx, by);
-    const NonlinearBhEvaluation bh = material.bh_curve_index >= 0
-        ? EvaluateNonlinearBh(model.bh_curves[material.bh_curve_index], b_magnitude)
-        : NonlinearBhEvaluation {};
-    double reluctivity = material.bh_curve_index >= 0 ? bh.reluctivity_m_per_h
-                                                      : material.reluctivity_zero_m_per_h
-            * (1.0 + material.alpha_per_t2 * b_magnitude * b_magnitude);
-    // The Newton term uses d(v)/d(B^2), so a v0*(1+alpha*B^2)
-    // material contributes v0*alpha without an extra |B| factor.
-    const double reluctivity_derivative = use_newton
-        ? (material.bh_curve_index >= 0 ? bh.dv_db2
-                                        : material.reluctivity_zero_m_per_h * material.alpha_per_t2)
-        : 0.0;
-    if (!use_newton && material.bh_curve_index >= 0) {
-      const NonlinearBhCurve& curve = model.bh_curves[material.bh_curve_index];
-      reluctivity = curve.cold_secant_reluctivity_m_per_h;
-    }
-    if (!(reluctivity > 0.0) || !std::isfinite(reluctivity)
-        || !std::isfinite(reluctivity_derivative))
-      return Status::kNumericalNonfinite;
     const double theta_rad = material.magnetization_deg * 3.141592653589793238462643383279502884 / 180.0;
     const double hcx = material.h_c_a_per_m * std::cos(theta_rad);
     const double hcy = material.h_c_a_per_m * std::sin(theta_rad);
-    for (int i = 0; i < 3; ++i) {
-      const int global_i = triangle.node[i];
-      const double coil = terms.area_m2 * material.source_j_per_a / 3.0;
-      const double pm = terms.area_m2 * (hcx * terms.b_x[i] + hcy * terms.b_y[i]);
-      if (material.circuit_index >= 0) {
-        const size_t circuit = static_cast<size_t>(material.circuit_index);
-        assembly->source_load_per_circuit[circuit][global_i] += coil;
-        rhs[global_i] += circuit_currents_a[circuit] * coil;
+    if (model.problem_type == MagneticProblemType::kPlanar) {
+      NonlinearElementTerms terms;
+      if (!BuildElementTerms(p, &terms))
+        return Status::kMeshInvalid;
+      double bx = 0.0, by = 0.0;
+      for (int i = 0; i < 3; ++i) {
+        bx += a_old[triangle.node[i]] * terms.b_x[i];
+        by += a_old[triangle.node[i]] * terms.b_y[i];
       }
-      rhs[global_i] += pm;
-      const double b_dot_i = bx * terms.b_x[i] + by * terms.b_y[i];
-      for (int j = 0; j < 3; ++j) {
-        const int global_j = triangle.node[j];
-        const double b_dot_j = bx * terms.b_x[j] + by * terms.b_y[j];
-        const double k = terms.area_m2 * reluctivity
-            * (terms.b_x[i] * terms.b_x[j] + terms.b_y[i] * terms.b_y[j]);
-        const double c = use_newton ? 2.0 * terms.area_m2 * reluctivity_derivative
-                * b_dot_i * b_dot_j
-                                    : 0.0;
-        const Status added = AddSparseEntry(&jacobian, global_i, global_j, k + c);
-        if (added != Status::kOk)
-          return added;
-        if (use_newton)
-          rhs[global_i] += c * a_old[global_j];
+      double reluctivity = 0.0, reluctivity_derivative = 0.0;
+      if (!EvaluateNonlinearMaterial(model, material, std::hypot(bx, by),
+              use_newton, &reluctivity, &reluctivity_derivative))
+        return Status::kNumericalNonfinite;
+      for (int i = 0; i < 3; ++i) {
+        const int global_i = triangle.node[i];
+        const double coil = terms.area_m2 * material.source_j_per_a / 3.0;
+        const double pm = terms.area_m2
+            * (hcx * terms.b_x[i] + hcy * terms.b_y[i]);
+        if (material.circuit_index >= 0) {
+          const size_t circuit = static_cast<size_t>(material.circuit_index);
+          assembly->source_load_per_circuit[circuit][global_i] += coil;
+          rhs[global_i] += circuit_currents_a[circuit] * coil;
+        }
+        rhs[global_i] += pm;
+        const double b_dot_i = bx * terms.b_x[i] + by * terms.b_y[i];
+        for (int j = 0; j < 3; ++j) {
+          const int global_j = triangle.node[j];
+          const double b_dot_j = bx * terms.b_x[j] + by * terms.b_y[j];
+          const double k = terms.area_m2 * reluctivity
+              * (terms.b_x[i] * terms.b_x[j] + terms.b_y[i] * terms.b_y[j]);
+          const double c = use_newton ? 2.0 * terms.area_m2
+                  * reluctivity_derivative * b_dot_i * b_dot_j
+                                      : 0.0;
+          const Status added = AddSparseEntry(&jacobian, global_i, global_j, k + c);
+          if (added != Status::kOk)
+            return added;
+          if (use_newton)
+            rhs[global_i] += c * a_old[global_j];
+        }
+      }
+    } else {
+      const double radius[3] = { p[0].x_m, p[1].x_m, p[2].x_m };
+      const double axial[3] = { p[0].y_m, p[1].y_m, p[2].y_m };
+      AxisymmetricP1Element element;
+      if (!BuildAxisymmetricP1Element(radius, axial, &element))
+        return Status::kMeshInvalid;
+      constexpr double kTwoPi = 6.283185307179586476925286766559005768;
+      for (const AxisymmetricP1Point& point : element.points) {
+        double br = 0.0, bz = 0.0;
+        for (int local = 0; local < 3; ++local) {
+          const double value = a_old[triangle.node[local]];
+          br += value * point.br_basis_per_m[local];
+          bz += value * point.bz_basis_per_m[local];
+        }
+        double reluctivity = 0.0, reluctivity_derivative = 0.0;
+        if (!EvaluateNonlinearMaterial(model, material, std::hypot(br, bz),
+                use_newton, &reluctivity, &reluctivity_derivative))
+          return Status::kNumericalNonfinite;
+        const double volume_weight = kTwoPi * point.radius_m * point.weight_area_m2;
+        for (int i = 0; i < 3; ++i) {
+          const int global_i = triangle.node[i];
+          const double coil = volume_weight * material.source_j_per_a
+              * point.shape[i];
+          const double pm = volume_weight
+              * (hcx * point.br_basis_per_m[i] + hcy * point.bz_basis_per_m[i]);
+          if (material.circuit_index >= 0) {
+            const size_t circuit = static_cast<size_t>(material.circuit_index);
+            assembly->source_load_per_circuit[circuit][global_i] += coil;
+            rhs[global_i] += circuit_currents_a[circuit] * coil;
+          }
+          rhs[global_i] += pm;
+          const double b_dot_i = br * point.br_basis_per_m[i]
+              + bz * point.bz_basis_per_m[i];
+          for (int j = 0; j < 3; ++j) {
+            const int global_j = triangle.node[j];
+            const double b_dot_j = br * point.br_basis_per_m[j]
+                + bz * point.bz_basis_per_m[j];
+            const double k = volume_weight * reluctivity
+                * (point.br_basis_per_m[i] * point.br_basis_per_m[j]
+                    + point.bz_basis_per_m[i] * point.bz_basis_per_m[j]);
+            const double c = use_newton ? 2.0 * volume_weight
+                    * reluctivity_derivative * b_dot_i * b_dot_j
+                                        : 0.0;
+            const Status added = AddSparseEntry(&jacobian, global_i, global_j, k + c);
+            if (added != Status::kOk)
+              return added;
+            if (use_newton)
+              rhs[global_i] += c * a_old[global_j];
+          }
+        }
       }
     }
   }
@@ -2271,53 +2457,7 @@ Status AssembleNonlinearNewton(const NonlinearModel& model,
   const Status sparse_validation = ValidateSparseRows(jacobian);
   if (sparse_validation != Status::kOk)
     return sparse_validation;
-
-  std::vector<bool> is_boundary(node_count, false);
-  assembly->boundary_values.assign(node_count, 0.0);
-  for (size_t i = 0; i < model.dirichlet_nodes.size(); ++i) {
-    is_boundary[model.dirichlet_nodes[i]] = true;
-    assembly->boundary_values[model.dirichlet_nodes[i]] = model.dirichlet_a_wb_per_m[i];
-  }
-  assembly->free_nodes.clear();
-  std::vector<int32_t> free_index(node_count, -1);
-  for (size_t node = 0; node < node_count; ++node) {
-    if (!is_boundary[node]) {
-      free_index[node] = static_cast<int32_t>(assembly->free_nodes.size());
-      assembly->free_nodes.push_back(static_cast<int32_t>(node));
-    }
-  }
-  const size_t free_count = assembly->free_nodes.size();
-  assembly->row_offsets.assign(free_count + 1, 0);
-  assembly->column_indices.clear();
-  assembly->values.clear();
-  assembly->diagonal.assign(free_count, 0.0);
-  assembly->rhs_per_amp.assign(free_count, 0.0);
-  assembly->rhs_offset.assign(free_count, 0.0);
-  for (size_t row = 0; row < free_count; ++row) {
-    const int global_row = assembly->free_nodes[row];
-    assembly->row_offsets[row] = static_cast<int32_t>(assembly->values.size());
-    assembly->rhs_per_amp[row] = rhs[global_row];
-    for (const auto& entry : jacobian[global_row]) {
-      const int32_t global_column = entry.first;
-      const double value = entry.second;
-      if (is_boundary[global_column]) {
-        assembly->rhs_offset[row] -= value * assembly->boundary_values[global_column];
-      } else if (value != 0.0) {
-        const int32_t column = free_index[global_column];
-        if (column < 0)
-          return Status::kAssemblyFailed;
-        assembly->column_indices.push_back(column);
-        assembly->values.push_back(value);
-        if (static_cast<size_t>(column) == row)
-          assembly->diagonal[row] = value;
-      }
-    }
-    if (!(assembly->diagonal[row] > 0.0) || !std::isfinite(assembly->diagonal[row])
-        || !std::isfinite(assembly->rhs_per_amp[row]) || !std::isfinite(assembly->rhs_offset[row]))
-      return Status::kAssemblyFailed;
-  }
-  assembly->row_offsets[free_count] = static_cast<int32_t>(assembly->values.size());
-  return Status::kOk;
+  return ReduceSignedSystem(model, jacobian, rhs, assembly);
 }
 
 Status AssembleNonlinearNewton(const NonlinearModel& model,
@@ -2539,6 +2679,9 @@ class DeviceNonlinearAssemblyPlan {
   {
     if (ValidateNonlinearModel(model) != Status::kOk)
       return Status::kInvalidArgument;
+    if (model.problem_type != MagneticProblemType::kPlanar
+        || !model.node_constraints.empty())
+      return Status::kUnsupportedFeature;
     node_count_ = model.nodes.size();
     circuit_count_ = model.circuit_count;
     std::vector<bool> boundary(node_count_, false);
@@ -2867,9 +3010,7 @@ class NonlinearP1FixtureSolver {
         result.info = linear_info;
         return result;
       }
-      std::vector<double> candidate = assembly.boundary_values;
-      for (size_t row = 0; row < free_solution.size(); ++row)
-        candidate[assembly.free_nodes[row]] = free_solution[row];
+      std::vector<double> candidate = ExpandAssemblySolution(assembly, free_solution);
       double difference_sq = 0.0;
       double candidate_sq = 0.0;
       for (size_t i = 0; i < candidate.size(); ++i) {
@@ -2933,7 +3074,19 @@ class NonlinearP1FixtureSolver {
       for (size_t boundary = 0; boundary < model_.dirichlet_nodes.size(); ++boundary)
         states[item][model_.dirichlet_nodes[boundary]] = model_.dirichlet_a_wb_per_m[boundary];
     }
-    bool device_assembly_active = requested_mode != NonlinearAssemblyMode::kHost;
+    const bool device_assembly_supported =
+        model_.problem_type == MagneticProblemType::kPlanar
+        && model_.node_constraints.empty();
+    bool device_assembly_active = requested_mode != NonlinearAssemblyMode::kHost
+        && device_assembly_supported;
+    if (requested_mode == NonlinearAssemblyMode::kDevice
+        && !device_assembly_supported) {
+      for (size_t item = 0; item < results.size(); ++item)
+        if (active[item]) {
+          results[item].info.status = Status::kUnsupportedFeature;
+          active[item] = false;
+        }
+    }
     if (device_assembly_active) {
       device_assembly_ = std::make_unique<DeviceNonlinearAssemblyPlan>();
       const Status plan_status = device_assembly_->Initialize(model_);
@@ -3020,9 +3173,8 @@ class NonlinearP1FixtureSolver {
             active[item] = false;
             continue;
           }
-          std::vector<double> candidate = assembly.boundary_values;
-          for (size_t row = 0; row < free_solutions[local].size(); ++row)
-            candidate[assembly.free_nodes[row]] = free_solutions[local][row];
+          std::vector<double> candidate = ExpandAssemblySolution(
+              assembly, free_solutions[local]);
           double difference_sq = 0.0, candidate_sq = 0.0;
           for (size_t node = 0; node < candidate.size(); ++node) {
             const double difference = candidate[node] - states[item][node];
@@ -3152,9 +3304,8 @@ class NonlinearP1FixtureSolver {
           active[item] = false;
           continue;
         }
-        std::vector<double> candidate = assemblies[local].boundary_values;
-        for (size_t row = 0; row < free_solutions[local].size(); ++row)
-          candidate[assemblies[local].free_nodes[row]] = free_solutions[local][row];
+        std::vector<double> candidate = ExpandAssemblySolution(
+            assemblies[local], free_solutions[local]);
         double difference_sq = 0.0, candidate_sq = 0.0;
         for (size_t node = 0; node < candidate.size(); ++node) {
           const double difference = candidate[node] - states[item][node];
@@ -3224,20 +3375,55 @@ class NonlinearP1FixtureSolver {
         result->info.status = Status::kMeshInvalid;
         return *result;
       }
-      for (int i = 0; i < 3; ++i) {
-        result->bx_t[element] += result->a_wb_per_m[triangle.node[i]] * terms.b_x[i];
-        result->by_t[element] += result->a_wb_per_m[triangle.node[i]] * terms.b_y[i];
-      }
       const NonlinearMaterial& material = model_.materials[triangle.material];
-      if (material.circuit_index >= 0) {
-        const size_t circuit = static_cast<size_t>(material.circuit_index);
-        result->circuit_flux_linkage_wb[circuit] += terms.area_m2 * material.source_j_per_a / 3.0
-            * (result->a_wb_per_m[triangle.node[0]] + result->a_wb_per_m[triangle.node[1]]
-                + result->a_wb_per_m[triangle.node[2]]);
+      if (model_.problem_type == MagneticProblemType::kPlanar) {
+        for (int i = 0; i < 3; ++i) {
+          result->bx_t[element] += result->a_wb_per_m[triangle.node[i]] * terms.b_x[i];
+          result->by_t[element] += result->a_wb_per_m[triangle.node[i]] * terms.b_y[i];
+        }
+        if (material.circuit_index >= 0) {
+          const size_t circuit = static_cast<size_t>(material.circuit_index);
+          result->circuit_flux_linkage_wb[circuit] += terms.area_m2
+              * material.source_j_per_a / 3.0
+              * (result->a_wb_per_m[triangle.node[0]]
+                  + result->a_wb_per_m[triangle.node[1]]
+                  + result->a_wb_per_m[triangle.node[2]]);
+        }
+      } else {
+        const double radius[3] = { p[0].x_m, p[1].x_m, p[2].x_m };
+        const double axial[3] = { p[0].y_m, p[1].y_m, p[2].y_m };
+        const double nodal_a[3] = {
+          result->a_wb_per_m[triangle.node[0]],
+          result->a_wb_per_m[triangle.node[1]],
+          result->a_wb_per_m[triangle.node[2]],
+        };
+        if (!EvaluateAxisymmetricP1Centroid(radius, axial, nodal_a,
+                &result->bx_t[element], &result->by_t[element])) {
+          result->info.status = Status::kMeshInvalid;
+          return *result;
+        }
+        if (material.circuit_index >= 0) {
+          AxisymmetricP1Element axisymmetric;
+          if (!BuildAxisymmetricP1Element(radius, axial, &axisymmetric)) {
+            result->info.status = Status::kMeshInvalid;
+            return *result;
+          }
+          constexpr double kTwoPi = 6.283185307179586476925286766559005768;
+          double flux = 0.0;
+          for (const AxisymmetricP1Point& point : axisymmetric.points) {
+            double a = 0.0;
+            for (int local = 0; local < 3; ++local)
+              a += point.shape[local] * nodal_a[local];
+            flux += kTwoPi * point.radius_m * point.weight_area_m2
+                * material.source_j_per_a * a;
+          }
+          result->circuit_flux_linkage_wb[material.circuit_index] += flux;
+        }
       }
     }
     for (double& flux : result->circuit_flux_linkage_wb) {
-      flux *= model_.depth_m;
+      if (model_.problem_type == MagneticProblemType::kPlanar)
+        flux *= model_.depth_m;
       if (!std::isfinite(flux))
         result->info.status = Status::kNumericalNonfinite;
     }
@@ -3713,7 +3899,9 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* schema = JsonMember(root, "schema_version", StrictJson::Type::kString, error);
   if (schema == nullptr)
     return false;
-  const bool neutral_schema = schema->string == "gpu_femm_planar_dc_mesh_v1";
+  const bool legacy_neutral_schema = schema->string == "gpu_femm_planar_dc_mesh_v1";
+  const bool generic_neutral_schema = schema->string == "gpu_femm_magnetostatic_mesh_v1";
+  const bool neutral_schema = legacy_neutral_schema || generic_neutral_schema;
   const bool motor_v1 = schema->string == "gpu_femm_mesh_v1";
   const bool motor_v2 = schema->string == "gpu_femm_mesh_v2";
   if ((!neutral_schema && !motor_v1 && !motor_v2)
@@ -3736,9 +3924,13 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       || !(neutral_schema ? JsonLowerSha256(identity->string)
                           : JsonSha256(identity->string))
       || !(neutral_schema
-              ? ExactObject(*resolved, { "source_fem_sha256", "model", "nodes_mm",
-                    "triangles", "regions", "materials", "circuits",
-                    "outer_dirichlet" }, error)
+              ? (generic_neutral_schema
+                    ? ExactObject(*resolved, { "source_fem_sha256", "model", "nodes_mm",
+                          "triangles", "regions", "materials", "circuits",
+                          "outer_dirichlet", "node_constraints" }, error)
+                    : ExactObject(*resolved, { "source_fem_sha256", "model", "nodes_mm",
+                          "triangles", "regions", "materials", "circuits",
+                          "outer_dirichlet" }, error))
               : (motor_v1
                     ? ExactObject(*resolved, { "source_fem_sha256",
                           "base_motor_fem_sha256", "model", "pose", "nodes_mm",
@@ -3764,9 +3956,13 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* materials = JsonMember(*resolved, "materials", StrictJson::Type::kArray, error);
   const StrictJson* circuits = JsonMember(*resolved, "circuits", StrictJson::Type::kArray, error);
   const StrictJson* boundary = JsonMember(*resolved, "outer_dirichlet", StrictJson::Type::kObject, error);
+  const StrictJson* node_constraints = generic_neutral_schema
+      ? JsonMember(*resolved, "node_constraints", StrictJson::Type::kArray, error)
+      : nullptr;
   if (resolved_sha == nullptr || base_sha == nullptr || model == nullptr
       || (!neutral_schema && pose == nullptr) || nodes == nullptr || triangles == nullptr || regions == nullptr
       || materials == nullptr || circuits == nullptr || boundary == nullptr
+      || (generic_neutral_schema && node_constraints == nullptr)
       || !(neutral_schema ? JsonLowerSha256(resolved_sha->string)
                           : JsonSha256(resolved_sha->string))
       || !(neutral_schema ? JsonLowerSha256(base_sha->string)
@@ -3781,8 +3977,13 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* depth = JsonMember(*model, "depth_mm", StrictJson::Type::kNumber, error);
   const StrictJson* type = JsonMember(*model, "problem_type", StrictJson::Type::kString, error);
   const StrictJson* frequency = JsonMember(*model, "frequency_hz", StrictJson::Type::kNumber, error);
+  const bool planar_problem = type != nullptr && type->string == "planar";
+  const bool axisymmetric_problem = type != nullptr && type->string == "axisymmetric";
   if (depth == nullptr || type == nullptr || frequency == nullptr || !(depth->number > 0.0)
-      || type->string != "planar" || frequency->number != 0.0) {
+      || frequency->number != 0.0
+      || (legacy_neutral_schema && !planar_problem)
+      || (!generic_neutral_schema && !planar_problem)
+      || (generic_neutral_schema && !planar_problem && !axisymmetric_problem)) {
     *error = "unsupported model physics";
     return false;
   }
@@ -3817,6 +4018,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   parsed.displacement_mm[0] = neutral_schema ? 0.0 : displacement->array[0].number;
   parsed.displacement_mm[1] = neutral_schema ? 0.0 : displacement->array[1].number;
   parsed.model.depth_m = depth->number * 1e-3;
+  parsed.model.problem_type = axisymmetric_problem
+      ? MagneticProblemType::kAxisymmetric : MagneticProblemType::kPlanar;
   for (const StrictJson& pair : nodes->array) {
     if (pair.type != StrictJson::Type::kArray || pair.array.size() != 2
         || pair.array[0].type != StrictJson::Type::kNumber || pair.array[1].type != StrictJson::Type::kNumber) {
@@ -4014,6 +4217,29 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     parsed.model.dirichlet_nodes.push_back(node);
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
   }
+  if (generic_neutral_schema) {
+    for (const StrictJson& entry : node_constraints->array) {
+      if (!ExactObject(entry, { "node_a", "node_b", "relation" }, error))
+        return false;
+      const StrictJson* node_a = JsonMember(entry, "node_a", StrictJson::Type::kNumber, error);
+      const StrictJson* node_b = JsonMember(entry, "node_b", StrictJson::Type::kNumber, error);
+      const StrictJson* relation = JsonMember(entry, "relation", StrictJson::Type::kString, error);
+      SignedNodeConstraint constraint;
+      if (node_a == nullptr || node_b == nullptr || relation == nullptr
+          || !JsonInteger(*node_a, &constraint.node_a)
+          || !JsonInteger(*node_b, &constraint.node_b)
+          || constraint.node_a < 0 || constraint.node_b < 0
+          || static_cast<size_t>(constraint.node_a) >= parsed.model.nodes.size()
+          || static_cast<size_t>(constraint.node_b) >= parsed.model.nodes.size()
+          || constraint.node_a == constraint.node_b
+          || (relation->string != "periodic" && relation->string != "antiperiodic")) {
+        *error = "invalid periodic node constraint";
+        return false;
+      }
+      constraint.sign = relation->string == "periodic" ? 1 : -1;
+      parsed.model.node_constraints.push_back(constraint);
+    }
+  }
   if (is_sliding_band_v2) {
     const auto ages_it = resolved->object.find("air_gap_elements");
     if (ages_it == resolved->object.end() || (ages_it->second.type != StrictJson::Type::kArray && ages_it->second.type != StrictJson::Type::kObject)
@@ -4124,7 +4350,8 @@ int GpuFemmMeshArtifactTest(const std::string& path)
             << " triangles=" << artifact.model.triangles.size()
             << " circuits=" << artifact.model.circuit_count
             << " source_fem_sha256=" << artifact.pose_fem_sha256;
-  if (artifact.schema_version != "gpu_femm_planar_dc_mesh_v1")
+  if (artifact.schema_version == "gpu_femm_mesh_v1"
+      || artifact.schema_version == "gpu_femm_mesh_v2")
     std::cout << " base_motor_fem_sha256=" << artifact.base_motor_fem_sha256;
   std::cout << '\n';
   return 0;
@@ -5609,6 +5836,7 @@ struct MotorSampleRequest {
 // remains frozen for the MATLAB adapter; this request exposes the same solver
 // without requiring motor identity, pose, or force-integration fields.
 struct PlanarDcSampleRequest {
+  std::string protocol = "gpu_femm_planar_dc_sample_v1";
   std::string mesh_artifact_path;
   std::string mesh_artifact_sha256;
   std::vector<double> circuit_currents_a;
@@ -5661,7 +5889,9 @@ bool ReadPlanarDcSampleRequestJson(const std::string& json,
   if (protocol == nullptr || path == nullptr || artifact_sha == nullptr || currents == nullptr
       || force_group == nullptr || air_group == nullptr || radius == nullptr || angles == nullptr
       || sliding_angle == nullptr || compute_force == nullptr || include_field == nullptr
-      || protocol->string != "gpu_femm_planar_dc_sample_v1" || path->string.empty()
+      || (protocol->string != "gpu_femm_planar_dc_sample_v1"
+          && protocol->string != "gpu_femm_magnetostatic_sample_v1")
+      || path->string.empty()
       || !JsonLowerSha256(artifact_sha->string) || !JsonInteger(*force_group, &selected)
       || !JsonInteger(*air_group, &air) || selected < -1 || air < -1
       || ((selected == -1) != (air == -1)) || (selected >= 0 && selected == air)
@@ -5674,6 +5904,7 @@ bool ReadPlanarDcSampleRequestJson(const std::string& json,
     return false;
   }
   request->mesh_artifact_path = path->string;
+  request->protocol = protocol->string;
   request->mesh_artifact_sha256 = artifact_sha->string;
   request->force_group_number = selected;
   request->stress_air_group_number = air;
@@ -5957,6 +6188,10 @@ int MotorSingleSampleAdapter(const std::string& request_path, const std::string&
 bool PlanarDcRequestMatchesArtifact(const PlanarDcSampleRequest& request,
     const GpuFemmMeshArtifact& artifact)
 {
+  const bool generic_request = request.protocol == "gpu_femm_magnetostatic_sample_v1";
+  const bool generic_artifact = artifact.schema_version == "gpu_femm_magnetostatic_mesh_v1";
+  if (generic_request != generic_artifact)
+    return false;
   if (request.circuit_currents_a.size()
       != static_cast<size_t>(artifact.model.circuit_count))
     return false;
@@ -5972,6 +6207,11 @@ bool PlanarDcRequestMatchesArtifact(const PlanarDcSampleRequest& request,
     return false;
   const bool needs_postprocess = request.compute_force_torque
       || !request.airgap_angles_deg.empty();
+  // The generic protocol deliberately exposes only the field solve.  Its
+  // periodic reduction and cylindrical operators are not yet implemented in
+  // the legacy weighted-stress/air-gap postprocessors.
+  if (generic_request)
+    return !needs_postprocess && request.sliding_band_angle_deg == 0.0;
   if (!artifact.has_sliding_band) {
     // A conforming artifact is already posed.  Rotation is only meaningful
     // for a native sliding-band artifact, and weighted-stress postprocessing
@@ -6020,7 +6260,8 @@ std::string EscapeJsonString(const std::string& value)
 bool WritePlanarDcSampleResponse(const std::string& path, Status status,
     Status solve_status, bool postprocess_requested, Status postprocess_status,
     const PlanarDcSampleRequest* request, const NonlinearSolveResult* solution,
-    const FrozenPostprocessResult* postprocess, const std::string& diagnostic)
+    const FrozenPostprocessResult* postprocess, const std::string& diagnostic,
+    const NonlinearModel* model = nullptr)
 {
   std::ofstream output(path, std::ios::trunc);
   if (!output)
@@ -6031,11 +6272,32 @@ bool WritePlanarDcSampleResponse(const std::string& path, Status status,
       && postprocess_status == Status::kOk && postprocess != nullptr;
   const std::string message = status == Status::kOk ? ""
       : (diagnostic.empty() ? StatusName(status) : diagnostic);
+  const std::string protocol = request == nullptr
+      ? "gpu_femm_planar_dc_sample_v1" : request->protocol;
+  const bool generic = protocol == "gpu_femm_magnetostatic_sample_v1";
+  const MagneticProblemType problem_type = model == nullptr
+      ? MagneticProblemType::kPlanar : model->problem_type;
+  const char* node_field_name = generic ? "node_potential" : "node_A_Wb_per_m";
+  const char* first_field_name = generic ? "element_B_component_1_T" : "element_Bx_T";
+  const char* second_field_name = generic ? "element_B_component_2_T" : "element_By_T";
   output << std::setprecision(17)
-         << "{\n  \"protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
+         << "{\n  \"protocol\": \"" << protocol << "\",\n"
          << "  \"mesh_artifact_sha256\": \""
-         << (request == nullptr ? "" : request->mesh_artifact_sha256) << "\",\n"
-         << "  \"status\": \"" << (status == Status::kOk ? "PASS" : "FAIL") << "\",\n"
+         << (request == nullptr ? "" : request->mesh_artifact_sha256) << "\",\n";
+  if (generic)
+    output << "  \"problem_type\": \""
+           << (problem_type == MagneticProblemType::kAxisymmetric ? "axisymmetric" : "planar")
+           << "\",\n  \"field_components\": [\""
+           << (problem_type == MagneticProblemType::kAxisymmetric ? "Br" : "Bx")
+           << "\", \""
+           << (problem_type == MagneticProblemType::kAxisymmetric ? "Bz" : "By")
+           << "\"],\n  \"node_potential_quantity\": \""
+           << (problem_type == MagneticProblemType::kAxisymmetric
+                   ? "poloidal_flux_function" : "magnetic_vector_potential")
+           << "\",\n  \"node_potential_unit\": \""
+           << (problem_type == MagneticProblemType::kAxisymmetric ? "Wb" : "Wb/m")
+           << "\",\n";
+  output << "  \"status\": \"" << (status == Status::kOk ? "PASS" : "FAIL") << "\",\n"
          << "  \"solve_status\": \"" << StatusName(solve_status) << "\",\n"
          << "  \"postprocess_status\": \""
          << (!postprocess_requested ? "NOT_REQUESTED"
@@ -6074,15 +6336,21 @@ bool WritePlanarDcSampleResponse(const std::string& path, Status status,
          << (solved ? solution->bx_t.size() : 0)
          << ",\n  \"field_solution_included\": "
          << (solved && request->include_field_solution ? "true" : "false")
-         << ",\n  \"node_A_Wb_per_m\": [";
+         << ",\n  \"" << node_field_name << "\": [";
   if (solved && request->include_field_solution)
-    for (size_t i = 0; i < solution->a_wb_per_m.size(); ++i)
-      output << (i ? ", " : "") << solution->a_wb_per_m[i];
-  output << "],\n  \"element_Bx_T\": [";
+    for (size_t i = 0; i < solution->a_wb_per_m.size(); ++i) {
+      double potential = solution->a_wb_per_m[i];
+      if (generic && problem_type == MagneticProblemType::kAxisymmetric
+          && model != nullptr && i < model->nodes.size())
+        potential *= 6.283185307179586476925286766559005768
+            * model->nodes[i].x_m;
+      output << (i ? ", " : "") << potential;
+    }
+  output << "],\n  \"" << first_field_name << "\": [";
   if (solved && request->include_field_solution)
     for (size_t i = 0; i < solution->bx_t.size(); ++i)
       output << (i ? ", " : "") << solution->bx_t[i];
-  output << "],\n  \"element_By_T\": [";
+  output << "],\n  \"" << second_field_name << "\": [";
   if (solved && request->include_field_solution)
     for (size_t i = 0; i < solution->by_t.size(); ++i)
       output << (i ? ", " : "") << solution->by_t[i];
@@ -6176,10 +6444,10 @@ int PlanarDcSingleSampleAdapter(const std::string& request_path,
           postprocess_requested, postprocess_status, &request,
           solve_attempted ? &solution : nullptr,
           postprocess_attempted && postprocess_status == Status::kOk ? &postprocess : nullptr,
-          error))
+          error, &artifact.model))
     return 1;
   if (status != Status::kOk) {
-    std::cerr << "FAIL planar-DC solve: "
+    std::cerr << "FAIL magnetostatic solve: "
               << (error.empty() ? StatusName(status) : error) << '\n';
     return 1;
   }
@@ -7231,6 +7499,83 @@ int SelfTest()
           && PlanarDcRequestMatchesArtifact(planar_request, parsed_artifact)
           && planar_request.include_field_solution,
       "project-neutral planar-DC request validates without motor identity fields");
+  SignedDofMap signed_map;
+  expect(BuildSignedDofMap(5,
+             { { 0, 1, 1 }, { 1, 2, -1 } }, { 3 }, { 0.0 }, &signed_map)
+              == SignedDofStatus::kOk
+          && signed_map.node_root[0] == signed_map.node_root[2]
+          && signed_map.node_sign[0] == 1 && signed_map.node_sign[1] == 1
+          && signed_map.node_sign[2] == -1
+          && signed_map.root_fixed[signed_map.node_root[3]],
+      "signed DOF map composes periodic and anti-periodic relations");
+  expect(BuildSignedDofMap(3,
+             { { 0, 1, 1 }, { 1, 2, 1 }, { 0, 2, -1 } }, {}, {},
+             &signed_map)
+              == SignedDofStatus::kContradictoryCycle,
+      "signed DOF map rejects contradictory periodic cycles");
+  NonlinearModel signed_reduction_model;
+  signed_reduction_model.nodes.resize(3);
+  signed_reduction_model.node_constraints = { { 1, 2, -1 } };
+  signed_reduction_model.dirichlet_nodes = { 0 };
+  signed_reduction_model.dirichlet_a_wb_per_m = { 0.0 };
+  SparseRows signed_full_matrix(3);
+  signed_full_matrix[0][0] = 1.0;
+  signed_full_matrix[1][1] = 2.0;
+  signed_full_matrix[1][2] = 1.0;
+  signed_full_matrix[2][1] = 1.0;
+  signed_full_matrix[2][2] = 2.0;
+  Assembly signed_reduction;
+  const Status signed_reduction_status = ReduceSignedSystem(
+      signed_reduction_model, signed_full_matrix, { 0.0, 3.0, -3.0 },
+      &signed_reduction);
+  GpuCsrSolver signed_reduction_solver;
+  std::vector<double> signed_free_solution;
+  SolveInfo signed_reduction_info;
+  if (signed_reduction_status == Status::kOk
+      && signed_reduction_solver.Initialize(signed_reduction) == Status::kOk)
+    signed_reduction_info = signed_reduction_solver.Solve(
+        { signed_reduction.rhs_per_amp[0] + signed_reduction.rhs_offset[0] },
+        1e-14, 16, &signed_free_solution);
+  const std::vector<double> signed_expanded = ExpandAssemblySolution(
+      signed_reduction, signed_free_solution);
+  expect(signed_reduction_status == Status::kOk
+          && signed_reduction_info.status == Status::kOk
+          && signed_expanded.size() == 3
+          && Near(signed_expanded[1], 3.0, 1e-13)
+          && Near(signed_expanded[2], -3.0, 1e-13),
+      "anti-periodic reduction solves T^T K T and reconstructs signed nodes");
+  const double manufactured_radius[3] = { 1.0, 2.0, 1.0 };
+  const double manufactured_axial[3] = { 0.0, 0.0, 1.0 };
+  const double manufactured_a[3] = { 0.25, 0.5, 0.25 };
+  double manufactured_br = 0.0, manufactured_bz = 0.0;
+  expect(EvaluateAxisymmetricP1Centroid(manufactured_radius,
+             manufactured_axial, manufactured_a, &manufactured_br,
+             &manufactured_bz)
+              && Near(manufactured_br, 0.0, 1e-14)
+              && Near(manufactured_bz, 0.5, 1e-14),
+      "axisymmetric P1 curl reproduces A_phi=c*r exactly");
+  std::string generic_mesh_artifact = neutral_mesh_artifact;
+  replace_all(&generic_mesh_artifact, "gpu_femm_planar_dc_mesh_v1",
+      "gpu_femm_magnetostatic_mesh_v1");
+  replace_all(&generic_mesh_artifact, v1_boundary,
+      v1_boundary + ",\"node_constraints\":[{\"node_a\":0,\"node_b\":1,\"relation\":\"periodic\"}]");
+  GpuFemmMeshArtifact generic_artifact;
+  expect(ParseGpuFemmMeshArtifactJson(generic_mesh_artifact,
+             &generic_artifact, &parser_error)
+          && generic_artifact.model.node_constraints.size() == 1
+          && generic_artifact.model.node_constraints[0].sign == 1,
+      std::string("generic periodic artifact parser: ") + parser_error);
+  std::string generic_request_json = planar_request_json;
+  replace_all(&generic_request_json, "gpu_femm_planar_dc_sample_v1",
+      "gpu_femm_magnetostatic_sample_v1");
+  PlanarDcSampleRequest generic_request;
+  expect(ReadPlanarDcSampleRequestJson(generic_request_json, &generic_request,
+             &parser_error)
+          && PlanarDcRequestMatchesArtifact(generic_request, generic_artifact),
+      "generic request binds the periodic artifact schema");
+  generic_request.compute_force_torque = true;
+  expect(!PlanarDcRequestMatchesArtifact(generic_request, generic_artifact),
+      "generic request rejects legacy force/air-gap postprocessing");
   MotorSampleRequest sliding_request = parsed_request;
   sliding_request.rotor_angle_deg = 3.0;
   sliding_request.displacement_mm[0] = 0.0;
@@ -8184,15 +8529,19 @@ int main(int argc, char** argv)
         << "{\n"
         << "  \"schema_version\": \"gpu_femm_capabilities_v1\",\n"
         << "  \"sample_protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
-        << "  \"problem_types\": [\"planar\"],\n"
+        << "  \"sample_protocols\": [\"gpu_femm_planar_dc_sample_v1\", \"gpu_femm_magnetostatic_sample_v1\"],\n"
+        << "  \"problem_types\": [\"planar\", \"axisymmetric\"],\n"
         << "  \"frequency_hz\": [0],\n"
         << "  \"precision\": \"fp64\",\n"
         << "  \"nonlinear_bh\": true,\n"
         << "  \"permanent_magnets\": true,\n"
         << "  \"native_sliding_band\": true,\n"
+        << "  \"general_periodic_node_constraints\": true,\n"
         << "  \"full_field_output\": true,\n"
         << "  \"ac_complex\": false,\n"
-        << "  \"axisymmetric\": false\n"
+        << "  \"axisymmetric\": true,\n"
+        << "  \"axisymmetric_assembly\": \"host\",\n"
+        << "  \"generic_force_airgap_postprocessing\": false\n"
         << "}\n";
     return 0;
   }

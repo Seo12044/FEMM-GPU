@@ -1,0 +1,3 @@
+circuit_current_A=12
+voltage_drop_V=0
+flux_linkage_Wb=1.308485169493925e-008

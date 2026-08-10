@@ -169,8 +169,11 @@ if(BUILD_TESTING)
     TIMEOUT 5
   )
   if(Python3_Interpreter_FOUND)
-    set_tests_properties(gpu_femm_project_neutral_cli
-      gpu_femm_project_neutral_prepare PROPERTIES
+    set_tests_properties(gpu_femm_project_neutral_cli PROPERTIES
+      LABELS "gpu;cli;requires_cuda;femm_fixture"
+      TIMEOUT 10
+    )
+    set_tests_properties(gpu_femm_project_neutral_prepare PROPERTIES
       LABELS "gpu;cli;no_cuda"
       TIMEOUT 10
     )

@@ -21,6 +21,9 @@ from typing import Sequence
 
 
 PROTOCOL = "gpu_femm_planar_dc_sample_v1"
+GENERIC_PROTOCOL = "gpu_femm_magnetostatic_sample_v1"
+LEGACY_ARTIFACT_SCHEMA = "gpu_femm_planar_dc_mesh_v1"
+GENERIC_ARTIFACT_SCHEMA = "gpu_femm_magnetostatic_mesh_v1"
 SOLVE_STATUSES = {
     "OK",
     "INPUT_IO",
@@ -59,10 +62,11 @@ def make_request(
     sliding_band_angle_deg: float = 0.0,
     compute_force_torque: bool = False,
     include_field_solution: bool = False,
+    protocol: str = PROTOCOL,
 ) -> dict[str, object]:
     artifact = artifact.resolve(strict=True)
     return {
-        "protocol": PROTOCOL,
+        "protocol": protocol,
         "mesh_artifact_path": str(artifact),
         "mesh_artifact_sha256": sha256_file(artifact),
         "circuit_currents_A": list(currents),
@@ -120,8 +124,24 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON value {value}")
 
 
+def artifact_protocol(path: Path) -> str:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"mesh artifact is not readable JSON: {error}") from error
+    if not isinstance(document, dict) or not isinstance(document.get("schema_version"), str):
+        raise ValueError("mesh artifact does not declare schema_version")
+    schema = document["schema_version"]
+    if schema == GENERIC_ARTIFACT_SCHEMA:
+        return GENERIC_PROTOCOL
+    if schema == LEGACY_ARTIFACT_SCHEMA:
+        return PROTOCOL
+    raise ValueError(f"unsupported standalone mesh artifact schema: {schema}")
+
+
 def validate_response(
-    path: Path, expected_artifact_sha256: str, returncode: int
+    path: Path, expected_artifact_sha256: str, returncode: int,
+    expected_protocol: str = PROTOCOL,
 ) -> dict[str, object]:
     """Validate the solver-owned response before publishing it to callers."""
     try:
@@ -132,7 +152,7 @@ def validate_response(
     if not isinstance(response, dict):
         raise RuntimeError("GPU solver response must be a JSON object")
     expected_strings = {
-        "protocol": PROTOCOL,
+        "protocol": expected_protocol,
         "mesh_artifact_sha256": expected_artifact_sha256,
     }
     for name, expected in expected_strings.items():
@@ -148,14 +168,38 @@ def validate_response(
         raise RuntimeError("GPU solver response has an unknown solve_status")
     if response["postprocess_status"] not in SOLVE_STATUSES | {"NOT_REQUESTED", "NOT_RUN"}:
         raise RuntimeError("GPU solver response has an unknown postprocess_status")
+    field_names = (
+        ("element_B_component_1_T", "element_B_component_2_T")
+        if expected_protocol == GENERIC_PROTOCOL
+        else ("element_Bx_T", "element_By_T")
+    )
+    if expected_protocol == GENERIC_PROTOCOL:
+        problem_type = response.get("problem_type")
+        components = response.get("field_components")
+        if problem_type not in ("planar", "axisymmetric"):
+            raise RuntimeError("GPU solver response has an invalid problem_type")
+        expected_components = ["Bx", "By"] if problem_type == "planar" else ["Br", "Bz"]
+        if components != expected_components:
+            raise RuntimeError("GPU solver response has invalid field_components")
+        expected_quantity = (
+            "magnetic_vector_potential"
+            if problem_type == "planar"
+            else "poloidal_flux_function"
+        )
+        expected_unit = "Wb/m" if problem_type == "planar" else "Wb"
+        if response.get("node_potential_quantity") != expected_quantity \
+                or response.get("node_potential_unit") != expected_unit:
+            raise RuntimeError("GPU solver response has invalid node potential metadata")
+    node_field_name = (
+        "node_potential" if expected_protocol == GENERIC_PROTOCOL else "node_A_Wb_per_m"
+    )
     for name in (
         "actual_circuit_currents_A",
         "circuit_flux_linkage_Wb",
         "airgap_sample_angles_deg",
         "airgap_radial_flux_density_T",
-        "node_A_Wb_per_m",
-        "element_Bx_T",
-        "element_By_T",
+        node_field_name,
+        *field_names,
     ):
         values = response.get(name)
         if not isinstance(values, list) or not all(_finite_number(value) for value in values):
@@ -176,15 +220,15 @@ def validate_response(
         raise RuntimeError("GPU solver response air-gap result lengths do not match")
     if response["field_solution_included"]:
         field_lengths_match = (
-            len(response["node_A_Wb_per_m"]) == response["mesh_node_count"]
-            and len(response["element_Bx_T"]) == response["mesh_element_count"]
-            and len(response["element_By_T"]) == response["mesh_element_count"]
+            len(response[node_field_name]) == response["mesh_node_count"]
+            and len(response[field_names[0]]) == response["mesh_element_count"]
+            and len(response[field_names[1]]) == response["mesh_element_count"]
         )
     else:
         field_lengths_match = not (
-            response["node_A_Wb_per_m"]
-            or response["element_Bx_T"]
-            or response["element_By_T"]
+            response[node_field_name]
+            or response[field_names[0]]
+            or response[field_names[1]]
         )
     if not field_lengths_match:
         raise RuntimeError("GPU solver response field result lengths do not match the mesh")
@@ -223,6 +267,13 @@ def validate_response(
 
 def command_solve(args: argparse.Namespace) -> int:
     solver = require_solver(args.solver)
+    protocol = artifact_protocol(Path(args.artifact).resolve(strict=True))
+    if protocol == GENERIC_PROTOCOL and (
+        args.force_torque or args.airgap_angles_deg or args.sliding_band_angle_deg != 0.0
+    ):
+        raise ValueError(
+            "generic periodic/axisymmetric artifacts do not support force, air-gap, or sliding-band postprocessing"
+        )
     request = make_request(
         Path(args.artifact),
         args.currents,
@@ -233,6 +284,7 @@ def command_solve(args: argparse.Namespace) -> int:
         args.sliding_band_angle_deg,
         args.force_torque,
         args.fields,
+        protocol,
     )
     output = Path(args.output).resolve()
     if output in (Path(str(request["mesh_artifact_path"])), solver.resolve()):
@@ -252,7 +304,9 @@ def command_solve(args: argparse.Namespace) -> int:
         ) as stream:
             response_path = Path(stream.name)
         returncode = run_solver(solver, "--solve", str(request_path), str(response_path))
-        validate_response(response_path, str(request["mesh_artifact_sha256"]), returncode)
+        validate_response(
+            response_path, str(request["mesh_artifact_sha256"]), returncode, protocol
+        )
         _atomic_replace(response_path, output)
         response_path = None
         return returncode
@@ -304,8 +358,8 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--overwrite", action="store_true")
     prepare.set_defaults(action=command_prepare)
 
-    solve = commands.add_parser("solve", help="solve one planar DC operating point")
-    solve.add_argument("artifact", help="gpu_femm_mesh_v1/v2 artifact")
+    solve = commands.add_parser("solve", help="solve one DC magnetostatic operating point")
+    solve.add_argument("artifact", help="standalone planar or generic magnetostatic artifact")
     solve.add_argument("output", help="response JSON path")
     solve.add_argument(
         "--currents",
@@ -320,7 +374,10 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--airgap-radius-mm", type=float, default=0.0)
     solve.add_argument("--airgap-angles-deg", type=float, nargs="*", default=())
     solve.add_argument("--sliding-band-angle-deg", type=float, default=0.0)
-    solve.add_argument("--fields", action="store_true", help="include nodal A and element B")
+    solve.add_argument(
+        "--fields", action="store_true",
+        help="include nodal potential and element field components",
+    )
     solve.set_defaults(action=command_solve)
 
     validate = commands.add_parser("validate", help="validate an immutable mesh artifact")

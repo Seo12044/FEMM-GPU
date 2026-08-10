@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://femm.info/schemas/gpu_femm_magnetostatic_sample_v1.schema.json",
+  "title": "FEMM GPU magnetostatic sample request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "mesh_artifact_path",
+    "mesh_artifact_sha256",
+    "circuit_currents_A",
+    "force_group_number",
+    "stress_air_group_number",
+    "airgap_radius_mm",
+    "airgap_angles_deg",
+    "sliding_band_angle_deg",
+    "compute_force_torque",
+    "include_field_solution"
+  ],
+  "properties": {
+    "protocol": { "const": "gpu_femm_magnetostatic_sample_v1" },
+    "mesh_artifact_path": { "type": "string", "minLength": 1 },
+    "mesh_artifact_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "circuit_currents_A": { "type": "array", "items": { "type": "number" } },
+    "force_group_number": { "const": -1 },
+    "stress_air_group_number": { "const": -1 },
+    "airgap_radius_mm": { "const": 0 },
+    "airgap_angles_deg": { "type": "array", "maxItems": 0 },
+    "sliding_band_angle_deg": { "const": 0 },
+    "compute_force_torque": { "const": false },
+    "include_field_solution": { "type": "boolean" }
+  }
+}
