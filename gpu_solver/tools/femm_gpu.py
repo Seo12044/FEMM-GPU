@@ -10,14 +10,35 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Sequence
 
 
 PROTOCOL = "gpu_femm_planar_dc_sample_v1"
+SOLVE_STATUSES = {
+    "OK",
+    "INPUT_IO",
+    "INVALID_ARGUMENT",
+    "UNSUPPORTED_FEATURE",
+    "MESH_INVALID",
+    "BOUNDARY_INVALID",
+    "GPU_UNAVAILABLE",
+    "GPU_ALLOCATION_FAILED",
+    "ASSEMBLY_FAILED",
+    "LINEAR_SOLVE_NOT_CONVERGED",
+    "LINEAR_SOLVE_BREAKDOWN",
+    "NUMERICAL_NONFINITE",
+    "OUTPUT_IO",
+    "INTERNAL_ERROR",
+    "NONLINEAR_SOLVE_NOT_CONVERGED",
+    "INVALID_MATERIAL",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -79,6 +100,127 @@ def run_solver(solver: Path, *arguments: str) -> int:
     return subprocess.run([str(solver), *arguments], check=False).returncode
 
 
+def _atomic_replace(source: Path, destination: Path) -> None:
+    """Tolerate short-lived Windows scanner/indexer sharing conflicts."""
+    for attempt in range(5):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON value {value}")
+
+
+def validate_response(
+    path: Path, expected_artifact_sha256: str, returncode: int
+) -> dict[str, object]:
+    """Validate the solver-owned response before publishing it to callers."""
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            response = json.load(stream, parse_constant=_reject_json_constant)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"GPU solver produced an unreadable response: {error}") from error
+    if not isinstance(response, dict):
+        raise RuntimeError("GPU solver response must be a JSON object")
+    expected_strings = {
+        "protocol": PROTOCOL,
+        "mesh_artifact_sha256": expected_artifact_sha256,
+    }
+    for name, expected in expected_strings.items():
+        if response.get(name) != expected:
+            raise RuntimeError(f"GPU solver response has an invalid {name}")
+    status = response.get("status")
+    if status not in ("PASS", "FAIL"):
+        raise RuntimeError("GPU solver response status must be PASS or FAIL")
+    for name in ("solve_status", "postprocess_status", "error_identifier", "error_message"):
+        if not isinstance(response.get(name), str):
+            raise RuntimeError(f"GPU solver response {name} must be a string")
+    if response["solve_status"] not in SOLVE_STATUSES:
+        raise RuntimeError("GPU solver response has an unknown solve_status")
+    if response["postprocess_status"] not in SOLVE_STATUSES | {"NOT_REQUESTED", "NOT_RUN"}:
+        raise RuntimeError("GPU solver response has an unknown postprocess_status")
+    for name in (
+        "actual_circuit_currents_A",
+        "circuit_flux_linkage_Wb",
+        "airgap_sample_angles_deg",
+        "airgap_radial_flux_density_T",
+        "node_A_Wb_per_m",
+        "element_Bx_T",
+        "element_By_T",
+    ):
+        values = response.get(name)
+        if not isinstance(values, list) or not all(_finite_number(value) for value in values):
+            raise RuntimeError(f"GPU solver response {name} must contain finite numbers")
+    for name in ("Fx_N", "Fy_N", "torque_Nm"):
+        value = response.get(name)
+        if value is not None and not _finite_number(value):
+            raise RuntimeError(f"GPU solver response {name} must be null or finite")
+    for name in ("mesh_node_count", "mesh_element_count"):
+        value = response.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError(f"GPU solver response {name} must be a non-negative integer")
+    if not isinstance(response.get("field_solution_included"), bool):
+        raise RuntimeError("GPU solver response field_solution_included must be boolean")
+    if len(response["actual_circuit_currents_A"]) != len(response["circuit_flux_linkage_Wb"]):
+        raise RuntimeError("GPU solver response circuit result lengths do not match")
+    if len(response["airgap_sample_angles_deg"]) != len(response["airgap_radial_flux_density_T"]):
+        raise RuntimeError("GPU solver response air-gap result lengths do not match")
+    if response["field_solution_included"]:
+        field_lengths_match = (
+            len(response["node_A_Wb_per_m"]) == response["mesh_node_count"]
+            and len(response["element_Bx_T"]) == response["mesh_element_count"]
+            and len(response["element_By_T"]) == response["mesh_element_count"]
+        )
+    else:
+        field_lengths_match = not (
+            response["node_A_Wb_per_m"]
+            or response["element_Bx_T"]
+            or response["element_By_T"]
+        )
+    if not field_lengths_match:
+        raise RuntimeError("GPU solver response field result lengths do not match the mesh")
+    convergence = response.get("convergence")
+    if not isinstance(convergence, dict):
+        raise RuntimeError("GPU solver response convergence must be an object")
+    iterations = convergence.get("iterations")
+    residual = convergence.get("residual_l2")
+    if (not isinstance(iterations, int) or isinstance(iterations, bool) or iterations < 0
+            or (residual is not None and not _finite_number(residual))):
+        raise RuntimeError("GPU solver response has invalid convergence data")
+    if status == "PASS" and returncode != 0:
+        raise RuntimeError("GPU solver returned a failure code with a PASS response")
+    if status == "FAIL" and returncode == 0:
+        raise RuntimeError("GPU solver returned success with a FAIL response")
+    if status == "PASS" and response["solve_status"] != "OK":
+        raise RuntimeError("GPU solver PASS response does not report a successful solve")
+    if status == "PASS" and response["postprocess_status"] not in ("OK", "NOT_REQUESTED"):
+        raise RuntimeError("GPU solver PASS response has an unsuccessful postprocess status")
+    if status == "PASS" and (response["error_identifier"] or response["error_message"]):
+        raise RuntimeError("GPU solver PASS response contains an error")
+    if status == "FAIL" and (not response["error_identifier"] or not response["error_message"]):
+        raise RuntimeError("GPU solver FAIL response does not identify its error")
+    if status == "FAIL":
+        failure_status = (
+            response["postprocess_status"]
+            if response["solve_status"] == "OK"
+            else response["solve_status"]
+        )
+        if failure_status in ("OK", "NOT_REQUESTED", "NOT_RUN"):
+            raise RuntimeError("GPU solver FAIL response does not report a failed operation")
+        if response["error_identifier"] != f"GPU_FEMM_{failure_status}":
+            raise RuntimeError("GPU solver FAIL response has an inconsistent error identifier")
+    return response
+
+
 def command_solve(args: argparse.Namespace) -> int:
     solver = require_solver(args.solver)
     request = make_request(
@@ -93,8 +235,11 @@ def command_solve(args: argparse.Namespace) -> int:
         args.fields,
     )
     output = Path(args.output).resolve()
+    if output in (Path(str(request["mesh_artifact_path"])), solver.resolve()):
+        raise ValueError("response path must not overwrite the mesh artifact or GPU solver")
     output.parent.mkdir(parents=True, exist_ok=True)
     request_path: Path | None = None
+    response_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", suffix=".json", delete=False
@@ -102,10 +247,20 @@ def command_solve(args: argparse.Namespace) -> int:
             json.dump(request, stream, indent=2)
             stream.write("\n")
             request_path = Path(stream.name)
-        return run_solver(solver, "--solve", str(request_path), str(output))
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".tmp", dir=output.parent, delete=False
+        ) as stream:
+            response_path = Path(stream.name)
+        returncode = run_solver(solver, "--solve", str(request_path), str(response_path))
+        validate_response(response_path, str(request["mesh_artifact_sha256"]), returncode)
+        _atomic_replace(response_path, output)
+        response_path = None
+        return returncode
     finally:
         if request_path is not None:
             request_path.unlink(missing_ok=True)
+        if response_path is not None:
+            response_path.unlink(missing_ok=True)
 
 
 def command_validate(args: argparse.Namespace) -> int:

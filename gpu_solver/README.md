@@ -42,8 +42,9 @@ python .\gpu_solver\tools\femm_gpu.py prepare model.fem model.gpu.json `
 
 The preparer stages a private FEMM runtime, invokes Triangle with the no-op
 solver, validates every resolved material/region/boundary, and writes the JSON
-atomically. It never replaces the installed `fkn.exe`. The exact artifact
-contract is in
+atomically. Output paths inside the stock FEMM installation or equal to the
+input model are rejected, even with `--overwrite`. It never replaces the
+installed `fkn.exe`. The exact artifact contract is in
 [`schemas/gpu_femm_planar_dc_mesh_v1.schema.json`](schemas/gpu_femm_planar_dc_mesh_v1.schema.json).
 
 ## `gpu_femm_planar_dc_sample_v1`
@@ -79,6 +80,9 @@ compact scalar responses.
 `solve_status` and `postprocess_status` are separate. If optional
 postprocessing fails after the field solve succeeds, currents, flux linkage,
 mesh counts, and requested full-field arrays remain in the response.
+The Python frontend validates the protocol, artifact hash, status fields, and
+array sizes in a temporary response before atomically publishing it. A missing
+or malformed solver response leaves any existing output file unchanged.
 
 The exact request schema is in
 [`schemas/gpu_femm_planar_dc_sample_v1.schema.json`](schemas/gpu_femm_planar_dc_sample_v1.schema.json).

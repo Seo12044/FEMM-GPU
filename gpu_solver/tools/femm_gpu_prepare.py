@@ -318,6 +318,18 @@ def _mesh_rows(path: Path, label: str) -> tuple[list[float], list[list[float]]]:
     return header, [_numeric_row(line, label) for line in lines[1:count + 1]]
 
 
+def _indexed_rows(rows: Sequence[list[float]], label: str, minimum_columns: int) -> list[list[float]]:
+    indexed: dict[int, list[float]] = {}
+    for row in rows:
+        if (len(row) < minimum_columns or row[0] != int(row[0])
+                or int(row[0]) in indexed):
+            raise PrepareError(f"invalid Triangle {label} row")
+        indexed[int(row[0])] = row
+    if sorted(indexed) != list(range(len(rows))):
+        raise PrepareError(f"Triangle {label} IDs must be contiguous and zero based")
+    return [indexed[index] for index in range(len(rows))]
+
+
 def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     model, length_scale_mm, materials, circuits, labels, default, boundaries = _parse_source(source)
     node_header, node_rows = _mesh_rows(mesh_stem.with_suffix(".node"), "node")
@@ -331,13 +343,16 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     if sorted(nodes_by_id) != list(range(len(nodes_by_id))):
         raise PrepareError("Triangle node IDs must be contiguous and zero based")
     element_header, element_rows = _mesh_rows(mesh_stem.with_suffix(".ele"), "element")
-    if len(element_header) < 3 or element_header[1] != 3 or element_header[2] < 1:
+    if len(element_header) < 3 or element_header[1] != 3 or element_header[2] != 1:
         raise PrepareError("Triangle element file must contain labeled P1 triangles")
+    element_rows = _indexed_rows(element_rows, "element", 5)
     raw_faces: list[tuple[list[int], int]] = []
     for row in element_rows:
         if len(row) < 5 or any(row[index] != int(row[index]) for index in range(5)):
             raise PrepareError("invalid Triangle element row")
         face = [int(row[1]), int(row[2]), int(row[3])]
+        if len(set(face)) != 3:
+            raise PrepareError("Triangle mesh contains a degenerate element")
         if any(node not in nodes_by_id for node in face):
             raise PrepareError("Triangle element references an unknown node")
         raw_label = int(row[4])
@@ -357,21 +372,43 @@ def _build_resolved(source: Path, mesh_stem: Path) -> dict[str, Any]:
     if not pbc_header or pbc_header[0] != 0:
         raise PrepareError("periodic or anti-periodic boundary constraints are not supported")
     edge_header, edge_rows = _mesh_rows(mesh_stem.with_suffix(".edge"), "edge")
-    if len(edge_header) < 2:
+    if len(edge_header) < 2 or edge_header[1] != 1:
         raise PrepareError("invalid Triangle edge header")
+    edge_rows = _indexed_rows(edge_rows, "edge", 4)
+    triangle_edge_incidence: dict[tuple[int, int], int] = {}
+    for face, _ in raw_faces:
+        for first, second in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            edge = tuple(sorted((first, second)))
+            triangle_edge_incidence[edge] = triangle_edge_incidence.get(edge, 0) + 1
+    if any(count not in (1, 2) for count in triangle_edge_incidence.values()):
+        raise PrepareError("Triangle mesh contains a non-manifold edge")
     boundary_nodes: set[int] = set()
+    mesh_edges: set[tuple[int, int]] = set()
     for row in edge_rows:
         if len(row) < 4 or any(row[index] != int(row[index]) for index in range(4)):
             raise PrepareError("invalid Triangle edge row")
         first, second, encoded = int(row[1]), int(row[2]), int(row[3])
+        if first == second:
+            raise PrepareError("Triangle mesh contains a degenerate edge")
         if first not in nodes_by_id or second not in nodes_by_id:
             raise PrepareError("Triangle edge references an unknown node")
+        edge = tuple(sorted((first, second)))
+        if edge in mesh_edges:
+            raise PrepareError("Triangle edge file contains a duplicate edge")
+        mesh_edges.add(edge)
+        incidence = triangle_edge_incidence.get(edge)
+        if incidence is None:
+            raise PrepareError("Triangle edge does not belong to an element")
         if encoded >= 0:
             continue
+        if incidence != 1:
+            raise PrepareError("Triangle boundary marker is attached to an interior edge")
         marker = -(encoded + 2)
         if marker < 0 or marker >= len(boundaries):
             raise PrepareError("Triangle edge has an invalid FEMM boundary marker")
         boundary_nodes.update((first, second))
+    if mesh_edges != set(triangle_edge_incidence):
+        raise PrepareError("Triangle edge file does not match the element topology")
     if not boundary_nodes:
         raise PrepareError("no zero-A Dirichlet boundary nodes were found")
 
@@ -470,7 +507,21 @@ def _stage_and_mesh(source: Path, femm_root: Path, noop_solver: Path, timeout_s:
 
 def prepare(source: Path, output: Path, femm_root: Path, noop_solver: Path, timeout_s: float, overwrite: bool) -> None:
     source = _require_file(source, "input FEMM model")
-    temporary, stem = _stage_and_mesh(source, femm_root.resolve(), noop_solver, timeout_s)
+    output = output.resolve()
+    femm_root = femm_root.resolve()
+    noop_solver = noop_solver.resolve()
+    if output == source:
+        raise PrepareError("output artifact must not overwrite the input FEMM model")
+    if output == noop_solver:
+        raise PrepareError("output artifact must not overwrite the mesh no-op helper")
+    protected_femm_root = (
+        femm_root.parent
+        if femm_root.name.casefold() == "bin" and (femm_root / "femm.exe").is_file()
+        else femm_root
+    )
+    if output.is_relative_to(protected_femm_root):
+        raise PrepareError("output artifact must be outside the stock FEMM installation")
+    temporary, stem = _stage_and_mesh(source, femm_root, noop_solver, timeout_s)
     try:
         _write_artifact(output, _build_resolved(source, stem), overwrite)
     finally:
