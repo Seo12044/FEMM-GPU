@@ -242,6 +242,111 @@ unique `task_id` and one complete `gpu_femm_motor_sample_v1` request.
   in separate operator groups while response order is preserved.
 - Duplicate task IDs and mismatched artifact identities are rejected.
 
+## `gpu_femm_motor_sample_v2` and `gpu_femm_motor_batch_v2`
+
+The v2 motor protocols are additive and do not change the strict v1 wire
+format. A v2 batch contains only v2 sample requests. Each v2 sample has the v1
+fields plus the required `tangent_multi_rhs` member. `null` or an empty array
+requests only the established nonlinear sample. An object requests a
+first-order response about that nonlinear operating point:
+
+```json
+"tangent_multi_rhs": {
+  "schema_version": "gpu_femm_tangent_multi_rhs_v1",
+  "rhs": [
+    {
+      "name": "suspension_d",
+      "circuit_current_derivative_A_per_A": [1, 0]
+    },
+    {
+      "name": "suspension_q",
+      "circuit_current_derivative_A_per_A": [0, 1]
+    }
+  ]
+}
+```
+
+The base `circuit_currents_A` is solved nonlinearly once. At its converged
+field, the solver reassembles the consistent Newton Jacobian and solves every
+named circuit-source derivative in one batched PCG launch. Permanent-magnet
+loads and fixed-boundary offsets are not included in derivative RHS vectors.
+
+The response's `tangent_multi_rhs` object records the operating-point
+currents, linearization provenance, PCG residual `||J*dA-S||`, and, per RHS:
+
+- `dFx_N_per_A`, `dFy_N_per_A`, and `dtorque_Nm_per_A`
+- `circuit_flux_linkage_derivative_Wb_per_A`
+- `airgap_radial_flux_density_derivative_T_per_A`
+- `linear_convergence`
+
+Force and torque derivatives use the direct bilinear cross-term between the
+base and derivative fields. Native AGE stencils are evaluated directly; the
+non-AGE weighted-stress mask is built once and reused for all RHS vectors.
+Flux linkage and radial air-gap field derivatives are linear evaluations of
+`dA`.
+
+If the base nonlinear solve fails, the sample fails normally. If the base
+sample passes but tangent processing fails, the sample stays `PASS` and the
+nested tangent object is `FAIL` with `GPU_FEMM_TANGENT_*`. This lets a caller
+retain the drive result and retry only the derivative with exact nonlinear
+central differences.
+
+## Exact 180-degree motor sector (`gpu_femm_motor_batch_v3`)
+
+V3 is an opt-in extension for the isolated-motor performance tangent path. It
+requires an actually cropped and conformingly meshed 180-degree
+`gpu_femm_mesh_v3` artifact. It never infers sector pairs from a full-circle
+mesh and it never approximates a 60-degree Bloch boundary. V1 and v2 remain
+strictly unchanged.
+
+The v3 artifact adds `node_constraints`, an empty `air_gap_elements` array,
+and SHA-bound `sector` metadata. The metadata contains the positive integer
+electrical pole-pair count `p`, suspension spatial order `p+1`, the base
+periodic/anti-periodic relation, and an oriented involutive permutation of
+circuit partners. `sector_start_angle_deg` binds the actual global start of
+the cropped interval, so full-circle Br requests are folded into
+`[start,start+180)` rather than assuming a zero-degree cut. The metadata also
+carries `apex_self_pair_nodes`, kept separate from physical
+`outer_dirichlet`, and the full-model C2 invariance-certificate SHA.
+An apex self-pair is zero-potential only for the AP operator; the GPU removes
+or adds that condition when switching from `p` to `p+1`. The base relation
+must be `(-1)^p`; the GPU derives a second
+signed degree-of-freedom map with relation `(-1)^(p+1)` for tangent d/q. Both
+operators use the same raw nodes and triangles, so there is no remesh or index
+drift.
+
+Each v3 sample requires the following sector object. A drive sample can also
+carry the v2 `tangent_multi_rhs` object; a zero/reference sample may omit it.
+
+```json
+"sector_performance": {
+  "schema_version": "gpu_femm_motor_sector_performance_v1",
+  "model_invariance_certificate_sha256": "<64 lowercase hex characters>"
+}
+```
+
+The weighting-stress mask uses the cut-node pairs with scalar `+1` equality,
+independent of the magnetic P/AP sign. The converged base and tangent fields
+retain their respective magnetic signs. V3 native AGE artifacts are rejected:
+the current release deliberately supports only the conforming posed-mesh WST
+route, which avoids an unverified sector-start phase convention.
+
+All returned loads, flux linkages, and radial-B samples are already normalized
+to the full machine. Requested angles across 360 degrees are folded into the
+stored 180-degree mesh and multiplied by the appropriate base or tangent copy
+sign. Base force cancels, base torque doubles, and for the `p`/`p+1` cross
+field tangent force doubles while tangent torque cancels. Circuit flux uses
+the explicit partner permutation and orientation; it is never blindly scaled.
+The `sector_reconstruction` response records the start angle, signs, multipliers,
+partner arrays, full-machine normalization, periodic-mask provenance, and the
+single-upload tangent-operator memory evidence. It echoes the certificate SHA
+and apex node list so the caller can verify active reconstruction provenance.
+
+The tangent PCG path uploads one consistent Newton matrix and its Jacobi
+preconditioner, then aliases that operator across all RHS workspaces. Regular
+and cooperative PCG launches both use the same physical operator. Legacy
+`SolveBatch` keeps its established per-item operator storage.
+
 `--motor-batch-profile` returns the same numerical results as `--motor-batch`
 and adds timing for artifact loading, host or device assembly, GPU solve, and
 postprocessing. `device_assembly_seconds` is zero when the host fallback path

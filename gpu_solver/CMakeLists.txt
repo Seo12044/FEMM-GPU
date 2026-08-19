@@ -171,7 +171,10 @@ if(BUILD_TESTING)
   if(Python3_Interpreter_FOUND)
     set_tests_properties(gpu_femm_project_neutral_cli PROPERTIES
       LABELS "gpu;cli;requires_cuda;femm_fixture"
-      TIMEOUT 10
+      # This test launches fourteen short GPU solver processes. Driver startup
+      # alone can exceed thirty seconds on Windows even when every assertion
+      # passes, so leave margin for cold-driver and CI startup variance.
+      TIMEOUT 120
     )
     set_tests_properties(gpu_femm_project_neutral_prepare PROPERTIES
       LABELS "gpu;cli;no_cuda"

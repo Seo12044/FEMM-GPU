@@ -291,9 +291,14 @@ __global__ void DeterministicPcgKernel(
   // use the same fixed reduction tree; sums may differ slightly from the
   // former lane-zero order but are deterministic.
   const int item = blockIdx.x;
+  // values_per_item==0 is the explicit shared-operator mode: every block
+  // reads the same already-uploaded K/diagonal/preconditioner, while all PCG
+  // vector workspaces remain disjoint per RHS.
   values += static_cast<size_t>(item) * values_per_item;
-  diagonal += static_cast<size_t>(item) * n;
-  inverse_diagonal += static_cast<size_t>(item) * n;
+  const size_t operator_row_offset = values_per_item == 0
+      ? 0 : static_cast<size_t>(item) * n;
+  diagonal += operator_row_offset;
+  inverse_diagonal += operator_row_offset;
   rhs += static_cast<size_t>(item) * n;
   x += static_cast<size_t>(item) * n;
   residual += static_cast<size_t>(item) * n;
@@ -675,8 +680,10 @@ __global__ void CooperativeDeterministicPcgKernel(
   int* item_controls = controls + static_cast<size_t>(item) * 4;
   const int global_any_index = 4 * item_count;
   values += static_cast<size_t>(item) * values_per_item;
-  diagonal += static_cast<size_t>(item) * n;
-  inverse_diagonal += static_cast<size_t>(item) * n;
+  const size_t operator_row_offset = values_per_item == 0
+      ? 0 : static_cast<size_t>(item) * n;
+  diagonal += operator_row_offset;
+  inverse_diagonal += operator_row_offset;
   rhs += static_cast<size_t>(item) * n;
   x += static_cast<size_t>(item) * n;
   residual += static_cast<size_t>(item) * n;
@@ -1244,6 +1251,14 @@ struct GpuBatchSolveTiming {
   double download_seconds = 0.0;
 };
 
+struct SharedOperatorBatchEvidence {
+  size_t physical_operator_count = 0;
+  size_t operator_upload_count = 0;
+  size_t rhs_count = 0;
+  size_t operator_bytes = 0;
+  size_t rhs_workspace_bytes = 0;
+};
+
 class GpuCsrSolver {
   public:
   Status Initialize(const Assembly& assembly)
@@ -1405,7 +1420,8 @@ class GpuCsrSolver {
       timing->upload_seconds += ProfileSecondsSince(upload_start);
     const ProfileClock::time_point kernel_start = ProfileClock::now();
     const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
-        count, nnz, relative_tolerance, max_iterations, batch_inverse_diagonal_usable);
+        count, nnz, relative_tolerance, max_iterations,
+        batch_inverse_diagonal_usable, false);
     if (cooperative_result == CooperativeLaunchResult::kFailed)
       return Status::kInternalError;
     const bool launched_cooperatively = cooperative_result == CooperativeLaunchResult::kCompleted;
@@ -1439,6 +1455,97 @@ class GpuCsrSolver {
       if (status != Status::kOk)
         return status;
       if ((status = CopyToHost((*solutions)[item].data(), batch_solution_.get() + item * n_, n_ * sizeof(double))) != Status::kOk)
+        return status;
+    }
+    if (timing != nullptr)
+      timing->download_seconds += ProfileSecondsSince(download_start);
+    return Status::kOk;
+  }
+
+  // Solve several right-hand sides against the numeric operator currently in
+  // values_/diagonal_/inverse_diagonal_. Unlike SolveBatch, no CSR numeric
+  // array is allocated or uploaded per RHS.
+  Status SolveCurrentOperatorBatch(
+      const std::vector<std::vector<double>>& rhs_values,
+      double relative_tolerance, int max_iterations,
+      std::vector<SolveInfo>* infos,
+      std::vector<std::vector<double>>* solutions, int* launches,
+      SharedOperatorBatchEvidence* evidence = nullptr,
+      GpuBatchSolveTiming* timing = nullptr)
+  {
+    if (!initialized_ || infos == nullptr || solutions == nullptr
+        || rhs_values.empty())
+      return Status::kInvalidArgument;
+    const size_t count = rhs_values.size();
+    for (const std::vector<double>& rhs : rhs_values)
+      if (rhs.size() != static_cast<size_t>(n_))
+        return Status::kInvalidArgument;
+    const ProfileClock::time_point upload_start = ProfileClock::now();
+    const Status capacity_status = EnsureSharedBatchCapacity(count);
+    if (capacity_status != Status::kOk)
+      return capacity_status;
+    for (size_t item = 0; item < count; ++item) {
+      const Status status = CopyToDevice(batch_rhs_.get() + item * n_,
+          rhs_values[item].data(), static_cast<size_t>(n_) * sizeof(double));
+      if (status != Status::kOk)
+        return status;
+    }
+    if (timing != nullptr)
+      timing->upload_seconds += ProfileSecondsSince(upload_start);
+    if (evidence != nullptr) {
+      evidence->physical_operator_count = 1;
+      evidence->operator_upload_count = 1;
+      evidence->rhs_count = count;
+      evidence->operator_bytes = values_.count() * sizeof(double)
+          + diagonal_.count() * sizeof(double)
+          + inverse_diagonal_.count() * sizeof(double);
+      evidence->rhs_workspace_bytes = count * static_cast<size_t>(n_)
+          * 6 * sizeof(double) + count * sizeof(SolveInfo);
+    }
+    const ProfileClock::time_point kernel_start = ProfileClock::now();
+    const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
+        count, host_column_indices_.size(), relative_tolerance,
+        max_iterations, inverse_diagonal_usable_, true);
+    if (cooperative_result == CooperativeLaunchResult::kFailed)
+      return Status::kInternalError;
+    const bool launched_cooperatively =
+        cooperative_result == CooperativeLaunchResult::kCompleted;
+    if (!launched_cooperatively && inverse_diagonal_usable_) {
+      DeterministicPcgKernel<true><<<static_cast<unsigned int>(count),
+          kPcgBlockThreads>>>(n_, row_offsets_.get(), column_indices_.get(),
+          values_.get(), diagonal_.get(), inverse_diagonal_.get(),
+          batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(),
+          batch_direction_.get(), batch_preconditioned_.get(),
+          batch_matrix_direction_.get(), relative_tolerance,
+          max_iterations, batch_info_.get(), 0);
+    } else if (!launched_cooperatively) {
+      DeterministicPcgKernel<false><<<static_cast<unsigned int>(count),
+          kPcgBlockThreads>>>(n_, row_offsets_.get(), column_indices_.get(),
+          values_.get(), diagonal_.get(), inverse_diagonal_.get(),
+          batch_rhs_.get(), batch_solution_.get(), batch_residual_.get(),
+          batch_direction_.get(), batch_preconditioned_.get(),
+          batch_matrix_direction_.get(), relative_tolerance,
+          max_iterations, batch_info_.get(), 0);
+    }
+    if (launches != nullptr)
+      ++*launches;
+    if (!launched_cooperatively && (cudaGetLastError() != cudaSuccess
+        || cudaDeviceSynchronize() != cudaSuccess))
+      return Status::kInternalError;
+    if (timing != nullptr)
+      timing->kernel_sync_seconds += ProfileSecondsSince(kernel_start);
+    const ProfileClock::time_point download_start = ProfileClock::now();
+    infos->assign(count, SolveInfo {});
+    solutions->assign(count, std::vector<double>(static_cast<size_t>(n_)));
+    for (size_t item = 0; item < count; ++item) {
+      Status status = CopyToHost(&(*infos)[item], batch_info_.get() + item,
+          sizeof(SolveInfo));
+      if (status != Status::kOk)
+        return status;
+      status = CopyToHost((*solutions)[item].data(),
+          batch_solution_.get() + item * n_,
+          static_cast<size_t>(n_) * sizeof(double));
+      if (status != Status::kOk)
         return status;
     }
     if (timing != nullptr)
@@ -1500,7 +1607,7 @@ class GpuCsrSolver {
     const ProfileClock::time_point kernel_start = ProfileClock::now();
     const CooperativeLaunchResult cooperative_result = TryLaunchCooperativeBatch(
         count, nnz, relative_tolerance, max_iterations,
-        batch_inverse_diagonal_usable_);
+        batch_inverse_diagonal_usable_, false);
     if (cooperative_result == CooperativeLaunchResult::kFailed)
       return Status::kInternalError;
     const bool launched_cooperatively = cooperative_result == CooperativeLaunchResult::kCompleted;
@@ -1546,10 +1653,41 @@ class GpuCsrSolver {
   }
 
   private:
+  Status EnsureSharedBatchCapacity(size_t count)
+  {
+    // A stale legacy batch may own count copies of K. Drop those copies so
+    // the physical operator count is exactly one on this path. A later
+    // SolveBatch sees batch_nnz_=0 and allocates its legacy buffers again.
+    batch_values_.reset();
+    batch_diagonal_.reset();
+    batch_inverse_diagonal_.reset();
+    Status status = Status::kOk;
+    if (batch_capacity_ < count || batch_dimension_ != n_) {
+      if ((status = batch_rhs_.allocate(count * n_)) != Status::kOk
+          || (status = batch_solution_.allocate(count * n_)) != Status::kOk
+          || (status = batch_residual_.allocate(count * n_)) != Status::kOk
+          || (status = batch_direction_.allocate(count * n_)) != Status::kOk
+          || (status = batch_preconditioned_.allocate(count * n_)) != Status::kOk
+          || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
+          || (status = batch_info_.allocate(count)) != Status::kOk
+          || (status = batch_cooperative_partials_.allocate(
+                  count * kPcgCooperativeShardsPerItem)) != Status::kOk
+          || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
+          || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk)
+        return status;
+      batch_capacity_ = count;
+      batch_dimension_ = n_;
+    }
+    batch_nnz_ = 0;
+    return Status::kOk;
+  }
+
   Status EnsureBatchCapacity(size_t count, size_t nnz)
   {
     if (batch_capacity_ >= count && batch_dimension_ == n_
-        && batch_nnz_ == nnz)
+        && batch_nnz_ == nnz && batch_values_.count() >= count * nnz
+        && batch_diagonal_.count() >= count * static_cast<size_t>(n_)
+        && batch_inverse_diagonal_.count() >= count * static_cast<size_t>(n_))
       return Status::kOk;
     Status status = Status::kOk;
     if ((status = batch_values_.allocate(count * nnz)) != Status::kOk
@@ -1577,7 +1715,7 @@ class GpuCsrSolver {
 
   CooperativeLaunchResult TryLaunchCooperativeBatch(
       size_t count, size_t nnz, double relative_tolerance,
-      int max_iterations, bool use_inverse_diagonal)
+      int max_iterations, bool use_inverse_diagonal, bool shared_operator)
   {
     // The B=32 path already occupies almost every SM on the target GPU.  This
     // path is deliberately limited to small batches where eight shards/item
@@ -1613,12 +1751,13 @@ class GpuCsrSolver {
     }
     int item_count = static_cast<int>(count);
     int shard_count = kPcgCooperativeShardsPerItem;
-    int values_per_item = static_cast<int>(nnz);
+    int values_per_item = shared_operator ? 0 : static_cast<int>(nnz);
     const int32_t* row_offsets = row_offsets_.get();
     const int32_t* column_indices = column_indices_.get();
-    const double* values = batch_values_.get();
-    const double* diagonal = batch_diagonal_.get();
-    const double* inverse_diagonal = batch_inverse_diagonal_.get();
+    const double* values = shared_operator ? values_.get() : batch_values_.get();
+    const double* diagonal = shared_operator ? diagonal_.get() : batch_diagonal_.get();
+    const double* inverse_diagonal = shared_operator
+        ? inverse_diagonal_.get() : batch_inverse_diagonal_.get();
     const double* rhs = batch_rhs_.get();
     double* solution = batch_solution_.get();
     double* residual = batch_residual_.get();
@@ -1992,6 +2131,11 @@ struct NonlinearModel {
   std::vector<int32_t> dirichlet_nodes;
   std::vector<double> dirichlet_a_wb_per_m;
   std::vector<SignedNodeConstraint> node_constraints;
+  // PBC self-pairs at the rotational apex are zero only for an
+  // antiperiodic magnetic field. They are tracked separately from physical
+  // Dirichlet boundaries so the p and p+1 operators can switch signs exactly
+  // and the scalar WST mask does not mistake them for an outer boundary.
+  std::vector<int32_t> symmetry_apex_nodes;
   int32_t circuit_count = 1;
   double depth_m = 0.0;
   MagneticProblemType problem_type = MagneticProblemType::kPlanar;
@@ -2038,6 +2182,17 @@ struct NonlinearSolveResult {
   std::vector<double> circuit_flux_linkage_wb;
   // Compatibility field for frozen single-circuit callers only.
   double flux_linkage_wb = std::numeric_limits<double>::quiet_NaN();
+};
+
+// First-order response about one converged nonlinear operating point.  The
+// nodal/element arrays are derivatives per unit command current, not a second
+// finite-current operating point.
+struct TangentSolveResult {
+  SolveInfo info;
+  std::string name;
+  std::vector<double> circuit_current_derivative_a_per_a;
+  NonlinearSolveResult field_derivative;
+  SharedOperatorBatchEvidence operator_evidence;
 };
 
 struct NonlinearElementTerms {
@@ -2255,6 +2410,23 @@ std::vector<double> ExpandAssemblySolution(const Assembly& assembly,
     for (size_t row = 0; row < free_solution.size(); ++row)
       expanded[assembly.free_nodes[row]] = free_solution[row];
   }
+  return expanded;
+}
+
+std::vector<double> ExpandAssemblyDerivative(const Assembly& assembly,
+    const std::vector<double>& free_solution)
+{
+  std::vector<double> expanded(assembly.boundary_values.size(), 0.0);
+  for (size_t node = 0; node < expanded.size(); ++node) {
+    const int32_t row = assembly.node_to_free.empty() ? -1
+                                                       : assembly.node_to_free[node];
+    if (row >= 0 && static_cast<size_t>(row) < free_solution.size())
+      expanded[node] = static_cast<double>(assembly.node_sign[node])
+          * free_solution[row];
+  }
+  if (assembly.node_to_free.empty())
+    for (size_t row = 0; row < free_solution.size(); ++row)
+      expanded[assembly.free_nodes[row]] = free_solution[row];
   return expanded;
 }
 
@@ -3459,6 +3631,101 @@ class NonlinearP1FixtureSolver {
     return results.empty() ? NonlinearSolveResult {} : std::move(results.front());
   }
 
+  // Reassemble the consistent Newton tangent at the converged operating
+  // point, then solve all command-current directions against that one
+  // operator.  No permanent-magnet or fixed-boundary load belongs in a field
+  // derivative, so every RHS is formed solely from the circuit source vectors.
+  std::vector<TangentSolveResult> SolveTangentMultiRhs(
+      const NonlinearSolveResult& base,
+      const std::vector<std::pair<std::string, std::vector<double>>>& directions,
+      const NonlinearOptions& options, int* batched_pcg_launches = nullptr)
+  {
+    std::vector<TangentSolveResult> results(directions.size());
+    for (size_t index = 0; index < directions.size(); ++index) {
+      results[index].name = directions[index].first;
+      results[index].circuit_current_derivative_a_per_a = directions[index].second;
+      results[index].info.status = Status::kInvalidArgument;
+    }
+    if (!initialized_ || base.info.status != Status::kOk
+        || base.a_wb_per_m.size() != model_.nodes.size() || directions.empty()
+        || !(options.linear_relative_tolerance > 0.0)
+        || options.max_linear_iterations < 0)
+      return results;
+    for (const auto& direction : directions)
+      if (direction.second.size() != static_cast<size_t>(model_.circuit_count)
+          || !std::all_of(direction.second.begin(), direction.second.end(),
+              [](double value) { return std::isfinite(value); }))
+        return results;
+
+    Assembly tangent;
+    Status status = AssembleNonlinearNewton(model_, base.a_wb_per_m,
+        base.circuit_currents_a, true, &tangent);
+    if (status != Status::kOk) {
+      for (TangentSolveResult& result : results)
+        result.info.status = status;
+      return results;
+    }
+    if (!csr_initialized_) {
+      status = csr_solver_.Initialize(tangent);
+      csr_initialized_ = status == Status::kOk;
+    } else if (!csr_solver_.HasMatchingStructure(tangent)) {
+      status = Status::kAssemblyFailed;
+    } else {
+      status = csr_solver_.UpdateValues(tangent);
+      if (status == Status::kOk)
+        ++csr_symbolic_reuse_count_;
+    }
+    if (status != Status::kOk) {
+      for (TangentSolveResult& result : results)
+        result.info.status = status;
+      return results;
+    }
+
+    std::vector<std::vector<double>> rhs_values(directions.size(),
+        std::vector<double>(tangent.free_nodes.size(), 0.0));
+    for (size_t item = 0; item < directions.size(); ++item) {
+      for (size_t circuit = 0; circuit < directions[item].second.size(); ++circuit) {
+        const double scale = directions[item].second[circuit];
+        if (scale == 0.0)
+          continue;
+        const std::vector<double>& source = tangent.source_load_per_circuit[circuit];
+        for (size_t node = 0; node < source.size(); ++node) {
+          const int32_t row = tangent.node_to_free[node];
+          if (row >= 0)
+            rhs_values[item][row] += scale
+                * static_cast<double>(tangent.node_sign[node]) * source[node];
+        }
+      }
+    }
+
+    std::vector<SolveInfo> infos;
+    std::vector<std::vector<double>> free_solutions;
+    SharedOperatorBatchEvidence operator_evidence;
+    status = csr_solver_.SolveCurrentOperatorBatch(rhs_values,
+        options.linear_relative_tolerance, options.max_linear_iterations,
+        &infos, &free_solutions, batched_pcg_launches, &operator_evidence);
+    if (status != Status::kOk) {
+      for (TangentSolveResult& result : results)
+        result.info.status = status;
+      return results;
+    }
+    for (size_t item = 0; item < results.size(); ++item) {
+      results[item].info = infos[item];
+      results[item].operator_evidence = operator_evidence;
+      if (infos[item].status != Status::kOk)
+        continue;
+      NonlinearSolveResult derivative;
+      derivative.info = infos[item];
+      derivative.a_wb_per_m = ExpandAssemblyDerivative(tangent,
+          free_solutions[item]);
+      derivative.circuit_currents_a = directions[item].second;
+      derivative = FinalizeResult(&derivative);
+      results[item].info = derivative.info;
+      results[item].field_derivative = std::move(derivative);
+    }
+    return results;
+  }
+
   private:
   GpuCsrSolver csr_solver_;
   bool csr_initialized_ = false;
@@ -4057,6 +4324,17 @@ struct GpuFemmMeshArtifact {
   std::string base_motor_fem_sha256;
   std::string canonical_identity_sha256;
   bool has_sliding_band = false;
+  bool has_motor_sector = false;
+  double sector_start_angle_deg = 0.0;
+  double sector_angle_deg = 360.0;
+  int32_t full_machine_sector_count = 1;
+  int32_t electrical_pole_pairs = 0;
+  int32_t suspension_spatial_order = 0;
+  int8_t sector_boundary_sign = 1;
+  std::vector<int32_t> circuit_partner_indices;
+  std::vector<int8_t> circuit_partner_orientations;
+  std::vector<int32_t> apex_self_pair_nodes;
+  std::string model_invariance_certificate_sha256;
   double rotor_angle_deg = 0.0;
   double displacement_mm[2] = {};
 };
@@ -4078,7 +4356,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const bool neutral_schema = legacy_neutral_schema || generic_neutral_schema;
   const bool motor_v1 = schema->string == "gpu_femm_mesh_v1";
   const bool motor_v2 = schema->string == "gpu_femm_mesh_v2";
-  if ((!neutral_schema && !motor_v1 && !motor_v2)
+  const bool motor_v3 = schema->string == "gpu_femm_mesh_v3";
+  if ((!neutral_schema && !motor_v1 && !motor_v2 && !motor_v3)
       || !(neutral_schema
               ? ExactObject(root, { "schema_version", "source_fem_sha256",
                     "canonical_identity_sha256", "resolved" }, error)
@@ -4110,10 +4389,15 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
                           "base_motor_fem_sha256", "model", "pose", "nodes_mm",
                           "triangles", "regions", "materials", "circuits",
                           "outer_dirichlet" }, error)
+                    : (motor_v2 ? ExactObject(*resolved, { "source_fem_sha256",
+                          "base_motor_fem_sha256", "model", "pose", "nodes_mm",
+                          "triangles", "regions", "materials", "circuits",
+                          "outer_dirichlet", "air_gap_elements" }, error)
                     : ExactObject(*resolved, { "source_fem_sha256",
                           "base_motor_fem_sha256", "model", "pose", "nodes_mm",
                           "triangles", "regions", "materials", "circuits",
-                          "outer_dirichlet", "air_gap_elements" }, error)))) {
+                          "outer_dirichlet", "air_gap_elements", "node_constraints",
+                          "sector" }, error))))) {
     if (error->empty())
       *error = "invalid GPU FEMM mesh artifact header";
     return false;
@@ -4134,13 +4418,16 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* materials = JsonMember(*resolved, "materials", StrictJson::Type::kArray, error);
   const StrictJson* circuits = JsonMember(*resolved, "circuits", StrictJson::Type::kArray, error);
   const StrictJson* boundary = JsonMember(*resolved, "outer_dirichlet", StrictJson::Type::kObject, error);
-  const StrictJson* node_constraints = generic_neutral_schema
+  const StrictJson* node_constraints = (generic_neutral_schema || motor_v3)
       ? JsonMember(*resolved, "node_constraints", StrictJson::Type::kArray, error)
       : nullptr;
+  const StrictJson* sector = motor_v3
+      ? JsonMember(*resolved, "sector", StrictJson::Type::kObject, error) : nullptr;
   if (resolved_sha == nullptr || base_sha == nullptr || model == nullptr
       || (!neutral_schema && pose == nullptr) || nodes == nullptr || triangles == nullptr || regions == nullptr
       || materials == nullptr || circuits == nullptr || boundary == nullptr
-      || (generic_neutral_schema && node_constraints == nullptr)
+      || ((generic_neutral_schema || motor_v3) && node_constraints == nullptr)
+      || (motor_v3 && sector == nullptr)
       || !(neutral_schema ? JsonLowerSha256(resolved_sha->string)
                           : JsonSha256(resolved_sha->string))
       || !(neutral_schema ? JsonLowerSha256(base_sha->string)
@@ -4187,8 +4474,18 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
 
   GpuFemmMeshArtifact parsed;
   parsed.schema_version = schema->string;
-  const bool is_sliding_band_v2 = motor_v2;
-  parsed.has_sliding_band = is_sliding_band_v2;
+  bool is_sliding_band_motor = motor_v2;
+  if (motor_v3) {
+    const auto sector_ages = resolved->object.find("air_gap_elements");
+    if (sector_ages == resolved->object.end()
+        || sector_ages->second.type != StrictJson::Type::kArray
+        || !sector_ages->second.array.empty()) {
+      *error = "gpu_femm_mesh_v3 requires a conforming posed sector mesh; native AGE sectors are not supported";
+      return false;
+    }
+    is_sliding_band_motor = false;
+  }
+  parsed.has_sliding_band = is_sliding_band_motor;
   parsed.pose_fem_sha256 = source_sha->string;
   parsed.base_motor_fem_sha256 = base_sha->string;
   parsed.canonical_identity_sha256 = identity->string;
@@ -4395,7 +4692,7 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     parsed.model.dirichlet_nodes.push_back(node);
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
   }
-  if (generic_neutral_schema) {
+  if (generic_neutral_schema || motor_v3) {
     for (const StrictJson& entry : node_constraints->array) {
       if (!ExactObject(entry, { "node_a", "node_b", "relation" }, error))
         return false;
@@ -4418,7 +4715,152 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       parsed.model.node_constraints.push_back(constraint);
     }
   }
-  if (is_sliding_band_v2) {
+  if (motor_v3) {
+    if (!ExactObject(*sector, { "schema_version", "sector_start_angle_deg",
+            "angle_deg",
+            "full_machine_sector_count", "electrical_pole_pairs",
+             "suspension_spatial_order",
+             "boundary_relation", "circuit_partner_indices",
+             "circuit_partner_orientations", "apex_self_pair_nodes",
+             "model_invariance_certificate_sha256" }, error))
+      return false;
+    const StrictJson* sector_schema = JsonMember(*sector, "schema_version",
+        StrictJson::Type::kString, error);
+    const StrictJson* start_angle = JsonMember(*sector,
+        "sector_start_angle_deg", StrictJson::Type::kNumber, error);
+    const StrictJson* angle = JsonMember(*sector, "angle_deg",
+        StrictJson::Type::kNumber, error);
+    const StrictJson* repeats = JsonMember(*sector, "full_machine_sector_count",
+        StrictJson::Type::kNumber, error);
+    const StrictJson* pole_pairs = JsonMember(*sector, "electrical_pole_pairs",
+        StrictJson::Type::kNumber, error);
+    const StrictJson* suspension_order = JsonMember(*sector,
+        "suspension_spatial_order", StrictJson::Type::kNumber, error);
+    const StrictJson* boundary_relation = JsonMember(*sector, "boundary_relation",
+        StrictJson::Type::kString, error);
+    const StrictJson* circuit_partners = JsonMember(*sector,
+        "circuit_partner_indices",
+        StrictJson::Type::kArray, error);
+    const StrictJson* circuit_orientations = JsonMember(*sector,
+        "circuit_partner_orientations", StrictJson::Type::kArray, error);
+    const StrictJson* apex_nodes = JsonMember(*sector,
+        "apex_self_pair_nodes", StrictJson::Type::kArray, error);
+    const StrictJson* invariance_sha = JsonMember(*sector,
+        "model_invariance_certificate_sha256", StrictJson::Type::kString,
+        error);
+    int32_t repeat_count = 0, p = 0, suspension_n = 0;
+    if (sector_schema == nullptr || start_angle == nullptr
+        || !std::isfinite(start_angle->number)
+        || angle == nullptr || repeats == nullptr
+        || pole_pairs == nullptr || suspension_order == nullptr
+         || boundary_relation == nullptr || circuit_partners == nullptr
+         || circuit_orientations == nullptr || apex_nodes == nullptr
+         || invariance_sha == nullptr || !JsonLowerSha256(invariance_sha->string)
+        || sector_schema->string != "gpu_femm_motor_sector_v1"
+        || angle->number != 180.0 || !JsonInteger(*repeats, &repeat_count)
+        || repeat_count != 2 || !JsonInteger(*pole_pairs, &p) || p <= 0
+        || !JsonInteger(*suspension_order, &suspension_n)
+        || suspension_n != p + 1
+        || (boundary_relation->string != "periodic"
+            && boundary_relation->string != "antiperiodic")
+        || circuit_partners->array.size()
+            != static_cast<size_t>(parsed.model.circuit_count)
+        || circuit_orientations->array.size()
+            != static_cast<size_t>(parsed.model.circuit_count)) {
+      *error = "motor sector v1 requires exact 180-degree, two-sector, p and p+1 harmonic metadata";
+      return false;
+    }
+    parsed.has_motor_sector = true;
+    parsed.sector_start_angle_deg = start_angle->number;
+    parsed.sector_angle_deg = angle->number;
+    parsed.full_machine_sector_count = repeat_count;
+    parsed.electrical_pole_pairs = p;
+    parsed.suspension_spatial_order = suspension_n;
+    parsed.sector_boundary_sign = boundary_relation->string == "periodic" ? 1 : -1;
+    parsed.model_invariance_certificate_sha256 = invariance_sha->string;
+    std::vector<bool> apex_seen(parsed.model.nodes.size(), false);
+    double mesh_radius_m = 1e-3;
+    for (const Node& node : parsed.model.nodes)
+      mesh_radius_m = std::max(mesh_radius_m, std::hypot(node.x_m, node.y_m));
+    const double sector_geometry_tolerance_m = std::max(
+        1e-10 * mesh_radius_m,
+        64.0 * std::numeric_limits<double>::epsilon() * mesh_radius_m);
+    for (const SignedNodeConstraint& constraint : parsed.model.node_constraints) {
+      const Node& a = parsed.model.nodes[constraint.node_a];
+      const Node& b = parsed.model.nodes[constraint.node_b];
+      if (std::hypot(a.x_m + b.x_m, a.y_m + b.y_m)
+          > sector_geometry_tolerance_m) {
+        *error = "motor sector non-self constraint nodes must be related by an exact 180-degree rotation";
+        return false;
+      }
+    }
+    for (const StrictJson& apex : apex_nodes->array) {
+      int32_t node = -1;
+      if (!JsonInteger(apex, &node) || node < 0
+          || static_cast<size_t>(node) >= parsed.model.nodes.size()
+          || apex_seen[node]
+          || std::hypot(parsed.model.nodes[node].x_m,
+                 parsed.model.nodes[node].y_m) > sector_geometry_tolerance_m
+          || std::any_of(parsed.model.node_constraints.begin(),
+                 parsed.model.node_constraints.end(), [node](
+                     const SignedNodeConstraint& constraint) {
+                   return constraint.node_a == node || constraint.node_b == node;
+                 })
+          || std::find(parsed.model.dirichlet_nodes.begin(),
+                 parsed.model.dirichlet_nodes.end(), node)
+              != parsed.model.dirichlet_nodes.end()) {
+        *error = "motor sector apex self-pair nodes must be unique origin nodes separate from physical boundaries and non-self constraints";
+        return false;
+      }
+      apex_seen[node] = true;
+      parsed.apex_self_pair_nodes.push_back(node);
+    }
+    std::vector<bool> partner_seen(parsed.model.circuit_count, false);
+    for (size_t circuit = 0; circuit < circuit_partners->array.size(); ++circuit) {
+      int32_t partner = -1, orientation = 0;
+      if (!JsonInteger(circuit_partners->array[circuit], &partner)
+          || !JsonInteger(circuit_orientations->array[circuit], &orientation)
+          || partner < 0 || partner >= parsed.model.circuit_count
+          || partner_seen[partner] || (orientation != -1 && orientation != 1)) {
+        *error = "invalid motor sector circuit partner mapping";
+        return false;
+      }
+      partner_seen[partner] = true;
+      parsed.circuit_partner_indices.push_back(partner);
+      parsed.circuit_partner_orientations.push_back(
+          static_cast<int8_t>(orientation));
+    }
+    for (size_t circuit = 0; circuit < parsed.circuit_partner_indices.size(); ++circuit) {
+      const int32_t partner = parsed.circuit_partner_indices[circuit];
+      if (parsed.circuit_partner_indices[partner] != static_cast<int32_t>(circuit)
+          || parsed.circuit_partner_orientations[circuit]
+              * parsed.circuit_partner_orientations[partner] != 1) {
+        *error = "motor sector circuit partner mapping must be an oriented involution";
+        return false;
+      }
+    }
+    if (parsed.model.node_constraints.empty()
+        || !std::all_of(parsed.model.node_constraints.begin(),
+            parsed.model.node_constraints.end(), [&](const SignedNodeConstraint& c) {
+              return c.sign == parsed.sector_boundary_sign;
+            })) {
+      *error = "motor sector node constraints do not match boundary_relation";
+      return false;
+    }
+    const int8_t base_sign = (p % 2) == 0 ? 1 : -1;
+    if (parsed.sector_boundary_sign != base_sign) {
+      *error = "motor sector boundary_relation does not match electrical pole-pair parity";
+      return false;
+    }
+    parsed.model.symmetry_apex_nodes = parsed.apex_self_pair_nodes;
+    if (base_sign < 0) {
+      for (const int32_t node : parsed.apex_self_pair_nodes) {
+        parsed.model.dirichlet_nodes.push_back(node);
+        parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
+      }
+    }
+  }
+  if (is_sliding_band_motor) {
     const auto ages_it = resolved->object.find("air_gap_elements");
     if (ages_it == resolved->object.end() || (ages_it->second.type != StrictJson::Type::kArray && ages_it->second.type != StrictJson::Type::kObject)
         || parsed.displacement_mm[0] != 0.0
@@ -4529,7 +4971,8 @@ int GpuFemmMeshArtifactTest(const std::string& path)
             << " circuits=" << artifact.model.circuit_count
             << " source_fem_sha256=" << artifact.pose_fem_sha256;
   if (artifact.schema_version == "gpu_femm_mesh_v1"
-      || artifact.schema_version == "gpu_femm_mesh_v2")
+      || artifact.schema_version == "gpu_femm_mesh_v2"
+      || artifact.schema_version == "gpu_femm_mesh_v3")
     std::cout << " base_motor_fem_sha256=" << artifact.base_motor_fem_sha256;
   std::cout << '\n';
   return 0;
@@ -4654,8 +5097,12 @@ Status BuildWeightedStressMask(const NonlinearModel& model,
   }
 
   std::vector<double> fixed(node_count, std::numeric_limits<double>::quiet_NaN());
-  for (const int32_t boundary : model.dirichlet_nodes)
-    fixed[boundary] = 0.0;
+  for (const int32_t boundary : model.dirichlet_nodes) {
+    if (std::find(model.symmetry_apex_nodes.begin(),
+            model.symmetry_apex_nodes.end(), boundary)
+        == model.symmetry_apex_nodes.end())
+      fixed[boundary] = 0.0;
+  }
   for (const NonlinearTriangle& triangle : model.triangles) {
     const NonlinearMaterial& material = model.materials[triangle.material];
     if (IsSelectedPostprocessMaterial(material, options, triangle.material)) {
@@ -4696,65 +5143,48 @@ Status BuildWeightedStressMask(const NonlinearModel& model,
   const Status sparse_validation = ValidateSparseRows(stiffness);
   if (sparse_validation != Status::kOk)
     return sparse_validation;
-  Assembly assembly;
-  assembly.boundary_values.assign(node_count, 0.0);
-  for (size_t node = 0; node < node_count; ++node) {
-    if (std::isfinite(fixed[node]))
-      assembly.boundary_values[node] = fixed[node];
-    else
-      assembly.free_nodes.push_back(static_cast<int32_t>(node));
-  }
-  if (assembly.free_nodes.empty()) {
+  if (std::all_of(fixed.begin(), fixed.end(),
+          [](double value) { return std::isfinite(value); })) {
     mask->assign(node_count, 0.0);
     for (size_t node = 0; node < node_count; ++node)
       (*mask)[node] = fixed[node] > 0.5 ? 1.0 : 0.0;
     return Status::kOk;
   }
-  const size_t free_count = assembly.free_nodes.size();
-  std::vector<int32_t> free_index(node_count, -1);
-  for (size_t row = 0; row < free_count; ++row)
-    free_index[assembly.free_nodes[row]] = static_cast<int32_t>(row);
-  assembly.row_offsets.assign(free_count + 1, 0);
-  assembly.diagonal.assign(free_count, 0.0);
-  std::vector<double> rhs(free_count, 0.0);
-  for (size_t row = 0; row < free_count; ++row) {
-    const int32_t global_row = assembly.free_nodes[row];
-    assembly.row_offsets[row] = static_cast<int32_t>(assembly.values.size());
-    for (const auto& entry : stiffness[global_row]) {
-      const int32_t global_column = entry.first;
-      const double value = entry.second;
-      if (std::isfinite(fixed[global_column])) {
-        rhs[row] -= value * fixed[global_column];
-      } else if (value != 0.0) {
-        const int32_t column = free_index[global_column];
-        if (column < 0)
-          return Status::kAssemblyFailed;
-        assembly.column_indices.push_back(column);
-        assembly.values.push_back(value);
-        if (static_cast<size_t>(column) == row)
-          assembly.diagonal[row] = value;
-      }
+  // The weighting field is a scalar geometric mask.  It is periodic across a
+  // 180-degree cut regardless of the magnetic A relation.  Reuse the exact
+  // cut-node pairs, force their signs to +1, and reduce the mask Laplacian in
+  // that quotient space.  BuildSignedDofMap also rejects a pair whose selected
+  // or air classification would impose incompatible fixed mask values.
+  NonlinearModel mask_model = model;
+  for (SignedNodeConstraint& constraint : mask_model.node_constraints)
+    constraint.sign = 1;
+  mask_model.dirichlet_nodes.clear();
+  mask_model.dirichlet_a_wb_per_m.clear();
+  for (size_t node = 0; node < node_count; ++node) {
+    if (std::isfinite(fixed[node])) {
+      mask_model.dirichlet_nodes.push_back(static_cast<int32_t>(node));
+      mask_model.dirichlet_a_wb_per_m.push_back(fixed[node]);
     }
-    if (!std::isfinite(rhs[row]))
-      return Status::kNumericalNonfinite;
-    if (!(assembly.diagonal[row] > 0.0) || !std::isfinite(assembly.diagonal[row]))
-      return Status::kAssemblyFailed;
   }
-  assembly.row_offsets[free_count] = static_cast<int32_t>(assembly.values.size());
+  Assembly assembly;
+  const std::vector<double> full_rhs(node_count, 0.0);
+  const Status reduction = ReduceSignedSystem(mask_model, stiffness, full_rhs,
+      &assembly);
+  if (reduction != Status::kOk)
+    return reduction;
   GpuCsrSolver solver;
   const Status initialize = solver.Initialize(assembly);
   if (initialize != Status::kOk)
     return initialize;
+  std::vector<double> rhs(assembly.rhs_per_amp.size(), 0.0);
+  for (size_t row = 0; row < rhs.size(); ++row)
+    rhs[row] = assembly.rhs_per_amp[row] + assembly.rhs_offset[row];
   std::vector<double> free_mask;
   const SolveInfo info = solver.Solve(rhs, options.mask_relative_tolerance,
       options.max_mask_iterations, &free_mask);
   if (info.status != Status::kOk)
     return info.status;
-  mask->assign(node_count, 0.0);
-  for (size_t node = 0; node < node_count; ++node)
-    (*mask)[node] = std::isfinite(fixed[node]) ? fixed[node] : 0.0;
-  for (size_t row = 0; row < free_count; ++row)
-    (*mask)[assembly.free_nodes[row]] = free_mask[row];
+  *mask = ExpandAssemblySolution(assembly, free_mask);
   // FEMM's default WeightingScheme=0 does not use the continuous harmonic
   // mask directly: it thresholds every solved node at V>0.5.
   for (double& value : *mask)
@@ -5163,6 +5593,251 @@ FrozenPostprocessResult ComputeAirGapElementPostprocess(const NonlinearModel& mo
   if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n) || !std::isfinite(result.torque_nm)) {
     result.status = Status::kNumericalNonfinite;
   }
+  return result;
+}
+
+struct TangentPostprocessResult {
+  Status status = Status::kInternalError;
+  double force_x_n_per_a = 0.0;
+  double force_y_n_per_a = 0.0;
+  double torque_nm_per_a = 0.0;
+  std::vector<double> airgap_radial_flux_density_t_per_a;
+};
+
+TangentPostprocessResult ComputeFrozenTangentPostprocess(
+    const NonlinearModel& model, const NonlinearSolveResult& base,
+    const NonlinearSolveResult& derivative,
+    const FrozenPostprocessOptions& options, const std::vector<double>& mask)
+{
+  TangentPostprocessResult result;
+  if (base.a_wb_per_m.size() != model.nodes.size()
+      || derivative.a_wb_per_m.size() != model.nodes.size()
+      || base.bx_t.size() != model.triangles.size()
+      || derivative.bx_t.size() != model.triangles.size()
+      || mask.size() != model.nodes.size()) {
+    result.status = Status::kInvalidArgument;
+    return result;
+  }
+  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
+  std::vector<std::vector<int32_t>> incident(model.nodes.size());
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    for (int local = 0; local < 3; ++local) {
+      incident[triangle.node[local]].push_back(static_cast<int32_t>(element));
+      edge_elements[CanonicalEdge(triangle.node[local],
+          triangle.node[(local + 1) % 3])].push_back(
+          static_cast<int32_t>(element));
+    }
+    Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
+      model.nodes[triangle.node[2]] };
+    NonlinearElementTerms terms;
+    if (!BuildElementTerms(p, &terms)) {
+      result.status = Status::kMeshInvalid;
+      return result;
+    }
+    double hx = 0.0, hy = 0.0;
+    for (int local = 0; local < 3; ++local) {
+      hx += mask[triangle.node[local]] * terms.b_y[local];
+      hy -= mask[triangle.node[local]] * terms.b_x[local];
+    }
+    const double bx = base.bx_t[element], by = base.by_t[element];
+    const double dbx = derivative.bx_t[element];
+    const double dby = derivative.by_t[element];
+    const double dnormal = 2.0 * (bx * dbx - by * dby);
+    const double dshear = 2.0 * (dbx * by + bx * dby);
+    const double dfx_density = (dnormal * hx + dshear * hy) / (2.0 * kMu0);
+    const double dfy_density = (dshear * hx - dnormal * hy) / (2.0 * kMu0);
+    const double weight = terms.area_m2 * model.depth_m;
+    result.force_x_n_per_a += weight * dfx_density;
+    result.force_y_n_per_a += weight * dfy_density;
+    const double cx = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
+    const double cy = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
+    result.torque_nm_per_a += weight
+        * (cx * dfy_density - cy * dfx_density);
+  }
+  for (const double angle : options.airgap_angles_rad) {
+    const double x = options.airgap_radius_m * std::cos(angle);
+    const double y = options.airgap_radius_m * std::sin(angle);
+    int32_t containing = -1;
+    double lambda[3] = {};
+    for (size_t element = 0; element < model.triangles.size(); ++element) {
+      const NonlinearTriangle& triangle = model.triangles[element];
+      Node p[3] = { model.nodes[triangle.node[0]],
+        model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+      double candidate[3] = {};
+      if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
+          && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
+        containing = static_cast<int32_t>(element);
+        std::copy(candidate, candidate + 3, lambda);
+        break;
+      }
+    }
+    if (containing < 0 || !IsAirPostprocessMaterial(
+            model.materials[model.triangles[containing].material], options,
+            model.triangles[containing].material)) {
+      result.status = Status::kInvalidArgument;
+      return result;
+    }
+    double nodal_bx[3] = {}, nodal_by[3] = {};
+    if (!SmoothedElementB(model, derivative.a_wb_per_m, derivative.bx_t,
+            derivative.by_t, incident, edge_elements, containing,
+            nodal_bx, nodal_by)) {
+      result.status = Status::kMeshInvalid;
+      return result;
+    }
+    double bx = 0.0, by = 0.0;
+    for (int local = 0; local < 3; ++local) {
+      bx += lambda[local] * nodal_bx[local];
+      by += lambda[local] * nodal_by[local];
+    }
+    result.airgap_radial_flux_density_t_per_a.push_back(
+        bx * std::cos(angle) + by * std::sin(angle));
+  }
+  result.status = std::isfinite(result.force_x_n_per_a)
+          && std::isfinite(result.force_y_n_per_a)
+          && std::isfinite(result.torque_nm_per_a)
+      ? Status::kOk : Status::kNumericalNonfinite;
+  return result;
+}
+
+TangentPostprocessResult ComputeAirGapElementTangentPostprocess(
+    const NonlinearModel& base_model, const NonlinearModel& tangent_model,
+    const NonlinearSolveResult& base,
+    const NonlinearSolveResult& derivative,
+    const FrozenPostprocessOptions& options)
+{
+  TangentPostprocessResult result;
+  if (base_model.air_gap_elements.empty()
+      || base_model.air_gap_elements.size() != tangent_model.air_gap_elements.size()
+      || base.a_wb_per_m.size() != base_model.nodes.size()
+      || derivative.a_wb_per_m.size() != tangent_model.nodes.size()
+      || base_model.nodes.size() != tangent_model.nodes.size()) {
+    result.status = Status::kInvalidArgument;
+    return result;
+  }
+  std::vector<double> first_dbr;
+  const AirGapElement* first_tangent_age = nullptr;
+  for (size_t age_index = 0; age_index < base_model.air_gap_elements.size(); ++age_index) {
+    const AirGapElement& age = base_model.air_gap_elements[age_index];
+    const AirGapElement& tangent_age = tangent_model.air_gap_elements[age_index];
+    const size_t elements = age.quad_points.size() - 1;
+    if (tangent_age.quad_points.size() != age.quad_points.size()
+        || tangent_age.arc_length_deg != age.arc_length_deg
+        || tangent_age.inner_radius_m != age.inner_radius_m
+        || tangent_age.outer_radius_m != age.outer_radius_m
+        || tangent_age.inner_shift != age.inner_shift
+        || tangent_age.outer_shift != age.outer_shift) {
+      result.status = Status::kInvalidArgument;
+      return result;
+    }
+    const double dt = (3.141592653589793238462643383279502884 / 180.0)
+        * age.arc_length_deg / static_cast<double>(elements);
+    const double radius = 0.5 * (age.inner_radius_m + age.outer_radius_m);
+    const double dr = age.outer_radius_m - age.inner_radius_m;
+    std::vector<double> dbr(elements, 0.0);
+    for (size_t k = 0; k < elements; ++k) {
+      int32_t node[10], tangent_node[10];
+      double weight[10], tangent_weight[10], a[10], da[10];
+      if (!BuildAirGapStencil(age, k, node, weight)
+          || !BuildAirGapStencil(tangent_age, k, tangent_node, tangent_weight)) {
+        result.status = Status::kMeshInvalid;
+        return result;
+      }
+      for (int local = 0; local < 10; ++local) {
+        a[local] = base.a_wb_per_m[node[local]] * weight[local];
+        da[local] = derivative.a_wb_per_m[tangent_node[local]]
+            * tangent_weight[local];
+      }
+      const auto age_field = [&](const double value[10], double* br, double* bt) {
+        const double ci = age.inner_shift, co = age.outer_shift;
+        *br = (-(ci * value[1]) - 2 * value[2] + 2 * value[3]
+                  + ci * (value[2] + value[3] - value[4])
+                  - ci * ci * ci * (value[0] - 4 * value[1] + 6 * value[2]
+                      - 4 * value[3] + value[4])
+                  + ci * ci * (value[0] - 5 * value[1] + 9 * value[2]
+                      - 7 * value[3] + 2 * value[4])
+                  - 2 * value[7] + 2 * value[8]
+                  + co * (-value[6] + value[7] + value[8] - value[9])
+                  - co * co * co * (value[5] - 4 * value[6] + 6 * value[7]
+                      - 4 * value[8] + value[9])
+                  + co * co * (value[5] - 5 * value[6] + 9 * value[7]
+                      - 7 * value[8] + 2 * value[9]))
+            / (4 * dt * radius);
+        *bt = (ci * value[1] + 2 * value[2] + 2 * value[3]
+                  - ci * ci * (value[0] - 3 * value[1] + value[2]
+                      + 3 * value[3] - 2 * value[4])
+                  + ci * (value[2] - value[3] - value[4])
+                  + ci * ci * ci * (value[0] - 2 * value[1]
+                      + 2 * value[3] - value[4]) - co * value[6]
+                  + (-2 + co) * (1 + co) * value[7] - 2 * value[8]
+                  + co * (value[8] + co * (value[5] - 3 * value[6]
+                      + 3 * value[8] - 2 * value[9]) + value[9]
+                      + co * co * (-value[5] + 2 * value[6]
+                          - 2 * value[8] + value[9])))
+            / (4 * dr);
+      };
+      double br = 0.0, bt = 0.0, dbt = 0.0;
+      age_field(a, &br, &bt);
+      age_field(da, &dbr[k], &dbt);
+      const double theta = (static_cast<double>(k) + 0.5) * dt;
+      const double dnormal = 2.0 * (br * dbr[k] - bt * dbt);
+      const double dshear = 2.0 * (dbr[k] * bt + br * dbt);
+      const double scale = base_model.depth_m * radius * dt / (2.0 * kMu0);
+      result.force_x_n_per_a += scale
+          * (dnormal * std::cos(theta) - dshear * std::sin(theta));
+      result.force_y_n_per_a += scale
+          * (dnormal * std::sin(theta) + dshear * std::cos(theta));
+      result.torque_nm_per_a += base_model.depth_m * radius * radius * dt
+          * (dbr[k] * bt + br * dbt) / kMu0;
+    }
+    if (first_tangent_age == nullptr) {
+      first_tangent_age = &tangent_age;
+      first_dbr = std::move(dbr);
+    }
+  }
+  if (first_tangent_age != nullptr) {
+    const size_t elements = first_dbr.size();
+    const size_t harmonic_count = first_tangent_age->antiperiodic
+        ? (elements + 1) / 2 : elements / 2 + 1;
+    const int32_t harmonic_base = static_cast<int32_t>(std::lround(
+        (first_tangent_age->antiperiodic ? 180.0 : 360.0)
+        / first_tangent_age->arc_length_deg));
+    const double dt = (3.141592653589793238462643383279502884 / 180.0)
+        * first_tangent_age->arc_length_deg / static_cast<double>(elements);
+    std::vector<int32_t> order(harmonic_count);
+    std::vector<double> cosine(harmonic_count, 0.0), sine(harmonic_count, 0.0);
+    for (size_t harmonic = 0; harmonic < harmonic_count; ++harmonic) {
+      order[harmonic] = first_tangent_age->antiperiodic
+          ? harmonic_base * static_cast<int32_t>(2 * harmonic + 1)
+          : harmonic_base * static_cast<int32_t>(harmonic);
+      for (size_t k = 0; k < elements; ++k) {
+        const double phase = (static_cast<double>(k) + 0.5) * dt
+            * static_cast<double>(order[harmonic]);
+        cosine[harmonic] += first_dbr[k] * std::cos(phase);
+        sine[harmonic] += first_dbr[k] * std::sin(phase);
+      }
+      const bool dc_or_nyquist = order[harmonic] == 0
+          || (!first_tangent_age->antiperiodic && harmonic + 1 == harmonic_count
+              && (elements % 2) == 0);
+      const double normalization = dc_or_nyquist
+          ? static_cast<double>(elements) : static_cast<double>(elements) / 2.0;
+      cosine[harmonic] /= normalization;
+      sine[harmonic] /= normalization;
+    }
+    for (const double angle : options.airgap_angles_rad) {
+      double radial = 0.0;
+      for (size_t harmonic = 0; harmonic < harmonic_count; ++harmonic) {
+        const double phase = static_cast<double>(order[harmonic]) * angle;
+        radial += cosine[harmonic] * std::cos(phase)
+            + sine[harmonic] * std::sin(phase);
+      }
+      result.airgap_radial_flux_density_t_per_a.push_back(radial);
+    }
+  }
+  result.status = std::isfinite(result.force_x_n_per_a)
+          && std::isfinite(result.force_y_n_per_a)
+          && std::isfinite(result.torque_nm_per_a)
+      ? Status::kOk : Status::kNumericalNonfinite;
   return result;
 }
 
@@ -5996,7 +6671,17 @@ bool ReadSingleSampleRequest(const std::string& path, SingleSampleRequest* reque
   return true;
 }
 
+struct TangentMultiRhsRequest {
+  std::vector<std::pair<std::string, std::vector<double>>> rhs;
+};
+
+struct MotorSectorPerformanceRequest {
+  bool enabled = false;
+  std::string model_invariance_certificate_sha256;
+};
+
 struct MotorSampleRequest {
+  std::string protocol = "gpu_femm_motor_sample_v1";
   std::string mesh_artifact_path;
   std::string mesh_artifact_sha256;
   std::string base_motor_fem_sha256;
@@ -6008,6 +6693,9 @@ struct MotorSampleRequest {
   std::vector<double> airgap_angles_deg;
   double rotor_angle_deg = 0.0;
   double displacement_mm[2] = {};
+  bool tangent_requested = false;
+  TangentMultiRhsRequest tangent_multi_rhs;
+  MotorSectorPerformanceRequest sector_performance;
 };
 
 // Project-neutral planar-DC entry point.  The production motor protocol above
@@ -6096,8 +6784,42 @@ bool ReadPlanarDcSampleRequestJson(const std::string& json,
 bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* request,
     std::string* error)
 {
+  const std::initializer_list<const char*> legacy_fields = { "protocol",
+    "mesh_artifact_path", "mesh_artifact_sha256", "base_motor_fem_sha256",
+    "source_fem_sha256", "circuit_currents_A", "selected_group_number",
+    "air_group_number", "airgap_radius_mm", "airgap_angles_deg",
+    "rotor_angle_deg", "displacement_mm" };
+  const auto protocol_field = root.type == StrictJson::Type::kObject
+      ? root.object.find("protocol") : root.object.end();
+  const bool v1 = protocol_field != root.object.end()
+      && protocol_field->second.type == StrictJson::Type::kString
+      && protocol_field->second.string == "gpu_femm_motor_sample_v1";
+  const bool v2 = protocol_field != root.object.end()
+      && protocol_field->second.type == StrictJson::Type::kString
+      && protocol_field->second.string == "gpu_femm_motor_sample_v2";
+  const bool v3 = protocol_field != root.object.end()
+      && protocol_field->second.type == StrictJson::Type::kString
+      && protocol_field->second.string == "gpu_femm_motor_sample_v3";
+  const bool has_tangent_field = root.type == StrictJson::Type::kObject
+      && root.object.find("tangent_multi_rhs") != root.object.end();
   if (request == nullptr || error == nullptr
-      || !ExactObject(root, { "protocol", "mesh_artifact_path", "mesh_artifact_sha256", "base_motor_fem_sha256", "source_fem_sha256", "circuit_currents_A", "selected_group_number", "air_group_number", "airgap_radius_mm", "airgap_angles_deg", "rotor_angle_deg", "displacement_mm" }, error))
+      || (!v1 && !v2 && !v3)
+      || (v1 && !ExactObject(root, legacy_fields, error))
+      || (v2 && !has_tangent_field)
+      || (v2
+          && !ExactObject(root, { "protocol", "mesh_artifact_path",
+              "mesh_artifact_sha256", "base_motor_fem_sha256",
+              "source_fem_sha256", "circuit_currents_A",
+              "selected_group_number", "air_group_number", "airgap_radius_mm",
+              "airgap_angles_deg", "rotor_angle_deg", "displacement_mm",
+              "tangent_multi_rhs" }, error))
+      || (v3
+          && !ExactObject(root, { "protocol", "mesh_artifact_path",
+              "mesh_artifact_sha256", "base_motor_fem_sha256",
+              "source_fem_sha256", "circuit_currents_A",
+              "selected_group_number", "air_group_number", "airgap_radius_mm",
+              "airgap_angles_deg", "rotor_angle_deg", "displacement_mm",
+              "tangent_multi_rhs", "sector_performance" }, error)))
     return false;
   const StrictJson* protocol = JsonMember(root, "protocol", StrictJson::Type::kString, error);
   const StrictJson* path = JsonMember(root, "mesh_artifact_path", StrictJson::Type::kString, error);
@@ -6114,7 +6836,10 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
   int32_t selected_group = -1, air_group = -1;
   if (protocol == nullptr || path == nullptr || artifact_sha == nullptr || base_sha == nullptr || source_sha == nullptr
       || currents == nullptr || selected == nullptr || air == nullptr || radius == nullptr
-      || angles == nullptr || rotor == nullptr || displacement == nullptr || protocol->string != "gpu_femm_motor_sample_v1"
+      || angles == nullptr || rotor == nullptr || displacement == nullptr
+      || (protocol->string != "gpu_femm_motor_sample_v1"
+          && protocol->string != "gpu_femm_motor_sample_v2"
+          && protocol->string != "gpu_femm_motor_sample_v3")
       || path->string.empty() || !JsonSha256(artifact_sha->string) || !JsonSha256(base_sha->string)
       || !JsonSha256(source_sha->string)
       || !JsonInteger(*selected, &selected_group) || !JsonInteger(*air, &air_group)
@@ -6129,6 +6854,7 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
     return false;
   }
   request->mesh_artifact_path = path->string;
+  request->protocol = protocol->string;
   request->mesh_artifact_sha256 = artifact_sha->string;
   request->base_motor_fem_sha256 = base_sha->string;
   request->source_fem_sha256 = source_sha->string;
@@ -6138,6 +6864,84 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
   request->rotor_angle_deg = rotor->number;
   request->displacement_mm[0] = displacement->array[0].number;
   request->displacement_mm[1] = displacement->array[1].number;
+  request->tangent_requested = false;
+  request->tangent_multi_rhs.rhs.clear();
+  request->sector_performance = {};
+  if (v2 || v3) {
+    const StrictJson& tangent = root.object.at("tangent_multi_rhs");
+    // MATLAB homogeneous struct arrays commonly encode an unused nested
+    // struct as [] or null.  Both are explicit no-op values.
+    const bool empty_tangent = tangent.type == StrictJson::Type::kNull
+        || (tangent.type == StrictJson::Type::kArray && tangent.array.empty());
+    if (empty_tangent && v2)
+      return true;
+    if (!empty_tangent) {
+      if (!ExactObject(tangent, { "schema_version", "rhs" }, error))
+        return false;
+    const StrictJson* schema = JsonMember(tangent, "schema_version",
+        StrictJson::Type::kString, error);
+    const StrictJson* rhs = JsonMember(tangent, "rhs", StrictJson::Type::kArray,
+        error);
+    if (schema == nullptr || rhs == nullptr
+        || schema->string != "gpu_femm_tangent_multi_rhs_v1"
+        || rhs->array.empty() || rhs->array.size() > 8) {
+      if (error->empty())
+        *error = "invalid gpu_femm_tangent_multi_rhs_v1 request";
+      return false;
+    }
+    std::map<std::string, bool> names;
+    for (const StrictJson& entry : rhs->array) {
+      if (!ExactObject(entry,
+              { "name", "circuit_current_derivative_A_per_A" }, error))
+        return false;
+      const StrictJson* name = JsonMember(entry, "name",
+          StrictJson::Type::kString, error);
+      const StrictJson* direction = JsonMember(entry,
+          "circuit_current_derivative_A_per_A", StrictJson::Type::kArray, error);
+      std::vector<double> values;
+      const bool valid_name = name != nullptr && !name->string.empty()
+          && name->string.size() <= 128
+          && std::all_of(name->string.begin(), name->string.end(),
+              [](unsigned char c) {
+                return std::isalnum(c) || c == '_' || c == '-' || c == '.';
+              });
+      if (!valid_name || direction == nullptr || names.count(name->string) != 0
+          || !StrictNumberArray(*direction, &values)
+          || values.size() != request->circuit_currents_a.size()
+          || !std::all_of(values.begin(), values.end(),
+              [](double value) { return std::isfinite(value); })) {
+        if (error->empty())
+          *error = "invalid tangent RHS name or circuit derivative vector";
+        return false;
+      }
+      names.emplace(name->string, true);
+      request->tangent_multi_rhs.rhs.emplace_back(name->string,
+          std::move(values));
+    }
+      request->tangent_requested = true;
+    }
+  }
+  if (v3) {
+    const StrictJson& sector_request = root.object.at("sector_performance");
+    if (!ExactObject(sector_request, { "schema_version",
+            "model_invariance_certificate_sha256" }, error))
+      return false;
+    const StrictJson* sector_schema = JsonMember(sector_request, "schema_version",
+        StrictJson::Type::kString, error);
+    const StrictJson* certificate_sha = JsonMember(sector_request,
+        "model_invariance_certificate_sha256", StrictJson::Type::kString,
+        error);
+    if (sector_schema == nullptr
+        || certificate_sha == nullptr
+        || !JsonLowerSha256(certificate_sha->string)
+        || sector_schema->string != "gpu_femm_motor_sector_performance_v1") {
+      *error = "invalid gpu_femm_motor_sector_performance_v1 request";
+      return false;
+    }
+    request->sector_performance.enabled = true;
+    request->sector_performance.model_invariance_certificate_sha256 =
+        certificate_sha->string;
+  }
   return true;
 }
 
@@ -6152,6 +6956,20 @@ bool ReadMotorSampleRequestJson(const std::string& json, MotorSampleRequest* req
 
 bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact)
 {
+  const bool sector_request = request.protocol == "gpu_femm_motor_sample_v3";
+  if (sector_request != artifact.has_motor_sector
+      || (sector_request && (artifact.schema_version != "gpu_femm_mesh_v3"
+          || artifact.sector_angle_deg != 180.0
+          || artifact.full_machine_sector_count != 2
+          || artifact.electrical_pole_pairs <= 0
+          || artifact.suspension_spatial_order
+              != artifact.electrical_pole_pairs + 1
+          || artifact.sector_boundary_sign
+              != ((artifact.electrical_pole_pairs % 2) == 0 ? 1 : -1)
+          || !request.sector_performance.enabled
+          || request.sector_performance.model_invariance_certificate_sha256
+              != artifact.model_invariance_certificate_sha256)))
+    return false;
   const bool matching_pose = artifact.has_sliding_band
       ? request.displacement_mm[0] == 0.0 && request.displacement_mm[1] == 0.0
       : request.rotor_angle_deg == artifact.rotor_angle_deg
@@ -6234,6 +7052,90 @@ bool ApplySlidingBandRotorAngle(const MotorSampleRequest& request,
   return ApplySlidingBandAngle(request.rotor_angle_deg, artifact, model);
 }
 
+bool MakeMotorSectorTangentModel(const GpuFemmMeshArtifact& artifact,
+    const NonlinearModel& posed_base_model, NonlinearModel* tangent_model)
+{
+  if (tangent_model == nullptr || !artifact.has_motor_sector
+      || artifact.suspension_spatial_order != artifact.electrical_pole_pairs + 1)
+    return false;
+  *tangent_model = posed_base_model;
+  const int8_t tangent_sign = static_cast<int8_t>(
+      (artifact.suspension_spatial_order % 2) == 0 ? 1 : -1);
+  for (const int32_t apex : artifact.apex_self_pair_nodes) {
+    for (size_t index = 0; index < tangent_model->dirichlet_nodes.size();) {
+      if (tangent_model->dirichlet_nodes[index] == apex) {
+        tangent_model->dirichlet_nodes.erase(
+            tangent_model->dirichlet_nodes.begin() + index);
+        tangent_model->dirichlet_a_wb_per_m.erase(
+            tangent_model->dirichlet_a_wb_per_m.begin() + index);
+      } else {
+        ++index;
+      }
+    }
+    if (tangent_sign < 0) {
+      tangent_model->dirichlet_nodes.push_back(apex);
+      tangent_model->dirichlet_a_wb_per_m.push_back(0.0);
+    }
+  }
+  for (SignedNodeConstraint& constraint : tangent_model->node_constraints)
+    constraint.sign = tangent_sign;
+  for (AirGapElement& age : tangent_model->air_gap_elements)
+    age.antiperiodic = tangent_sign < 0;
+  return ValidateNonlinearModel(*tangent_model) == Status::kOk;
+}
+
+std::vector<int8_t> MapSectorAirgapAnglesToRepresentative(
+    double sector_start_angle_rad, int8_t repeat_sign,
+    FrozenPostprocessOptions* options)
+{
+  std::vector<int8_t> signs;
+  if (options == nullptr || !std::isfinite(sector_start_angle_rad))
+    return signs;
+  signs.reserve(options->airgap_angles_rad.size());
+  constexpr double kPi = 3.141592653589793238462643383279502884;
+  for (double& angle : options->airgap_angles_rad) {
+    const double turns = std::floor((angle - sector_start_angle_rad) / kPi);
+    int64_t copy = static_cast<int64_t>(turns);
+    angle -= static_cast<double>(copy) * kPi;
+    const double tolerance = 64.0 * std::numeric_limits<double>::epsilon()
+        * std::max({ 1.0, std::abs(angle), std::abs(sector_start_angle_rad) });
+    if (angle < sector_start_angle_rad - tolerance) {
+      angle += kPi;
+      --copy;
+    } else if (angle >= sector_start_angle_rad + kPi - tolerance) {
+      angle -= kPi;
+      ++copy;
+    }
+    if (std::abs(angle - sector_start_angle_rad) <= tolerance)
+      angle = sector_start_angle_rad;
+    const bool odd_copy = (std::abs(copy) % 2) != 0;
+    signs.push_back(odd_copy ? repeat_sign : 1);
+  }
+  return signs;
+}
+
+bool ApplySectorAirgapRepeatSigns(const std::vector<int8_t>& signs,
+    FrozenPostprocessResult* postprocess)
+{
+  if (postprocess == nullptr || signs.size() != postprocess->airgap_samples.size())
+    return false;
+  for (size_t sample = 0; sample < signs.size(); ++sample)
+    postprocess->airgap_samples[sample].radial_b_t *= signs[sample];
+  return true;
+}
+
+bool ApplySectorTangentAirgapRepeatSigns(const std::vector<int8_t>& signs,
+    TangentPostprocessResult* postprocess)
+{
+  if (postprocess == nullptr
+      || signs.size()
+          != postprocess->airgap_radial_flux_density_t_per_a.size())
+    return false;
+  for (size_t sample = 0; sample < signs.size(); ++sample)
+    postprocess->airgap_radial_flux_density_t_per_a[sample] *= signs[sample];
+  return true;
+}
+
 Status SolveMeshArtifactSingleSample(const MotorSampleRequest& request,
     const GpuFemmMeshArtifact& artifact, NonlinearSolveResult* solution,
     FrozenPostprocessResult* postprocess)
@@ -6268,7 +7170,9 @@ void WriteMotorSampleResponseJson(std::ostream& output, Status status, const Mot
     const NonlinearSolveResult* solution, const FrozenPostprocessResult* postprocess)
 {
   const auto field = [request](const std::string MotorSampleRequest::* member) { return request == nullptr ? "" : request->*member; };
-  output << std::setprecision(17) << "{\n  \"protocol\": \"gpu_femm_motor_sample_v1\",\n"
+  output << std::setprecision(17) << "{\n  \"protocol\": \""
+         << (request == nullptr ? "gpu_femm_motor_sample_v1" : request->protocol)
+         << "\",\n"
          << "  \"mesh_artifact_sha256\": \"" << field(&MotorSampleRequest::mesh_artifact_sha256) << "\",\n"
          << "  \"base_motor_fem_sha256\": \"" << field(&MotorSampleRequest::base_motor_fem_sha256) << "\",\n"
          << "  \"source_fem_sha256\": \"" << field(&MotorSampleRequest::source_fem_sha256) << "\",\n"
@@ -6723,6 +7627,7 @@ struct MotorBatchItem {
 };
 
 struct MotorBatchRequest {
+  std::string protocol = "gpu_femm_motor_batch_v1";
   int32_t max_items_per_chunk = 1;
   std::vector<MotorBatchItem> items;
 };
@@ -6745,12 +7650,16 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
   const StrictJson* items = JsonMember(root, "items", StrictJson::Type::kArray, error);
   int32_t max_items = 0;
   if (protocol == nullptr || chunk == nullptr || items == nullptr
-      || protocol->string != "gpu_femm_motor_batch_v1" || !JsonInteger(*chunk, &max_items)
+      || (protocol->string != "gpu_femm_motor_batch_v1"
+          && protocol->string != "gpu_femm_motor_batch_v2"
+          && protocol->string != "gpu_femm_motor_batch_v3")
+      || !JsonInteger(*chunk, &max_items)
       || max_items < 1 || max_items > 4096 || items->array.empty() || items->array.size() > 4096) {
     if (error->empty())
       *error = "invalid gpu_femm_motor_batch_v1 request";
     return false;
   }
+  request->protocol = protocol->string;
   request->max_items_per_chunk = max_items;
   request->items.clear();
   std::map<std::string, bool> ids;
@@ -6760,10 +7669,19 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
     const StrictJson* id = JsonMember(item, "task_id", StrictJson::Type::kString, error);
     const StrictJson* sample = JsonMember(item, "request", StrictJson::Type::kObject, error);
     MotorBatchItem parsed;
+    const std::string expected_sample_protocol = request->protocol
+            == "gpu_femm_motor_batch_v3"
+        ? "gpu_femm_motor_sample_v3"
+        : (request->protocol == "gpu_femm_motor_batch_v2"
+              ? "gpu_femm_motor_sample_v2" : "gpu_femm_motor_sample_v1");
     if (id == nullptr || sample == nullptr || !BatchTaskIdValid(id->string)
         || ids.count(id->string) != 0 || !ReadMotorSampleRequestValue(*sample, &parsed.request, error)) {
       if (error->empty())
         *error = "invalid or duplicate batch task_id";
+      return false;
+    }
+    if (parsed.request.protocol != expected_sample_protocol) {
+      *error = "motor batch and item protocol versions must match";
       return false;
     }
     parsed.task_id = id->string;
@@ -6808,6 +7726,10 @@ std::string NonlinearModelFingerprint(const NonlinearModel& model)
   bytes << ':';
   for (double value : model.dirichlet_a_wb_per_m)
     bytes << value << ',';
+  bytes << ':';
+  for (const SignedNodeConstraint& constraint : model.node_constraints)
+    bytes << constraint.node_a << ',' << constraint.node_b << ','
+          << static_cast<int>(constraint.sign) << ';';
   return Sha256Hex(bytes.str());
 }
 
@@ -6872,6 +7794,61 @@ void LoadMotorBatchArtifact(const std::string& path, MotorBatchArtifactLoad* loa
   load->status = Status::kOk;
 }
 
+bool SameSectorConstraintPairs(const NonlinearModel& base,
+    const NonlinearModel& tangent)
+{
+  if (base.node_constraints.size() != tangent.node_constraints.size())
+    return false;
+  const auto pairs = [](const NonlinearModel& model) {
+    std::vector<std::pair<int32_t, int32_t>> result;
+    result.reserve(model.node_constraints.size());
+    for (const SignedNodeConstraint& constraint : model.node_constraints)
+      result.push_back(std::minmax(constraint.node_a, constraint.node_b));
+    std::sort(result.begin(), result.end());
+    return result;
+  };
+  return pairs(base) == pairs(tangent);
+}
+
+bool MotorSectorArtifactsCompatible(const GpuFemmMeshArtifact& base,
+    const GpuFemmMeshArtifact& tangent)
+{
+  if (!base.has_motor_sector || !tangent.has_motor_sector
+      || !base.has_sliding_band || !tangent.has_sliding_band
+      || base.schema_version != "gpu_femm_mesh_v3"
+      || tangent.schema_version != "gpu_femm_mesh_v3"
+      || base.base_motor_fem_sha256 != tangent.base_motor_fem_sha256
+      || base.rotor_angle_deg != tangent.rotor_angle_deg
+      || base.displacement_mm[0] != tangent.displacement_mm[0]
+      || base.displacement_mm[1] != tangent.displacement_mm[1]
+      || base.sector_start_angle_deg != tangent.sector_start_angle_deg
+      || base.sector_angle_deg != 180.0 || tangent.sector_angle_deg != 180.0
+      || base.full_machine_sector_count != 2
+      || tangent.full_machine_sector_count != 2
+      || base.electrical_pole_pairs != tangent.electrical_pole_pairs
+      || base.suspension_spatial_order != tangent.suspension_spatial_order
+      || base.suspension_spatial_order != base.electrical_pole_pairs + 1
+      || base.sector_boundary_sign
+          != ((base.electrical_pole_pairs % 2) == 0 ? 1 : -1)
+      || tangent.sector_boundary_sign
+          != ((base.suspension_spatial_order % 2) == 0 ? 1 : -1)
+      || base.circuit_partner_indices != tangent.circuit_partner_indices
+      || base.circuit_partner_orientations
+          != tangent.circuit_partner_orientations
+      || !SameSectorConstraintPairs(base.model, tangent.model))
+    return false;
+  NonlinearModel normalized_base = base.model;
+  NonlinearModel normalized_tangent = tangent.model;
+  normalized_base.node_constraints.clear();
+  normalized_tangent.node_constraints.clear();
+  for (AirGapElement& age : normalized_base.air_gap_elements)
+    age.antiperiodic = false;
+  for (AirGapElement& age : normalized_tangent.air_gap_elements)
+    age.antiperiodic = false;
+  return NonlinearModelFingerprint(normalized_base)
+      == NonlinearModelFingerprint(normalized_tangent);
+}
+
 // SolveBatch can share its CUDA CSR operator only when every item has the
 // exact same assembled model.  For v2 this deliberately keys the immutable
 // artifact bytes and the requested mechanical pose, rather than treating all
@@ -6893,6 +7870,7 @@ struct MotorBatchPreparedItem {
   size_t request_index = 0;
   const GpuFemmMeshArtifact* artifact = nullptr;
   NonlinearModel model;
+  NonlinearModel tangent_model;
   std::vector<double> currents;
   std::string operator_key;
 };
@@ -6919,6 +7897,17 @@ std::vector<std::vector<size_t>> GroupMotorBatchPreparedItemsByOperator(
 
 // Keep only protocol output after each item/chunk.  In particular, do not
 // retain the nodal A or per-element B vectors for a whole batch.
+struct TangentRhsResponseDto {
+  std::string name;
+  std::vector<double> circuit_current_derivative_a_per_a;
+  double force_x_n_per_a = 0.0;
+  double force_y_n_per_a = 0.0;
+  double torque_nm_per_a = 0.0;
+  std::vector<double> circuit_flux_linkage_derivative_wb_per_a;
+  std::vector<double> airgap_radial_flux_density_derivative_t_per_a;
+  SolveInfo linear_convergence;
+};
+
 struct MotorBatchResponseDto {
   Status status = Status::kInvalidArgument;
   double force_x_n = 0.0;
@@ -6931,7 +7920,100 @@ struct MotorBatchResponseDto {
   size_t mesh_element_count = 0;
   int iterations = 0;
   double residual_l2 = std::numeric_limits<double>::infinity();
+  bool tangent_requested = false;
+  Status tangent_status = Status::kInvalidArgument;
+  std::vector<TangentRhsResponseDto> tangent_rhs;
+  bool sector_reconstruction_enabled = false;
+  Status sector_reconstruction_status = Status::kInvalidArgument;
+  double sector_start_angle_deg = 0.0;
+  double sector_angle_deg = 360.0;
+  int32_t full_machine_sector_count = 1;
+  int32_t electrical_pole_pairs = 0;
+  int32_t suspension_spatial_order = 0;
+  int8_t base_field_repeat_sign = 1;
+  int8_t tangent_field_repeat_sign = 1;
+  double base_torque_multiplier = 1.0;
+  double tangent_force_multiplier = 1.0;
+  double tangent_torque_multiplier = 1.0;
+  bool sector_uses_native_age = false;
+  SharedOperatorBatchEvidence tangent_operator_evidence;
+  std::vector<int32_t> circuit_partner_indices;
+  std::vector<int8_t> circuit_partner_orientations;
+  std::vector<int32_t> apex_self_pair_nodes;
+  std::string model_invariance_certificate_sha256;
 };
+
+std::vector<double> ReconstructSectorCircuitFluxLinkage(
+    const std::vector<double>& sector_flux, const GpuFemmMeshArtifact& artifact,
+    int8_t field_repeat_sign)
+{
+  if (sector_flux.size() != artifact.circuit_partner_indices.size()
+      || sector_flux.size() != artifact.circuit_partner_orientations.size())
+    return {};
+  std::vector<double> full = sector_flux;
+  for (size_t source = 0; source < sector_flux.size(); ++source) {
+    const int32_t target = artifact.circuit_partner_indices[source];
+    full[target] += static_cast<double>(
+        artifact.circuit_partner_orientations[source] * field_repeat_sign)
+        * sector_flux[source];
+  }
+  return full;
+}
+
+void ApplyBaseSectorReconstruction(const GpuFemmMeshArtifact& artifact,
+    const MotorSampleRequest& request, MotorBatchResponseDto* dto)
+{
+  if (dto == nullptr || !artifact.has_motor_sector)
+    return;
+  dto->sector_reconstruction_enabled = true;
+  dto->sector_start_angle_deg = artifact.sector_start_angle_deg;
+  dto->sector_angle_deg = artifact.sector_angle_deg;
+  dto->full_machine_sector_count = artifact.full_machine_sector_count;
+  dto->electrical_pole_pairs = artifact.electrical_pole_pairs;
+  dto->suspension_spatial_order = artifact.suspension_spatial_order;
+  dto->base_field_repeat_sign = artifact.sector_boundary_sign;
+  dto->tangent_field_repeat_sign = static_cast<int8_t>(
+      (artifact.suspension_spatial_order % 2) == 0 ? 1 : -1);
+  dto->base_torque_multiplier = 2.0;
+  const int8_t cross_repeat_sign = static_cast<int8_t>(
+      dto->base_field_repeat_sign * dto->tangent_field_repeat_sign);
+  dto->tangent_force_multiplier = 1.0 - cross_repeat_sign;
+  dto->tangent_torque_multiplier = 1.0 + cross_repeat_sign;
+  dto->sector_uses_native_age = artifact.has_sliding_band;
+  (void)request;
+  dto->circuit_partner_indices = artifact.circuit_partner_indices;
+  dto->circuit_partner_orientations = artifact.circuit_partner_orientations;
+  dto->apex_self_pair_nodes = artifact.apex_self_pair_nodes;
+  dto->model_invariance_certificate_sha256 =
+      artifact.model_invariance_certificate_sha256;
+  if (dto->status == Status::kOk) {
+    // A vector load from the opposite 180-degree sector is rotated by pi.
+    // The quadratic base stress is periodic, so the two vector contributions
+    // cancel exactly while axial torque contributions add.
+    dto->force_x_n = 0.0;
+    dto->force_y_n = 0.0;
+    dto->torque_nm *= dto->base_torque_multiplier;
+    dto->circuit_flux_linkage_wb = ReconstructSectorCircuitFluxLinkage(
+        dto->circuit_flux_linkage_wb, artifact, dto->base_field_repeat_sign);
+    if (dto->circuit_flux_linkage_wb.empty())
+      dto->status = Status::kInternalError;
+  }
+}
+
+bool ApplyTangentSectorReconstruction(const GpuFemmMeshArtifact& artifact,
+    const MotorBatchResponseDto& response, TangentRhsResponseDto* rhs)
+{
+  if (rhs == nullptr || !artifact.has_motor_sector)
+    return false;
+  rhs->force_x_n_per_a *= response.tangent_force_multiplier;
+  rhs->force_y_n_per_a *= response.tangent_force_multiplier;
+  rhs->torque_nm_per_a *= response.tangent_torque_multiplier;
+  rhs->circuit_flux_linkage_derivative_wb_per_a =
+      ReconstructSectorCircuitFluxLinkage(
+          rhs->circuit_flux_linkage_derivative_wb_per_a, artifact,
+          response.tangent_field_repeat_sign);
+  return !rhs->circuit_flux_linkage_derivative_wb_per_a.empty();
+}
 
 struct MotorBatchTiming {
   double request_read_parse_seconds = 0.0;
@@ -6948,6 +8030,7 @@ MotorBatchResponseDto MakeMotorBatchResponseDto(Status status, const MotorSample
 {
   MotorBatchResponseDto dto;
   dto.status = status;
+  dto.tangent_requested = request.tangent_requested;
   if (solution != nullptr) {
     dto.circuit_currents_a = solution->circuit_currents_a;
     dto.iterations = solution->info.iterations;
@@ -6969,7 +8052,8 @@ MotorBatchResponseDto MakeMotorBatchResponseDto(Status status, const MotorSample
 void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequest& request,
     const MotorBatchResponseDto& dto)
 {
-  output << std::setprecision(17) << "{\n  \"protocol\": \"gpu_femm_motor_sample_v1\",\n"
+  output << std::setprecision(17) << "{\n  \"protocol\": \""
+         << request.protocol << "\",\n"
          << "  \"mesh_artifact_sha256\": \"" << request.mesh_artifact_sha256 << "\",\n"
          << "  \"base_motor_fem_sha256\": \"" << request.base_motor_fem_sha256 << "\",\n"
          << "  \"source_fem_sha256\": \"" << request.source_fem_sha256 << "\",\n"
@@ -6991,7 +8075,113 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
     output << "],\n  \"airgap_radial_flux_density_T\": [";
     for (size_t i = 0; i < dto.airgap_radial_flux_density_t.size(); ++i)
       output << (i ? ", " : "") << dto.airgap_radial_flux_density_t[i];
-    output << "],\n  \"mesh_element_count\": " << dto.mesh_element_count << ",\n  \"convergence\": {\"iterations\": "
+    output << "],\n  \"mesh_element_count\": " << dto.mesh_element_count << ",\n";
+    if (dto.sector_reconstruction_enabled) {
+      output << "  \"sector_reconstruction\": {\"schema_version\": "
+             << "\"gpu_femm_motor_sector_reconstruction_response_v1\", "
+             << "\"status\": \""
+             << (dto.sector_reconstruction_status == Status::kOk ? "PASS" : "FAIL")
+             << "\", \"error_identifier\": \""
+             << (dto.sector_reconstruction_status == Status::kOk ? ""
+                  : std::string("GPU_FEMM_SECTOR_")
+                      + StatusName(dto.sector_reconstruction_status))
+             << "\", \"sector_start_angle_deg\": "
+             << dto.sector_start_angle_deg
+             << ", \"sector_angle_deg\": " << dto.sector_angle_deg
+             << ", \"full_machine_sector_count\": "
+             << dto.full_machine_sector_count
+             << ", \"electrical_pole_pairs\": " << dto.electrical_pole_pairs
+             << ", \"suspension_spatial_order\": "
+             << dto.suspension_spatial_order
+             << ", \"base_boundary_relation\": \""
+             << (dto.base_field_repeat_sign > 0 ? "periodic" : "antiperiodic")
+             << "\", \"tangent_boundary_relation\": \""
+             << (dto.tangent_field_repeat_sign > 0 ? "periodic" : "antiperiodic")
+             << "\", \"base_field_repeat_sign\": "
+             << static_cast<int>(dto.base_field_repeat_sign)
+             << ", \"tangent_field_repeat_sign\": "
+             << static_cast<int>(dto.tangent_field_repeat_sign)
+             << ", \"output_normalization\": \"full_machine\""
+             << ", \"load_extraction_method\": \""
+             << (dto.sector_uses_native_age
+                    ? "native_air_gap_element_signed_sector"
+                    : "weighted_stress_tensor_periodic_pair_mask")
+             << "\", \"periodic_pair_aware_weighted_stress_mask\": "
+             << (!dto.sector_uses_native_age ? "true" : "false")
+             << ", \"constraint_source\": \"cropped_sector_artifact\""
+             << ", \"operator_construction\": "
+             << "\"same_topology_dual_signed_reduction\""
+             << ", \"tangent_operator_storage\": \"shared_single_upload\""
+             << ", \"tangent_physical_operator_count\": "
+             << dto.tangent_operator_evidence.physical_operator_count
+             << ", \"tangent_operator_upload_count\": "
+             << dto.tangent_operator_evidence.operator_upload_count
+             << ", \"tangent_rhs_count\": "
+             << dto.tangent_operator_evidence.rhs_count
+             << ", \"tangent_operator_bytes\": "
+             << dto.tangent_operator_evidence.operator_bytes
+             << ", \"tangent_rhs_workspace_bytes\": "
+             << dto.tangent_operator_evidence.rhs_workspace_bytes
+             << ", \"base_force_rule\": \"sum_rotated_sector_vectors\""
+             << ", \"base_torque_multiplier\": "
+             << dto.base_torque_multiplier
+             << ", \"tangent_force_multiplier\": "
+             << dto.tangent_force_multiplier
+             << ", \"tangent_torque_multiplier\": "
+             << dto.tangent_torque_multiplier
+             << ", \"circuit_partner_indices\": [";
+      for (size_t i = 0; i < dto.circuit_partner_indices.size(); ++i)
+        output << (i ? ", " : "") << dto.circuit_partner_indices[i];
+      output << "], \"circuit_partner_orientations\": [";
+      for (size_t i = 0; i < dto.circuit_partner_orientations.size(); ++i)
+        output << (i ? ", " : "")
+               << static_cast<int>(dto.circuit_partner_orientations[i]);
+      output << "], \"apex_self_pair_nodes\": [";
+      for (size_t i = 0; i < dto.apex_self_pair_nodes.size(); ++i)
+        output << (i ? ", " : "") << dto.apex_self_pair_nodes[i];
+      output << "], \"model_invariance_certificate_sha256\": \""
+             << dto.model_invariance_certificate_sha256 << "\"},\n";
+    }
+    if (dto.tangent_requested) {
+      output << "  \"tangent_multi_rhs\": {\"schema_version\": "
+             << "\"gpu_femm_tangent_multi_rhs_response_v1\", \"status\": \""
+             << (dto.tangent_status == Status::kOk ? "PASS" : "FAIL")
+             << "\", \"solve_status\": \"" << StatusName(dto.tangent_status)
+             << "\", \"error_identifier\": \""
+             << (dto.tangent_status == Status::kOk ? ""
+                  : std::string("GPU_FEMM_TANGENT_") + StatusName(dto.tangent_status))
+             << "\", \"linearization\": "
+             << "\"consistent_newton_jacobian_at_converged_operating_point\", "
+             << "\"base_circuit_currents_A\": [";
+      for (size_t i = 0; i < dto.circuit_currents_a.size(); ++i)
+        output << (i ? ", " : "") << dto.circuit_currents_a[i];
+      output << "], \"rhs\": [";
+      for (size_t rhs_index = 0; rhs_index < dto.tangent_rhs.size(); ++rhs_index) {
+        const TangentRhsResponseDto& rhs = dto.tangent_rhs[rhs_index];
+        output << (rhs_index ? ", " : "") << "{\"name\": \"" << rhs.name
+               << "\", \"circuit_current_derivative_A_per_A\": [";
+        for (size_t i = 0; i < rhs.circuit_current_derivative_a_per_a.size(); ++i)
+          output << (i ? ", " : "") << rhs.circuit_current_derivative_a_per_a[i];
+        output << "], \"dFx_N_per_A\": " << rhs.force_x_n_per_a
+               << ", \"dFy_N_per_A\": " << rhs.force_y_n_per_a
+               << ", \"dtorque_Nm_per_A\": " << rhs.torque_nm_per_a
+               << ", \"circuit_flux_linkage_derivative_Wb_per_A\": [";
+        for (size_t i = 0; i < rhs.circuit_flux_linkage_derivative_wb_per_a.size(); ++i)
+          output << (i ? ", " : "") << rhs.circuit_flux_linkage_derivative_wb_per_a[i];
+        output << "], \"airgap_radial_flux_density_derivative_T_per_A\": [";
+        for (size_t i = 0; i < rhs.airgap_radial_flux_density_derivative_t_per_a.size(); ++i)
+          output << (i ? ", " : "") << rhs.airgap_radial_flux_density_derivative_t_per_a[i];
+        output << "], \"linear_convergence\": {\"iterations\": "
+               << rhs.linear_convergence.iterations << ", \"residual_l2\": ";
+        if (std::isfinite(rhs.linear_convergence.residual_l2))
+          output << rhs.linear_convergence.residual_l2;
+        else
+          output << "null";
+        output << "}}";
+      }
+      output << "]},\n";
+    }
+    output << "  \"convergence\": {\"iterations\": "
            << dto.iterations << ", \"residual_l2\": " << dto.residual_l2 << "}\n";
   } else {
     output << "  \"Fx_N\": null,\n  \"Fy_N\": null,\n  \"torque_Nm\": null,\n"
@@ -7019,7 +8209,9 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
   bool pass = request != nullptr && request->items.size() == responses.size();
   for (const MotorBatchResponseDto& response : responses)
     pass = pass && response.status == Status::kOk;
-  output << std::setprecision(17) << "{\n  \"protocol\": \"gpu_femm_motor_batch_v1\",\n"
+  output << std::setprecision(17) << "{\n  \"protocol\": \""
+         << (request == nullptr ? "gpu_femm_motor_batch_v1" : request->protocol)
+         << "\",\n"
          << "  \"status\": \"" << (pass ? "PASS" : "FAIL") << "\",\n"
          << "  \"solve_status\": \"" << (pass ? "PASS" : "PARTIAL_FAILURE") << "\",\n"
          << "  \"error_identifier\": \"" << (pass ? "" : "GPU_FEMM_BATCH_PARTIAL_FAILURE") << "\",\n"
@@ -7226,9 +8418,13 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         responses[index].status = Status::kInvalidArgument;
         continue;
       }
+      NonlinearModel tangent_model;
+      if (item.sector_performance.enabled
+          && !MakeMotorSectorTangentModel(artifact, model, &tangent_model))
+        tangent_model.nodes.clear();
       const std::string operator_key = MotorBatchOperatorKey(item, *load, model);
-      prepared.push_back({ index, &artifact, std::move(model), item.circuit_currents_a,
-          operator_key });
+      prepared.push_back({ index, &artifact, std::move(model),
+          std::move(tangent_model), item.circuit_currents_a, operator_key });
     }
     // A SolveBatch instance owns exactly one CSR operator.  Partition the
     // request chunk before initializing it, so only samples with identical
@@ -7295,13 +8491,133 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         for (double angle : item.airgap_angles_deg)
           post_options.airgap_angles_rad.push_back(
               angle * 3.141592653589793238462643383279502884 / 180.0);
+        FrozenPostprocessOptions base_post_options = post_options;
+        std::vector<int8_t> base_airgap_repeat_signs;
+        if (item.sector_performance.enabled
+            && !prepared_item.artifact->has_sliding_band) {
+          base_airgap_repeat_signs = MapSectorAirgapAnglesToRepresentative(
+              prepared_item.artifact->sector_start_angle_deg
+                  * 3.141592653589793238462643383279502884 / 180.0,
+              prepared_item.artifact->sector_boundary_sign, &base_post_options);
+        }
         const ProfileClock::time_point postprocess_start = ProfileClock::now();
         FrozenPostprocessResult postprocess = prepared_item.artifact->has_sliding_band
-            ? ComputeAirGapElementPostprocess(prepared_item.model, solution, post_options)
-            : ComputeFrozenPostprocess(prepared_item.model, solution, post_options);
+            ? ComputeAirGapElementPostprocess(prepared_item.model, solution,
+                  base_post_options)
+            : ComputeFrozenPostprocess(prepared_item.model, solution,
+                  base_post_options);
+        if (postprocess.status == Status::kOk
+            && !base_airgap_repeat_signs.empty()
+            && !ApplySectorAirgapRepeatSigns(base_airgap_repeat_signs,
+                &postprocess))
+          postprocess.status = Status::kInternalError;
         timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
         responses[index] = MakeMotorBatchResponseDto(postprocess.status, item, &solution,
             postprocess.status == Status::kOk ? &postprocess : nullptr);
+        if (item.sector_performance.enabled) {
+          ApplyBaseSectorReconstruction(*prepared_item.artifact, item,
+              &responses[index]);
+          responses[index].sector_reconstruction_status = responses[index].status;
+        }
+        if (postprocess.status == Status::kOk && item.tangent_requested) {
+          responses[index].tangent_status = Status::kOk;
+          FrozenPostprocessOptions tangent_post_options = post_options;
+          std::vector<int8_t> tangent_airgap_repeat_signs;
+          if (item.sector_performance.enabled
+              && !prepared_item.artifact->has_sliding_band) {
+            tangent_airgap_repeat_signs = MapSectorAirgapAnglesToRepresentative(
+                prepared_item.artifact->sector_start_angle_deg
+                    * 3.141592653589793238462643383279502884 / 180.0,
+                static_cast<int8_t>((prepared_item.artifact
+                    ->suspension_spatial_order % 2) == 0 ? 1 : -1),
+                &tangent_post_options);
+          }
+          std::vector<double> tangent_stress_mask;
+          if (!prepared_item.artifact->has_sliding_band) {
+            responses[index].tangent_status = BuildWeightedStressMask(
+                prepared_item.model, tangent_post_options,
+                &tangent_stress_mask);
+          }
+          NonlinearP1FixtureSolver sector_tangent_solver;
+          NonlinearP1FixtureSolver* tangent_solver = &cached_solver;
+          if (item.sector_performance.enabled) {
+            if (prepared_item.tangent_model.nodes.empty()) {
+              responses[index].tangent_status = Status::kInvalidArgument;
+            } else {
+              responses[index].tangent_status = sector_tangent_solver.Initialize(
+                  prepared_item.tangent_model);
+              tangent_solver = &sector_tangent_solver;
+            }
+          }
+          std::vector<TangentSolveResult> tangent_results =
+              responses[index].tangent_status == Status::kOk
+              ? tangent_solver->SolveTangentMultiRhs(solution,
+                    item.tangent_multi_rhs.rhs, options, &batched_pcg_launches)
+              : std::vector<TangentSolveResult> {};
+          if (responses[index].tangent_status == Status::kOk
+              && tangent_results.size() != item.tangent_multi_rhs.rhs.size())
+            responses[index].tangent_status = Status::kInternalError;
+          if (item.sector_performance.enabled && !tangent_results.empty())
+            responses[index].tangent_operator_evidence =
+                tangent_results.front().operator_evidence;
+          for (TangentSolveResult& tangent : tangent_results) {
+            if (tangent.info.status != Status::kOk) {
+              responses[index].tangent_status = tangent.info.status;
+              continue;
+            }
+            const ProfileClock::time_point tangent_postprocess_start =
+                ProfileClock::now();
+            TangentPostprocessResult tangent_postprocess =
+                prepared_item.artifact->has_sliding_band
+                ? ComputeAirGapElementTangentPostprocess(prepared_item.model,
+                      item.sector_performance.enabled
+                          ? prepared_item.tangent_model : prepared_item.model,
+                      solution, tangent.field_derivative,
+                      tangent_post_options)
+                : ComputeFrozenTangentPostprocess(prepared_item.model, solution,
+                      tangent.field_derivative, tangent_post_options,
+                      tangent_stress_mask);
+            timing.postprocess_seconds += ProfileSecondsSince(
+                tangent_postprocess_start);
+            if (tangent_postprocess.status != Status::kOk) {
+              responses[index].tangent_status = tangent_postprocess.status;
+              continue;
+            }
+            if (!tangent_airgap_repeat_signs.empty()
+                && !ApplySectorTangentAirgapRepeatSigns(
+                    tangent_airgap_repeat_signs, &tangent_postprocess)) {
+              responses[index].tangent_status = Status::kInternalError;
+              continue;
+            }
+            TangentRhsResponseDto dto;
+            dto.name = tangent.name;
+            dto.circuit_current_derivative_a_per_a =
+                tangent.circuit_current_derivative_a_per_a;
+            dto.force_x_n_per_a = tangent_postprocess.force_x_n_per_a;
+            dto.force_y_n_per_a = tangent_postprocess.force_y_n_per_a;
+            dto.torque_nm_per_a = tangent_postprocess.torque_nm_per_a;
+            dto.circuit_flux_linkage_derivative_wb_per_a =
+                tangent.field_derivative.circuit_flux_linkage_wb;
+            dto.airgap_radial_flux_density_derivative_t_per_a =
+                std::move(tangent_postprocess
+                    .airgap_radial_flux_density_t_per_a);
+            dto.linear_convergence = tangent.info;
+            if (item.sector_performance.enabled
+                && !ApplyTangentSectorReconstruction(*prepared_item.artifact,
+                    responses[index], &dto)) {
+              responses[index].tangent_status = Status::kInternalError;
+              continue;
+            }
+            responses[index].tangent_rhs.push_back(std::move(dto));
+          }
+          if (responses[index].tangent_status == Status::kOk
+              && responses[index].tangent_rhs.size()
+                  != item.tangent_multi_rhs.rhs.size())
+            responses[index].tangent_status = Status::kInternalError;
+          if (item.sector_performance.enabled)
+            responses[index].sector_reconstruction_status =
+                responses[index].tangent_status;
+        }
       }
     }
   }
@@ -7623,6 +8939,287 @@ int SelfTest()
           && parsed_artifact.base_motor_fem_sha256.size() == 64
           && parsed_artifact.pose_fem_sha256.size() == 64,
       "gpu_femm_mesh_v1 maps multi-circuit labels and identities");
+  const auto replace_once = [](std::string* value, const std::string& before,
+                                const std::string& after) {
+    const size_t at = value->find(before);
+    if (at == std::string::npos)
+      return false;
+    value->replace(at, before.size(), after);
+    return true;
+  };
+  std::string sector_mesh_artifact = mesh_artifact;
+  const std::string sector_boundary_suffix =
+      "\"outer_dirichlet\":{\"node_indices\":[1,2,3],\"A_Wb_per_m\":[0,0,0]},"
+      "\"air_gap_elements\":[],"
+      "\"node_constraints\":[{\"node_a\":1,\"node_b\":2,\"relation\":\"antiperiodic\"}],"
+      "\"sector\":{\"schema_version\":\"gpu_femm_motor_sector_v1\","
+      "\"sector_start_angle_deg\":15,\"angle_deg\":180,"
+      "\"full_machine_sector_count\":2,"
+      "\"electrical_pole_pairs\":3,\"suspension_spatial_order\":4,"
+      "\"boundary_relation\":\"antiperiodic\","
+      "\"circuit_partner_indices\":[1,0],"
+      "\"circuit_partner_orientations\":[1,1],"
+      "\"apex_self_pair_nodes\":[0],"
+      "\"model_invariance_certificate_sha256\":"
+      "\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}";
+  const bool sector_document_built = replace_once(&sector_mesh_artifact,
+          "gpu_femm_mesh_v1", "gpu_femm_mesh_v3")
+      && replace_once(&sector_mesh_artifact,
+          "\"nodes_mm\":[[0,0],[1,0],[1,1],[0,1],[0.5,0.5]]",
+          "\"nodes_mm\":[[0,0],[1,0],[-1,0],[0,1],[0,0.5]]")
+      && replace_once(&sector_mesh_artifact,
+          "\"node_indices\":[[0,1,4],[1,2,4],[2,3,4],[3,0,4]]",
+          "\"node_indices\":[[0,1,4],[1,3,4],[3,2,4],[2,0,4]]")
+      && replace_once(&sector_mesh_artifact,
+          "\"outer_dirichlet\":{\"node_indices\":[0,1,2,3],\"A_Wb_per_m\":[0,0,0,0]}",
+          sector_boundary_suffix);
+  GpuFemmMeshArtifact sector_artifact;
+  parser_error.clear();
+  expect(sector_document_built
+          && ParseGpuFemmMeshArtifactJson(sector_mesh_artifact,
+              &sector_artifact, &parser_error)
+          && sector_artifact.has_motor_sector
+          && !sector_artifact.has_sliding_band
+          && sector_artifact.sector_start_angle_deg == 15.0
+          && sector_artifact.electrical_pole_pairs == 3
+          && sector_artifact.suspension_spatial_order == 4
+          && sector_artifact.sector_boundary_sign == -1,
+      std::string("strict generic 180-degree motor sector artifact parser: ")
+          + parser_error);
+  std::string rejected_missing_sector_start = sector_mesh_artifact;
+  replace_once(&rejected_missing_sector_start,
+      "\"sector_start_angle_deg\":15,", "");
+  GpuFemmMeshArtifact invalid_missing_sector_start;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(rejected_missing_sector_start,
+             &invalid_missing_sector_start, &parser_error),
+      "v3 strictly rejects a sector artifact without its SHA-bound start angle");
+  NonlinearModel sector_tangent_model;
+  expect(MakeMotorSectorTangentModel(sector_artifact,
+             sector_artifact.model, &sector_tangent_model)
+          && !sector_tangent_model.node_constraints.empty()
+          && sector_tangent_model.node_constraints.front().sign == 1
+          && std::find(sector_artifact.model.dirichlet_nodes.begin(),
+                 sector_artifact.model.dirichlet_nodes.end(), 0)
+              != sector_artifact.model.dirichlet_nodes.end()
+          && std::find(sector_tangent_model.dirichlet_nodes.begin(),
+                 sector_tangent_model.dirichlet_nodes.end(), 0)
+              == sector_tangent_model.dirichlet_nodes.end(),
+      "p=3 AP base derives a separate p+1=4 periodic tangent reduction");
+  std::string even_p_sector_artifact = sector_mesh_artifact;
+  replace_once(&even_p_sector_artifact,
+      "\"electrical_pole_pairs\":3,\"suspension_spatial_order\":4",
+      "\"electrical_pole_pairs\":2,\"suspension_spatial_order\":3");
+  for (size_t at = even_p_sector_artifact.find("antiperiodic");
+       at != std::string::npos;
+       at = even_p_sector_artifact.find("antiperiodic", at + 8))
+    even_p_sector_artifact.replace(at, 12, "periodic");
+  GpuFemmMeshArtifact even_p_sector;
+  parser_error.clear();
+  NonlinearModel even_p_tangent_model;
+  expect(ParseGpuFemmMeshArtifactJson(even_p_sector_artifact,
+             &even_p_sector, &parser_error)
+          && even_p_sector.electrical_pole_pairs == 2
+          && even_p_sector.sector_boundary_sign == 1
+          && MakeMotorSectorTangentModel(even_p_sector,
+              even_p_sector.model, &even_p_tangent_model)
+          && even_p_tangent_model.node_constraints.front().sign == -1
+          && std::find(even_p_sector.model.dirichlet_nodes.begin(),
+                 even_p_sector.model.dirichlet_nodes.end(), 0)
+              == even_p_sector.model.dirichlet_nodes.end()
+          && std::find(even_p_tangent_model.dirichlet_nodes.begin(),
+                 even_p_tangent_model.dirichlet_nodes.end(), 0)
+              != even_p_tangent_model.dirichlet_nodes.end(),
+      "generic p=2 periodic base derives p+1=3 antiperiodic tangent reduction");
+  std::string wrong_p3_base_sign = sector_mesh_artifact;
+  for (size_t at = wrong_p3_base_sign.find("antiperiodic");
+       at != std::string::npos;
+       at = wrong_p3_base_sign.find("antiperiodic", at + 8))
+    wrong_p3_base_sign.replace(at, 12, "periodic");
+  GpuFemmMeshArtifact rejected_wrong_p3;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(wrong_p3_base_sign,
+             &rejected_wrong_p3, &parser_error),
+      "p=3 sector rejects periodic base relation even though p+1 tangent is periodic");
+  std::string wrong_p4_base_sign = sector_mesh_artifact;
+  replace_once(&wrong_p4_base_sign,
+      "\"electrical_pole_pairs\":3,\"suspension_spatial_order\":4",
+      "\"electrical_pole_pairs\":4,\"suspension_spatial_order\":5");
+  GpuFemmMeshArtifact rejected_wrong_p4;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(wrong_p4_base_sign,
+             &rejected_wrong_p4, &parser_error),
+      "p=4 sector rejects antiperiodic base relation even though p+1 tangent is antiperiodic");
+  std::string rejected_sector_age = sector_mesh_artifact;
+  replace_once(&rejected_sector_age, "\"air_gap_elements\":[]",
+      "\"air_gap_elements\":{}");
+  GpuFemmMeshArtifact invalid_sector_age;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(rejected_sector_age,
+             &invalid_sector_age, &parser_error),
+      "v3 rejects unvalidated native AGE sectors and requires posed conforming mesh");
+  std::string rejected_nonorigin_apex = sector_mesh_artifact;
+  replace_once(&rejected_nonorigin_apex,
+      "\"apex_self_pair_nodes\":[0]", "\"apex_self_pair_nodes\":[4]");
+  GpuFemmMeshArtifact invalid_nonorigin_apex;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(rejected_nonorigin_apex,
+             &invalid_nonorigin_apex, &parser_error),
+      "v3 rejects arbitrary non-origin nodes declared as rotational apex self-pairs");
+  std::string rejected_wrong_radius_pair = sector_mesh_artifact;
+  replace_once(&rejected_wrong_radius_pair,
+      "\"node_a\":1,\"node_b\":2", "\"node_a\":1,\"node_b\":4");
+  GpuFemmMeshArtifact invalid_wrong_radius_pair;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(rejected_wrong_radius_pair,
+             &invalid_wrong_radius_pair, &parser_error),
+      "v3 rejects non-self PBC nodes that are not exact 180-degree geometric partners");
+  // Nonlinear central-difference oracle for the production tangent path.
+  // The h/2 estimate must approach the analytic consistent-Jacobian result
+  // faster than h, while the reported PCG residual is J*dA-S itself.
+  NonlinearModel tangent_oracle_model = parsed_artifact.model;
+  for (NonlinearMaterial& material : tangent_oracle_model.materials)
+    material.alpha_per_t2 = 0.3;
+  NonlinearP1FixtureSolver tangent_oracle_solver;
+  const NonlinearOptions tangent_oracle_options = ProductionSampleOptions();
+  const Status tangent_oracle_initialize = tangent_oracle_solver.Initialize(
+      tangent_oracle_model);
+  const std::vector<double> tangent_base_currents = { 2.0, -2.0 };
+  const NonlinearSolveResult tangent_base = tangent_oracle_initialize == Status::kOk
+      ? tangent_oracle_solver.Solve(tangent_base_currents,
+            tangent_oracle_options)
+      : NonlinearSolveResult {};
+  const std::vector<TangentSolveResult> tangent_oracle =
+      tangent_base.info.status == Status::kOk
+      ? tangent_oracle_solver.SolveTangentMultiRhs(tangent_base,
+            { { "d", { 1.0, 0.0 } }, { "q", { 0.0, 1.0 } } },
+            tangent_oracle_options)
+      : std::vector<TangentSolveResult> {};
+  const auto centered_derivative = [&](double step) {
+    std::vector<double> plus_currents = tangent_base_currents;
+    std::vector<double> minus_currents = tangent_base_currents;
+    plus_currents[0] += step;
+    minus_currents[0] -= step;
+    const NonlinearSolveResult plus = tangent_oracle_solver.Solve(
+        plus_currents, tangent_oracle_options, &tangent_base.a_wb_per_m);
+    const NonlinearSolveResult minus = tangent_oracle_solver.Solve(
+        minus_currents, tangent_oracle_options, &tangent_base.a_wb_per_m);
+    std::vector<double> derivative;
+    if (plus.info.status == Status::kOk && minus.info.status == Status::kOk) {
+      derivative.resize(plus.a_wb_per_m.size());
+      for (size_t node = 0; node < derivative.size(); ++node)
+        derivative[node] = (plus.a_wb_per_m[node] - minus.a_wb_per_m[node])
+            / (2.0 * step);
+    }
+    return derivative;
+  };
+  const std::vector<double> tangent_cd_h = centered_derivative(0.2);
+  const std::vector<double> tangent_cd_h2 = centered_derivative(0.1);
+  const auto derivative_error = [](const std::vector<double>& actual,
+                                    const std::vector<double>& expected) {
+    double difference_sq = 0.0, expected_sq = 0.0;
+    if (actual.size() != expected.size() || actual.empty())
+      return std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < actual.size(); ++index) {
+      const double difference = actual[index] - expected[index];
+      difference_sq += difference * difference;
+      expected_sq += expected[index] * expected[index];
+    }
+    return std::sqrt(difference_sq)
+        / std::max(std::sqrt(expected_sq), std::numeric_limits<double>::min());
+  };
+  const double tangent_error_h = tangent_oracle.empty()
+      ? std::numeric_limits<double>::infinity()
+      : derivative_error(tangent_cd_h,
+            tangent_oracle[0].field_derivative.a_wb_per_m);
+  const double tangent_error_h2 = tangent_oracle.empty()
+      ? std::numeric_limits<double>::infinity()
+      : derivative_error(tangent_cd_h2,
+            tangent_oracle[0].field_derivative.a_wb_per_m);
+  expect(tangent_oracle.size() == 2
+          && tangent_oracle[0].info.status == Status::kOk
+          && tangent_oracle[1].info.status == Status::kOk
+          && tangent_oracle[0].info.residual_l2 < 1e-10
+          && tangent_error_h2 < tangent_error_h
+          && tangent_error_h2 < 5e-4,
+      std::string("consistent tangent multi-RHS matches nonlinear h/h2 oracle (h=")
+          + std::to_string(tangent_error_h) + ", h2="
+          + std::to_string(tangent_error_h2) + ", residual="
+          + (tangent_oracle.empty() ? "missing"
+                                    : std::to_string(tangent_oracle[0].info.residual_l2))
+          + ")");
+  FrozenPostprocessOptions tangent_force_options;
+  tangent_force_options.selected_group_number = 20;
+  tangent_force_options.air_group_number = 50;
+  NonlinearModel tangent_force_model = parsed_artifact.model;
+  tangent_force_model.dirichlet_nodes = { 3 };
+  tangent_force_model.dirichlet_a_wb_per_m = { 0.0 };
+  NonlinearP1FixtureSolver tangent_force_solver;
+  const Status tangent_force_initialize = tangent_force_solver.Initialize(
+      tangent_force_model);
+  const NonlinearSolveResult tangent_force_base = tangent_force_initialize
+          == Status::kOk
+      ? tangent_force_solver.Solve(tangent_base_currents,
+            tangent_oracle_options)
+      : NonlinearSolveResult {};
+  const std::vector<TangentSolveResult> tangent_force_solutions =
+      tangent_force_base.info.status == Status::kOk
+      ? tangent_force_solver.SolveTangentMultiRhs(tangent_force_base,
+            { { "d", { 1.0, 0.0 } } }, tangent_oracle_options)
+      : std::vector<TangentSolveResult> {};
+  std::vector<double> tangent_force_mask;
+  const Status tangent_force_mask_status = BuildWeightedStressMask(
+      tangent_force_model, tangent_force_options, &tangent_force_mask);
+  TangentPostprocessResult tangent_force_direct;
+  FrozenPostprocessResult tangent_force_plus, tangent_force_minus;
+  if (tangent_force_mask_status == Status::kOk
+      && !tangent_force_solutions.empty()) {
+    tangent_force_direct = ComputeFrozenTangentPostprocess(tangent_force_model,
+        tangent_force_base, tangent_force_solutions[0].field_derivative,
+        tangent_force_options, tangent_force_mask);
+    NonlinearSolveResult plus = tangent_force_base, minus = tangent_force_base;
+    for (size_t node = 0; node < plus.a_wb_per_m.size(); ++node) {
+      plus.a_wb_per_m[node] += tangent_force_solutions[0].field_derivative.a_wb_per_m[node];
+      minus.a_wb_per_m[node] -= tangent_force_solutions[0].field_derivative.a_wb_per_m[node];
+    }
+    for (size_t element = 0; element < plus.bx_t.size(); ++element) {
+      plus.bx_t[element] += tangent_force_solutions[0].field_derivative.bx_t[element];
+      plus.by_t[element] += tangent_force_solutions[0].field_derivative.by_t[element];
+      minus.bx_t[element] -= tangent_force_solutions[0].field_derivative.bx_t[element];
+      minus.by_t[element] -= tangent_force_solutions[0].field_derivative.by_t[element];
+    }
+    tangent_force_plus = ComputeFrozenPostprocess(tangent_force_model, plus,
+        tangent_force_options);
+    tangent_force_minus = ComputeFrozenPostprocess(tangent_force_model, minus,
+        tangent_force_options);
+  }
+  expect(tangent_force_initialize == Status::kOk
+          && tangent_force_base.info.status == Status::kOk
+          && tangent_force_solutions.size() == 1
+          && tangent_force_solutions[0].info.status == Status::kOk
+          && tangent_force_mask_status == Status::kOk
+          && tangent_force_direct.status == Status::kOk
+          && tangent_force_plus.status == Status::kOk
+          && tangent_force_minus.status == Status::kOk
+          && NearMixed(tangent_force_direct.force_x_n_per_a,
+              0.5 * (tangent_force_plus.force_x_n
+                  - tangent_force_minus.force_x_n), 1e-12, 1e-12)
+          && NearMixed(tangent_force_direct.force_y_n_per_a,
+              0.5 * (tangent_force_plus.force_y_n
+                  - tangent_force_minus.force_y_n), 1e-12, 1e-12)
+          && NearMixed(tangent_force_direct.torque_nm_per_a,
+              0.5 * (tangent_force_plus.torque_nm
+                  - tangent_force_minus.torque_nm), 1e-12, 1e-12),
+      std::string("direct bilinear weighted-stress derivative matches polarization oracle (direct=")
+          + std::to_string(tangent_force_direct.force_x_n_per_a) + ","
+          + std::to_string(tangent_force_direct.force_y_n_per_a) + ","
+          + std::to_string(tangent_force_direct.torque_nm_per_a) + "; polarized="
+          + std::to_string(0.5 * (tangent_force_plus.force_x_n
+              - tangent_force_minus.force_x_n)) + ","
+          + std::to_string(0.5 * (tangent_force_plus.force_y_n
+              - tangent_force_minus.force_y_n)) + ","
+          + std::to_string(0.5 * (tangent_force_plus.torque_nm
+              - tangent_force_minus.torque_nm)) + ")");
   std::string neutral_mesh_artifact = mesh_artifact;
   neutral_mesh_artifact.replace(neutral_mesh_artifact.find("gpu_femm_mesh_v1"),
       16, "gpu_femm_planar_dc_mesh_v1");
@@ -7755,6 +9352,218 @@ int SelfTest()
   expect(ReadMotorSampleRequestJson(motor_request_json, &parsed_request, &parser_error)
           && RequestMatchesArtifact(parsed_request, parsed_artifact),
       "motor request binds artifact identities and pose");
+  const std::string tangent_request_json = R"json({
+    "protocol":"gpu_femm_motor_sample_v2",
+    "mesh_artifact_path":"fixture.json",
+    "mesh_artifact_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "base_motor_fem_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_fem_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "circuit_currents_A":[2,-2],"selected_group_number":20,"air_group_number":50,
+    "airgap_radius_mm":0,"airgap_angles_deg":[],"rotor_angle_deg":3,
+    "displacement_mm":[0.1,0],"tangent_multi_rhs":{
+      "schema_version":"gpu_femm_tangent_multi_rhs_v1","rhs":[
+        {"name":"d","circuit_current_derivative_A_per_A":[1,0]},
+        {"name":"q","circuit_current_derivative_A_per_A":[0,1]}]}
+  })json";
+  MotorSampleRequest parsed_tangent_request;
+  expect(ReadMotorSampleRequestJson(tangent_request_json,
+             &parsed_tangent_request, &parser_error)
+          && parsed_tangent_request.protocol == "gpu_femm_motor_sample_v2"
+          && parsed_tangent_request.tangent_requested
+          && parsed_tangent_request.tangent_multi_rhs.rhs.size() == 2,
+      "motor sample v2 parses strict named tangent multi-RHS vectors");
+  const std::string sector_request_json = R"json({
+    "protocol":"gpu_femm_motor_sample_v3",
+    "mesh_artifact_path":"fixture.json",
+    "mesh_artifact_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "base_motor_fem_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_fem_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "circuit_currents_A":[2,-2],"selected_group_number":20,"air_group_number":50,
+    "airgap_radius_mm":0,"airgap_angles_deg":[],"rotor_angle_deg":3,
+    "displacement_mm":[0.1,0],"tangent_multi_rhs":{
+      "schema_version":"gpu_femm_tangent_multi_rhs_v1","rhs":[
+        {"name":"d","circuit_current_derivative_A_per_A":[1,0]},
+        {"name":"q","circuit_current_derivative_A_per_A":[0,1]}]},
+    "sector_performance":{"schema_version":"gpu_femm_motor_sector_performance_v1",
+      "model_invariance_certificate_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+  })json";
+  MotorSampleRequest parsed_sector_request;
+  parser_error.clear();
+  expect(ReadMotorSampleRequestJson(sector_request_json,
+             &parsed_sector_request, &parser_error)
+          && parsed_sector_request.protocol == "gpu_femm_motor_sample_v3"
+          && parsed_sector_request.sector_performance.enabled
+          && RequestMatchesArtifact(parsed_sector_request, sector_artifact),
+      std::string("strict motor sample v3 binds cropped sector metadata: ")
+          + parser_error);
+  std::string sector_base_only_request_json = sector_request_json;
+  const size_t tangent_member_at = sector_base_only_request_json.find(
+      "\"tangent_multi_rhs\":{");
+  const size_t sector_member_at = sector_base_only_request_json.find(
+      ",\n    \"sector_performance\"", tangent_member_at);
+  if (tangent_member_at != std::string::npos
+      && sector_member_at != std::string::npos)
+    sector_base_only_request_json.replace(tangent_member_at,
+        sector_member_at - tangent_member_at, "\"tangent_multi_rhs\":[]");
+  MotorSampleRequest parsed_sector_base_only;
+  parser_error.clear();
+  expect(ReadMotorSampleRequestJson(sector_base_only_request_json,
+             &parsed_sector_base_only, &parser_error)
+          && parsed_sector_base_only.protocol == "gpu_femm_motor_sample_v3"
+          && parsed_sector_base_only.sector_performance.enabled
+          && !parsed_sector_base_only.tangent_requested
+          && RequestMatchesArtifact(parsed_sector_base_only, sector_artifact),
+      "motor sample v3 accepts explicit base-only zero/reference item");
+  const std::string mixed_sector_batch =
+      std::string("{\"protocol\":\"gpu_femm_motor_batch_v3\","
+          "\"max_items_per_chunk\":2,\"items\":["
+          "{\"task_id\":\"zero\",\"request\":")
+      + sector_base_only_request_json
+      + "},{\"task_id\":\"drive\",\"request\":"
+      + sector_request_json + "}]}";
+  MotorBatchRequest parsed_mixed_sector_batch;
+  parser_error.clear();
+  expect(ReadMotorBatchRequestJson(mixed_sector_batch,
+             &parsed_mixed_sector_batch, &parser_error)
+          && parsed_mixed_sector_batch.items.size() == 2
+          && !parsed_mixed_sector_batch.items[0].request.tangent_requested
+          && parsed_mixed_sector_batch.items[1].request.tangent_requested,
+      "motor batch v3 strictly accepts mixed base-only zero and tangent drive items");
+  std::string v2_with_sector = sector_request_json;
+  replace_once(&v2_with_sector, "gpu_femm_motor_sample_v3",
+      "gpu_femm_motor_sample_v2");
+  MotorSampleRequest rejected_v2_sector;
+  parser_error.clear();
+  expect(!ReadMotorSampleRequestJson(v2_with_sector,
+             &rejected_v2_sector, &parser_error),
+      "motor sample v2 remains strict and rejects sector extension fields");
+  expect(ReconstructSectorCircuitFluxLinkage(
+             { 2.0, 3.0 }, sector_artifact, -1)
+              == std::vector<double>({ -1.0, 1.0 })
+          && ReconstructSectorCircuitFluxLinkage(
+                 { 2.0, 3.0 }, sector_artifact, 1)
+              == std::vector<double>({ 5.0, 5.0 }),
+      "sector circuit flux reconstruction applies partner permutation, orientation, and field sign");
+  FrozenPostprocessOptions sector_angle_options;
+  constexpr double kSelfTestPi =
+      3.141592653589793238462643383279502884;
+  sector_angle_options.airgap_angles_rad = { 0.0, 0.5 * kSelfTestPi,
+    kSelfTestPi, 1.5 * kSelfTestPi, 2.0 * kSelfTestPi, -kSelfTestPi };
+  const std::vector<int8_t> sector_angle_signs =
+      MapSectorAirgapAnglesToRepresentative(0.0, -1, &sector_angle_options);
+  expect(sector_angle_signs == std::vector<int8_t>({ 1, 1, -1, -1, 1, -1 })
+          && Near(sector_angle_options.airgap_angles_rad[0], 0.0)
+          && Near(sector_angle_options.airgap_angles_rad[1], 0.5 * kSelfTestPi)
+          && Near(sector_angle_options.airgap_angles_rad[2], 0.0)
+          && Near(sector_angle_options.airgap_angles_rad[3], 0.5 * kSelfTestPi)
+          && Near(sector_angle_options.airgap_angles_rad[4], 0.0)
+          && Near(sector_angle_options.airgap_angles_rad[5], 0.0),
+      "full-circle Br requests fold into 180-degree sector with exact AP copy signs");
+  FrozenPostprocessOptions shifted_sector_angle_options;
+  const double shifted_sector_start = 15.0 * kSelfTestPi / 180.0;
+  shifted_sector_angle_options.airgap_angles_rad = { 0.0,
+    10.0 * kSelfTestPi / 180.0, 15.0 * kSelfTestPi / 180.0,
+    190.0 * kSelfTestPi / 180.0, 195.0 * kSelfTestPi / 180.0 };
+  const std::vector<int8_t> shifted_sector_signs =
+      MapSectorAirgapAnglesToRepresentative(
+          shifted_sector_start, -1, &shifted_sector_angle_options);
+  expect(shifted_sector_signs == std::vector<int8_t>({ -1, -1, 1, 1, -1 })
+          && Near(shifted_sector_angle_options.airgap_angles_rad[0],
+              kSelfTestPi)
+          && Near(shifted_sector_angle_options.airgap_angles_rad[1],
+              190.0 * kSelfTestPi / 180.0)
+          && Near(shifted_sector_angle_options.airgap_angles_rad[2],
+              shifted_sector_start)
+          && Near(shifted_sector_angle_options.airgap_angles_rad[4],
+              shifted_sector_start),
+      "nonzero-start sector folds below-start angles into its actual posed interval");
+  FrozenPostprocessOptions full_br_options;
+  constexpr size_t kBrOracleSamples = 72;
+  for (size_t sample = 0; sample < kBrOracleSamples; ++sample)
+    full_br_options.airgap_angles_rad.push_back(
+        2.0 * kSelfTestPi * static_cast<double>(sample)
+        / static_cast<double>(kBrOracleSamples));
+  const std::vector<double> global_br_angles = full_br_options.airgap_angles_rad;
+  const std::vector<int8_t> full_br_signs =
+      MapSectorAirgapAnglesToRepresentative(
+          shifted_sector_start, -1, &full_br_options);
+  std::vector<double> reconstructed_br, direct_full_br;
+  for (size_t sample = 0; sample < kBrOracleSamples; ++sample) {
+    const double sector_value = std::cos(3.0
+            * full_br_options.airgap_angles_rad[sample])
+        + 0.1 * std::cos(9.0 * full_br_options.airgap_angles_rad[sample]);
+    reconstructed_br.push_back(full_br_signs[sample] * sector_value);
+    direct_full_br.push_back(std::cos(3.0 * global_br_angles[sample])
+        + 0.1 * std::cos(9.0 * global_br_angles[sample]));
+  }
+  const auto sampled_thd = [&](const std::vector<double>& values,
+                               size_t fundamental) {
+    std::vector<double> amplitudes(values.size() / 2, 0.0);
+    for (size_t order = 1; order < amplitudes.size(); ++order) {
+      double cosine = 0.0, sine = 0.0;
+      for (size_t sample = 0; sample < values.size(); ++sample) {
+        const double phase = 2.0 * kSelfTestPi
+            * static_cast<double>(order * sample)
+            / static_cast<double>(values.size());
+        cosine += values[sample] * std::cos(phase);
+        sine += values[sample] * std::sin(phase);
+      }
+      amplitudes[order] = 2.0 * std::hypot(cosine, sine)
+          / static_cast<double>(values.size());
+    }
+    double harmonic_sq = 0.0;
+    for (size_t order = 1; order < amplitudes.size(); ++order)
+      if (order != fundamental)
+        harmonic_sq += amplitudes[order] * amplitudes[order];
+    return std::sqrt(harmonic_sq) / amplitudes[fundamental];
+  };
+  bool full_br_matches = reconstructed_br.size() == direct_full_br.size();
+  for (size_t sample = 0; full_br_matches && sample < reconstructed_br.size(); ++sample)
+    full_br_matches = Near(reconstructed_br[sample], direct_full_br[sample], 1e-13);
+  expect(full_br_matches
+          && Near(sampled_thd(reconstructed_br, 3),
+              sampled_thd(direct_full_br, 3), 1e-13)
+          && Near(sampled_thd(reconstructed_br, 3), 0.1, 1e-13),
+      "nonzero-start 180-degree AP sector reconstructs full-circle Br and spatial THD oracle exactly");
+  MotorBatchResponseDto sector_reconstruction_oracle;
+  sector_reconstruction_oracle.status = Status::kOk;
+  sector_reconstruction_oracle.force_x_n = 7.0;
+  sector_reconstruction_oracle.force_y_n = -4.0;
+  sector_reconstruction_oracle.torque_nm = 3.0;
+  sector_reconstruction_oracle.circuit_flux_linkage_wb = { 2.0, 3.0 };
+  ApplyBaseSectorReconstruction(sector_artifact, parsed_sector_request,
+      &sector_reconstruction_oracle);
+  TangentRhsResponseDto tangent_reconstruction_oracle;
+  tangent_reconstruction_oracle.force_x_n_per_a = 5.0;
+  tangent_reconstruction_oracle.force_y_n_per_a = -2.0;
+  tangent_reconstruction_oracle.torque_nm_per_a = 11.0;
+  tangent_reconstruction_oracle.circuit_flux_linkage_derivative_wb_per_a =
+      { 2.0, 3.0 };
+  const bool tangent_reconstruction_ok = ApplyTangentSectorReconstruction(
+      sector_artifact, sector_reconstruction_oracle,
+      &tangent_reconstruction_oracle);
+  expect(sector_reconstruction_oracle.sector_start_angle_deg == 15.0
+          && sector_reconstruction_oracle.force_x_n == 0.0
+          && sector_reconstruction_oracle.force_y_n == 0.0
+          && sector_reconstruction_oracle.torque_nm == 6.0
+          && sector_reconstruction_oracle.circuit_flux_linkage_wb
+              == std::vector<double>({ -1.0, 1.0 })
+          && tangent_reconstruction_ok
+          && tangent_reconstruction_oracle.force_x_n_per_a == 10.0
+          && tangent_reconstruction_oracle.force_y_n_per_a == -4.0
+          && tangent_reconstruction_oracle.torque_nm_per_a == 0.0
+          && tangent_reconstruction_oracle
+                 .circuit_flux_linkage_derivative_wb_per_a
+              == std::vector<double>({ 5.0, 5.0 }),
+      "C2 reconstruction cancels base force/tangent torque and doubles base torque/tangent force");
+  std::string v1_with_tangent = motor_request_json;
+  const size_t v1_close = v1_with_tangent.rfind('}');
+  if (v1_close != std::string::npos)
+    v1_with_tangent.insert(v1_close, ",\"tangent_multi_rhs\":null");
+  MotorSampleRequest rejected_v1_extension;
+  expect(!ReadMotorSampleRequestJson(v1_with_tangent,
+             &rejected_v1_extension, &parser_error),
+      "motor sample v1 remains strict and rejects tangent extension fields");
   const std::string planar_request_json = R"json({
     "protocol":"gpu_femm_planar_dc_sample_v1",
     "mesh_artifact_path":"fixture.json",
@@ -8029,11 +9838,11 @@ int SelfTest()
   std::vector<MotorBatchPreparedItem> sliding_prepared;
   if (batch_key_models_valid) {
     sliding_prepared.push_back({ 0, &sliding_artifact, shifted_sliding_model,
-        sliding_request.circuit_currents_a, same_pose_key });
+        {}, sliding_request.circuit_currents_a, same_pose_key });
     sliding_prepared.push_back({ 1, &sliding_artifact, std::move(next_pose_model),
-        next_pose_request.circuit_currents_a, next_pose_key });
+        {}, next_pose_request.circuit_currents_a, next_pose_key });
     sliding_prepared.push_back({ 2, &sliding_artifact, std::move(same_pose_model),
-        same_pose_request.circuit_currents_a, same_pose_key });
+        {}, same_pose_request.circuit_currents_a, same_pose_key });
   }
   const std::vector<std::vector<size_t>> sliding_groups = GroupMotorBatchPreparedItemsByOperator(sliding_prepared);
   expect(batch_key_models_valid && same_pose_key != next_pose_key
@@ -8564,6 +10373,33 @@ int SelfTest()
     expect(scalable_mask_values.size() == scalable_mask.nodes.size(),
         "large WST mask dimensions");
   }
+  {
+    NonlinearModel paired_mask = LargeStructuredMaskFixture(4);
+    paired_mask.dirichlet_nodes.clear();
+    paired_mask.dirichlet_a_wb_per_m.clear();
+    constexpr int paired_side = 5;
+    for (int y = 0; y < paired_side; ++y)
+      for (int x = 0; x < paired_side; ++x)
+        if (x == 0 || y == 0 || x + 1 == paired_side || y + 1 == paired_side) {
+          paired_mask.dirichlet_nodes.push_back(y * paired_side + x);
+          paired_mask.dirichlet_a_wb_per_m.push_back(0.0);
+        }
+    paired_mask.node_constraints = { { 6, 8, -1 } };
+    paired_mask.symmetry_apex_nodes = { 12 };
+    paired_mask.dirichlet_nodes.push_back(12);
+    paired_mask.dirichlet_a_wb_per_m.push_back(0.0);
+    FrozenPostprocessOptions paired_mask_options;
+    paired_mask_options.selected_material_label = 1;
+    paired_mask_options.air_material_label = 0;
+    std::vector<double> paired_mask_values;
+    const Status paired_mask_status = BuildWeightedStressMask(
+        paired_mask, paired_mask_options, &paired_mask_values);
+    expect(paired_mask_status == Status::kOk
+            && paired_mask_values.size() == paired_mask.nodes.size()
+            && paired_mask_values[6] == paired_mask_values[8]
+            && paired_mask_values[12] == 1.0,
+        "WST mask uses periodic cut pairs and ignores magnetic AP apex zero as a physical mask boundary");
+  }
 
   Assembly three_by_three;
   three_by_three.row_offsets = { 0, 2, 5, 7 };
@@ -8587,6 +10423,37 @@ int SelfTest()
              &small_batch_infos, &small_batch_solutions, &small_batch_launches)
           == Status::kOk,
       "3x3 batch buffer allocation");
+  std::vector<SolveInfo> shared_operator_infos;
+  std::vector<std::vector<double>> shared_operator_solutions;
+  SharedOperatorBatchEvidence shared_operator_evidence;
+  int shared_operator_launches = 0;
+  const Status shared_operator_status = csr_solver.UpdateValues(three_by_three)
+          == Status::kOk
+      ? csr_solver.SolveCurrentOperatorBatch(
+            { { 2.0, 4.0, 7.0 }, { 4.0, 8.0, 14.0 } }, 1e-13, 64,
+            &shared_operator_infos, &shared_operator_solutions,
+            &shared_operator_launches, &shared_operator_evidence)
+      : Status::kInternalError;
+  expect(shared_operator_status == Status::kOk
+          && shared_operator_solutions.size() == 2
+          && shared_operator_solutions[0]
+              == std::vector<double>({ 1.0, 2.0, 3.0 })
+          && shared_operator_solutions[1]
+              == std::vector<double>({ 2.0, 4.0, 6.0 })
+          && shared_operator_launches == 1
+          && shared_operator_evidence.physical_operator_count == 1
+          && shared_operator_evidence.operator_upload_count == 1
+          && shared_operator_evidence.rhs_count == 2,
+      "shared tangent operator stores/uploads one K and solves two RHS in one launch");
+  std::vector<SolveInfo> legacy_after_shared_infos;
+  std::vector<std::vector<double>> legacy_after_shared_solutions;
+  int legacy_after_shared_launches = 0;
+  expect(csr_solver.SolveBatch({ three_by_three, three_by_three },
+             { { 2.0, 4.0, 7.0 }, { 4.0, 8.0, 14.0 } }, 1e-13, 64,
+             &legacy_after_shared_infos, &legacy_after_shared_solutions,
+             &legacy_after_shared_launches) == Status::kOk
+          && legacy_after_shared_solutions == shared_operator_solutions,
+      "legacy replicated batch safely reallocates after shared-operator mode");
 
   // 257 exercises the strided reduction tail beyond one 256-thread block.
   Assembly reduction_tail;
@@ -8867,6 +10734,8 @@ int main(int argc, char** argv)
         << "  \"schema_version\": \"gpu_femm_capabilities_v1\",\n"
         << "  \"sample_protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
         << "  \"sample_protocols\": [\"gpu_femm_planar_dc_sample_v1\", \"gpu_femm_magnetostatic_sample_v1\"],\n"
+        << "  \"motor_sample_protocols\": [\"gpu_femm_motor_sample_v1\", \"gpu_femm_motor_sample_v2\", \"gpu_femm_motor_sample_v3\"],\n"
+        << "  \"motor_batch_protocols\": [\"gpu_femm_motor_batch_v1\", \"gpu_femm_motor_batch_v2\", \"gpu_femm_motor_batch_v3\"],\n"
         << "  \"problem_types\": [\"planar\", \"axisymmetric\"],\n"
         << "  \"frequency_hz\": [0],\n"
         << "  \"precision\": \"fp64\",\n"
@@ -8874,6 +10743,10 @@ int main(int argc, char** argv)
         << "  \"permanent_magnets\": true,\n"
         << "  \"native_sliding_band\": true,\n"
         << "  \"general_periodic_node_constraints\": true,\n"
+        << "  \"motor_tangent_multi_rhs_v1\": true,\n"
+        << "  \"motor_sector_performance_180_v1\": true,\n"
+        << "  \"motor_sector_posed_periodic_wst_v1\": true,\n"
+        << "  \"motor_sector_native_age_v1\": false,\n"
         << "  \"full_field_output\": true,\n"
         << "  \"ac_complex\": false,\n"
         << "  \"axisymmetric\": true,\n"

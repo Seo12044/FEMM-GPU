@@ -1,0 +1,36 @@
+{
+  "protocol": "gpu_femm_motor_batch_v2",
+  "max_items_per_chunk": 4,
+  "items": [
+    {
+      "task_id": "drive_tangent",
+      "request": {
+        "protocol": "gpu_femm_motor_sample_v2",
+        "mesh_artifact_path": "gpu_femm_batch_selftest_artifact.json",
+        "mesh_artifact_sha256": "c038e26b9c504958669c142bd5b88bb4763811db9b9a720b051d2fb1031eec31",
+        "base_motor_fem_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "source_fem_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "circuit_currents_A": [2, -2],
+        "selected_group_number": 20,
+        "air_group_number": 50,
+        "airgap_radius_mm": 0,
+        "airgap_angles_deg": [],
+        "rotor_angle_deg": 3,
+        "displacement_mm": [0.1, 0],
+        "tangent_multi_rhs": {
+          "schema_version": "gpu_femm_tangent_multi_rhs_v1",
+          "rhs": [
+            {
+              "name": "suspension_d",
+              "circuit_current_derivative_A_per_A": [1, 0]
+            },
+            {
+              "name": "suspension_q",
+              "circuit_current_derivative_A_per_A": [0, 1]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
