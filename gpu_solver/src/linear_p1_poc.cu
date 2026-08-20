@@ -2156,12 +2156,12 @@ constexpr double kNativeFemmAgeToSiReluctivity = 1.0 / kMu0;
 
 // Full motor meshes can need substantially more PCG steps than the compact
 // fixtures, especially for thin V-magnet bridges.  This remains an upper
-// bound: the deterministic solver exits as soon as the motor-specific 1e-12
+// bound: the deterministic solver exits as soon as the motor-specific 1e-10
 // relative linear tolerance is verified against the true residual.  This is
-// still four orders tighter than the outer nonlinear tolerance while avoiding
-// the measured double-precision residual plateau on the V-magnet mesh.
+// still two orders tighter than the outer nonlinear tolerance and avoids the
+// measured double-precision residual plateau on thin motor meshes.
 constexpr int kMotorMaxLinearIterations = 16384;
-constexpr double kMotorLinearRelativeTolerance = 1e-12;
+constexpr double kMotorLinearRelativeTolerance = 1e-10;
 
 NonlinearOptions ProductionSampleOptions()
 {
@@ -2380,8 +2380,9 @@ Status ReduceSignedSystem(const NonlinearModel& model, const SparseRows& full_ma
   for (size_t row = 0; row < free_count; ++row) {
     assembly->row_offsets[row] = static_cast<int32_t>(assembly->values.size());
     for (const auto& entry : reduced[row]) {
-      if (entry.second == 0.0)
-        continue;
+      // Keep exact cancellation slots.  Device assembly retains the symbolic
+      // CSR topology, and sliding-band tangent assembly must match that same
+      // structure even when signed reduction makes a coefficient exactly zero.
       assembly->column_indices.push_back(entry.first);
       assembly->values.push_back(entry.second);
       if (entry.first == static_cast<int32_t>(row))
@@ -9909,6 +9910,30 @@ int SelfTest()
           && Near(signed_expanded[1], 3.0, 1e-13)
           && Near(signed_expanded[2], -3.0, 1e-13),
       "anti-periodic reduction solves T^T K T and reconstructs signed nodes");
+  NonlinearModel cancellation_model;
+  cancellation_model.nodes.resize(4);
+  cancellation_model.node_constraints = { { 1, 2, -1 } };
+  cancellation_model.dirichlet_nodes = { 0 };
+  cancellation_model.dirichlet_a_wb_per_m = { 0.0 };
+  SparseRows cancellation_matrix(4);
+  cancellation_matrix[0][0] = 1.0;
+  cancellation_matrix[1][1] = 2.0;
+  cancellation_matrix[2][2] = 2.0;
+  cancellation_matrix[3][3] = 3.0;
+  cancellation_matrix[1][3] = 1.0;
+  cancellation_matrix[2][3] = 1.0;
+  cancellation_matrix[3][1] = 1.0;
+  cancellation_matrix[3][2] = 1.0;
+  Assembly cancellation_reduction;
+  const Status cancellation_status = ReduceSignedSystem(cancellation_model,
+      cancellation_matrix, { 0.0, 0.0, 0.0, 0.0 }, &cancellation_reduction);
+  expect(cancellation_status == Status::kOk
+          && cancellation_reduction.row_offsets == std::vector<int32_t>({ 0, 2, 4 })
+          && cancellation_reduction.column_indices == std::vector<int32_t>({ 0, 1, 0, 1 })
+          && cancellation_reduction.values.size() == 4
+          && cancellation_reduction.values[1] == 0.0
+          && cancellation_reduction.values[2] == 0.0,
+      "signed reduction preserves exact-cancellation CSR slots for tangent symbolic reuse");
   const double manufactured_radius[3] = { 1.0, 2.0, 1.0 };
   const double manufactured_axial[3] = { 0.0, 0.0, 1.0 };
   const double manufactured_a[3] = { 0.25, 0.5, 0.25 };
