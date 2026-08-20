@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -5353,8 +5354,171 @@ bool SmoothedElementB(const NonlinearModel& model, const std::vector<double>& a,
   return true;
 }
 
+struct FrozenAirgapProbe {
+  int32_t containing_element = -1;
+  double lambda[3] = {};
+  double cosine = 0.0;
+  double sine = 0.0;
+};
+
+struct FrozenPostprocessPlan {
+  Status status = Status::kInternalError;
+  size_t node_count = 0;
+  size_t triangle_count = 0;
+  int32_t selected_group_number = -1;
+  int32_t air_group_number = -1;
+  int32_t selected_material_label = -1;
+  int32_t air_material_label = -1;
+  double airgap_radius_m = 0.0;
+  std::vector<double> airgap_angles_rad;
+  std::vector<double> mask;
+  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
+  std::vector<std::vector<int32_t>> incident;
+  std::vector<FrozenAirgapProbe> probes;
+  std::vector<double> mask_gradient_x;
+  std::vector<double> mask_gradient_y;
+  std::vector<double> element_weight;
+  std::vector<double> element_center_x;
+  std::vector<double> element_center_y;
+};
+
+bool FrozenPostprocessPlanMatches(const FrozenPostprocessPlan& plan,
+    const NonlinearModel& model, const FrozenPostprocessOptions& options)
+{
+  return plan.status == Status::kOk
+      && plan.node_count == model.nodes.size()
+      && plan.triangle_count == model.triangles.size()
+      && plan.selected_group_number == options.selected_group_number
+      && plan.air_group_number == options.air_group_number
+      && plan.selected_material_label == options.selected_material_label
+      && plan.air_material_label == options.air_material_label
+      && plan.airgap_radius_m == options.airgap_radius_m
+      && plan.airgap_angles_rad == options.airgap_angles_rad;
+}
+
+Status BuildFrozenPostprocessPlan(const NonlinearModel& model,
+    const FrozenPostprocessOptions& options, FrozenPostprocessPlan* plan)
+{
+  if (plan == nullptr)
+    return Status::kInvalidArgument;
+  *plan = FrozenPostprocessPlan {};
+  plan->node_count = model.nodes.size();
+  plan->triangle_count = model.triangles.size();
+  plan->selected_group_number = options.selected_group_number;
+  plan->air_group_number = options.air_group_number;
+  plan->selected_material_label = options.selected_material_label;
+  plan->air_material_label = options.air_material_label;
+  plan->airgap_radius_m = options.airgap_radius_m;
+  plan->airgap_angles_rad = options.airgap_angles_rad;
+  plan->status = BuildWeightedStressMask(model, options, &plan->mask);
+  if (plan->status != Status::kOk)
+    return plan->status;
+  plan->incident.assign(model.nodes.size(), {});
+  plan->mask_gradient_x.resize(model.triangles.size());
+  plan->mask_gradient_y.resize(model.triangles.size());
+  plan->element_weight.resize(model.triangles.size());
+  plan->element_center_x.resize(model.triangles.size());
+  plan->element_center_y.resize(model.triangles.size());
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    for (int local = 0; local < 3; ++local) {
+      plan->incident[triangle.node[local]].push_back(static_cast<int32_t>(element));
+      plan->edge_elements[CanonicalEdge(triangle.node[local],
+          triangle.node[(local + 1) % 3])].push_back(
+          static_cast<int32_t>(element));
+    }
+    Node p[3] = { model.nodes[triangle.node[0]],
+      model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+    NonlinearElementTerms terms;
+    if (!BuildElementTerms(p, &terms)) {
+      plan->status = Status::kMeshInvalid;
+      return plan->status;
+    }
+    for (int local = 0; local < 3; ++local) {
+      plan->mask_gradient_x[element] += plan->mask[triangle.node[local]]
+          * terms.b_y[local];
+      plan->mask_gradient_y[element] -= plan->mask[triangle.node[local]]
+          * terms.b_x[local];
+    }
+    plan->element_weight[element] = terms.area_m2 * model.depth_m;
+    plan->element_center_x[element] = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
+    plan->element_center_y[element] = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
+  }
+  if (!(options.airgap_radius_m >= 0.0)
+      || !std::isfinite(options.airgap_radius_m)) {
+    plan->status = Status::kInvalidArgument;
+    return plan->status;
+  }
+  // Every requested probe lies on one circle.  Preserve FEMM's established
+  // first-containing-element order, but avoid testing triangles whose axis-
+  // aligned bounds cannot intersect that circle.  This is a conservative
+  // geometry-only filter: every triangle that can contain a probe remains in
+  // original element order, including boundary/tolerance cases.
+  std::vector<int32_t> airgap_candidate_elements;
+  airgap_candidate_elements.reserve(model.triangles.size());
+  const double radius_squared = options.airgap_radius_m * options.airgap_radius_m;
+  const double radial_tolerance = 64.0 * std::numeric_limits<double>::epsilon()
+      * std::max(1.0, radius_squared);
+  for (size_t element = 0; element < model.triangles.size(); ++element) {
+    const NonlinearTriangle& triangle = model.triangles[element];
+    const Node& p0 = model.nodes[triangle.node[0]];
+    const Node& p1 = model.nodes[triangle.node[1]];
+    const Node& p2 = model.nodes[triangle.node[2]];
+    const double min_x = std::min({ p0.x_m, p1.x_m, p2.x_m });
+    const double max_x = std::max({ p0.x_m, p1.x_m, p2.x_m });
+    const double min_y = std::min({ p0.y_m, p1.y_m, p2.y_m });
+    const double max_y = std::max({ p0.y_m, p1.y_m, p2.y_m });
+    const double closest_x = min_x > 0.0 ? min_x : (max_x < 0.0 ? max_x : 0.0);
+    const double closest_y = min_y > 0.0 ? min_y : (max_y < 0.0 ? max_y : 0.0);
+    const double minimum_squared = closest_x * closest_x + closest_y * closest_y;
+    const double farthest_x = std::max(std::abs(min_x), std::abs(max_x));
+    const double farthest_y = std::max(std::abs(min_y), std::abs(max_y));
+    const double maximum_squared = farthest_x * farthest_x + farthest_y * farthest_y;
+    if (radius_squared + radial_tolerance >= minimum_squared
+        && radius_squared <= maximum_squared + radial_tolerance) {
+      airgap_candidate_elements.push_back(static_cast<int32_t>(element));
+    }
+  }
+  plan->probes.reserve(options.airgap_angles_rad.size());
+  for (const double angle : options.airgap_angles_rad) {
+    if (!std::isfinite(angle)) {
+      plan->status = Status::kInvalidArgument;
+      return plan->status;
+    }
+    const double cosine = std::cos(angle), sine = std::sin(angle);
+    const double x = options.airgap_radius_m * cosine;
+    const double y = options.airgap_radius_m * sine;
+    FrozenAirgapProbe probe;
+    probe.cosine = cosine;
+    probe.sine = sine;
+    for (const int32_t element : airgap_candidate_elements) {
+      const NonlinearTriangle& triangle = model.triangles[element];
+      Node p[3] = { model.nodes[triangle.node[0]],
+        model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+      double candidate[3] = {};
+      if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
+          && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
+        probe.containing_element = element;
+        std::copy(candidate, candidate + 3, probe.lambda);
+        break;
+      }
+    }
+    if (probe.containing_element < 0
+        || !IsAirPostprocessMaterial(model.materials[model.triangles[
+            probe.containing_element].material], options,
+            model.triangles[probe.containing_element].material)) {
+      plan->status = Status::kInvalidArgument;
+      return plan->status;
+    }
+    plan->probes.push_back(probe);
+  }
+  plan->status = Status::kOk;
+  return plan->status;
+}
+
 FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
-    const NonlinearSolveResult& solution, const FrozenPostprocessOptions& options)
+    const NonlinearSolveResult& solution, const FrozenPostprocessOptions& options,
+    const FrozenPostprocessPlan* reusable_plan = nullptr)
 {
   FrozenPostprocessResult result;
   result.force_x_n = 0.0;
@@ -5366,86 +5530,51 @@ FrozenPostprocessResult ComputeFrozenPostprocess(const NonlinearModel& model,
     result.status = Status::kInvalidArgument;
     return result;
   }
-  std::vector<double> mask;
-  result.status = BuildWeightedStressMask(model, options, &mask);
-  if (result.status != Status::kOk)
+  FrozenPostprocessPlan local_plan;
+  const FrozenPostprocessPlan* plan = reusable_plan;
+  if (plan == nullptr) {
+    result.status = BuildFrozenPostprocessPlan(model, options, &local_plan);
+    plan = &local_plan;
+  } else if (!FrozenPostprocessPlanMatches(*plan, model, options)) {
+    result.status = Status::kInvalidArgument;
     return result;
-  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
-  std::vector<std::vector<int32_t>> incident(model.nodes.size());
-  for (size_t element = 0; element < model.triangles.size(); ++element) {
-    const NonlinearTriangle& triangle = model.triangles[element];
-    for (int local = 0; local < 3; ++local) {
-      incident[triangle.node[local]].push_back(static_cast<int32_t>(element));
-      edge_elements[CanonicalEdge(triangle.node[local], triangle.node[(local + 1) % 3])]
-          .push_back(static_cast<int32_t>(element));
-    }
+  }
+  result.status = plan->status;
+  if (result.status != Status::kOk) {
+    return result;
   }
   for (size_t element = 0; element < model.triangles.size(); ++element) {
-    const NonlinearTriangle& triangle = model.triangles[element];
-    Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
-      model.nodes[triangle.node[2]] };
-    NonlinearElementTerms terms;
-    if (!BuildElementTerms(p, &terms)) {
-      result.status = Status::kMeshInvalid;
-      return result;
-    }
-    double hx = 0.0, hy = 0.0;
-    for (int local = 0; local < 3; ++local) {
-      // HenrotteVector is -grad(mask).  b=(dN/dy,-dN/dx), hence
-      // -grad(m)=(sum m*b_y, -sum m*b_x).
-      hx += mask[triangle.node[local]] * terms.b_y[local];
-      hy -= mask[triangle.node[local]] * terms.b_x[local];
-    }
+    const double hx = plan->mask_gradient_x[element];
+    const double hy = plan->mask_gradient_y[element];
     const double bx = solution.bx_t[element], by = solution.by_t[element];
     const double fx_density = ((bx * bx - by * by) * hx + 2.0 * bx * by * hy)
         / (2.0 * kMu0);
     const double fy_density = (2.0 * bx * by * hx + (by * by - bx * bx) * hy)
         / (2.0 * kMu0);
-    const double weight = terms.area_m2 * model.depth_m;
+    const double weight = plan->element_weight[element];
     result.force_x_n += weight * fx_density;
     result.force_y_n += weight * fy_density;
-    const double cx = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
-    const double cy = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
+    const double cx = plan->element_center_x[element];
+    const double cy = plan->element_center_y[element];
     result.torque_nm += weight * (cx * fy_density - cy * fx_density);
   }
-  for (const double angle : options.airgap_angles_rad) {
-    if (!std::isfinite(angle) || !(options.airgap_radius_m >= 0.0)
-        || !std::isfinite(options.airgap_radius_m)) {
-      result.status = Status::kInvalidArgument;
-      return result;
-    }
-    const double x = options.airgap_radius_m * std::cos(angle);
-    const double y = options.airgap_radius_m * std::sin(angle);
-    int32_t containing = -1;
-    double lambda[3] = {};
-    for (size_t element = 0; element < model.triangles.size(); ++element) {
-      const NonlinearTriangle& triangle = model.triangles[element];
-      Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
-        model.nodes[triangle.node[2]] };
-      double candidate[3] = {};
-      if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
-          && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
-        containing = static_cast<int32_t>(element);
-        std::copy(candidate, candidate + 3, lambda);
-        break;
-      }
-    }
-    if (containing < 0 || !IsAirPostprocessMaterial(model.materials[model.triangles[containing].material], options, model.triangles[containing].material)) {
-      result.status = Status::kInvalidArgument;
-      return result;
-    }
+  for (size_t sample = 0; sample < plan->probes.size(); ++sample) {
+    const double angle = options.airgap_angles_rad[sample];
+    const FrozenAirgapProbe& probe = plan->probes[sample];
+    const int32_t containing = probe.containing_element;
     double nodal_bx[3] = {}, nodal_by[3] = {};
     if (!SmoothedElementB(model, solution.a_wb_per_m, solution.bx_t, solution.by_t,
-            incident, edge_elements, containing, nodal_bx, nodal_by)) {
+            plan->incident, plan->edge_elements, containing, nodal_bx, nodal_by)) {
       result.status = Status::kMeshInvalid;
       return result;
     }
     double bx = 0.0, by = 0.0;
     for (int local = 0; local < 3; ++local) {
-      bx += lambda[local] * nodal_bx[local];
-      by += lambda[local] * nodal_by[local];
+      bx += probe.lambda[local] * nodal_bx[local];
+      by += probe.lambda[local] * nodal_by[local];
     }
-    result.airgap_samples.push_back({ angle, bx * std::cos(angle) + by * std::sin(angle) });
+    result.airgap_samples.push_back({ angle,
+        bx * probe.cosine + by * probe.sine });
   }
   if (!std::isfinite(result.force_x_n) || !std::isfinite(result.force_y_n)
       || !std::isfinite(result.torque_nm))
@@ -5607,38 +5736,59 @@ struct TangentPostprocessResult {
 TangentPostprocessResult ComputeFrozenTangentPostprocess(
     const NonlinearModel& model, const NonlinearSolveResult& base,
     const NonlinearSolveResult& derivative,
-    const FrozenPostprocessOptions& options, const std::vector<double>& mask)
+    const FrozenPostprocessOptions& options, const std::vector<double>& mask,
+    const FrozenPostprocessPlan* reusable_plan = nullptr)
 {
   TangentPostprocessResult result;
   if (base.a_wb_per_m.size() != model.nodes.size()
       || derivative.a_wb_per_m.size() != model.nodes.size()
       || base.bx_t.size() != model.triangles.size()
       || derivative.bx_t.size() != model.triangles.size()
-      || mask.size() != model.nodes.size()) {
+      || mask.size() != model.nodes.size()
+      || (reusable_plan != nullptr
+          && !FrozenPostprocessPlanMatches(*reusable_plan, model, options))) {
     result.status = Status::kInvalidArgument;
     return result;
   }
-  std::map<EdgeKey, std::vector<int32_t>> edge_elements;
-  std::vector<std::vector<int32_t>> incident(model.nodes.size());
+  std::map<EdgeKey, std::vector<int32_t>> local_edge_elements;
+  std::vector<std::vector<int32_t>> local_incident(model.nodes.size());
+  const std::map<EdgeKey, std::vector<int32_t>>* edge_elements =
+      reusable_plan == nullptr ? &local_edge_elements
+                               : &reusable_plan->edge_elements;
+  const std::vector<std::vector<int32_t>>* incident =
+      reusable_plan == nullptr ? &local_incident : &reusable_plan->incident;
   for (size_t element = 0; element < model.triangles.size(); ++element) {
     const NonlinearTriangle& triangle = model.triangles[element];
-    for (int local = 0; local < 3; ++local) {
-      incident[triangle.node[local]].push_back(static_cast<int32_t>(element));
-      edge_elements[CanonicalEdge(triangle.node[local],
-          triangle.node[(local + 1) % 3])].push_back(
-          static_cast<int32_t>(element));
-    }
-    Node p[3] = { model.nodes[triangle.node[0]], model.nodes[triangle.node[1]],
-      model.nodes[triangle.node[2]] };
-    NonlinearElementTerms terms;
-    if (!BuildElementTerms(p, &terms)) {
-      result.status = Status::kMeshInvalid;
-      return result;
-    }
-    double hx = 0.0, hy = 0.0;
-    for (int local = 0; local < 3; ++local) {
-      hx += mask[triangle.node[local]] * terms.b_y[local];
-      hy -= mask[triangle.node[local]] * terms.b_x[local];
+    if (reusable_plan == nullptr)
+      for (int local = 0; local < 3; ++local) {
+        local_incident[triangle.node[local]].push_back(
+            static_cast<int32_t>(element));
+        local_edge_elements[CanonicalEdge(triangle.node[local],
+            triangle.node[(local + 1) % 3])].push_back(
+            static_cast<int32_t>(element));
+      }
+    double hx = 0.0, hy = 0.0, weight = 0.0, cx = 0.0, cy = 0.0;
+    if (reusable_plan != nullptr) {
+      hx = reusable_plan->mask_gradient_x[element];
+      hy = reusable_plan->mask_gradient_y[element];
+      weight = reusable_plan->element_weight[element];
+      cx = reusable_plan->element_center_x[element];
+      cy = reusable_plan->element_center_y[element];
+    } else {
+      Node p[3] = { model.nodes[triangle.node[0]],
+        model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+      NonlinearElementTerms terms;
+      if (!BuildElementTerms(p, &terms)) {
+        result.status = Status::kMeshInvalid;
+        return result;
+      }
+      for (int local = 0; local < 3; ++local) {
+        hx += mask[triangle.node[local]] * terms.b_y[local];
+        hy -= mask[triangle.node[local]] * terms.b_x[local];
+      }
+      weight = terms.area_m2 * model.depth_m;
+      cx = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
+      cy = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
     }
     const double bx = base.bx_t[element], by = base.by_t[element];
     const double dbx = derivative.bx_t[element];
@@ -5647,29 +5797,36 @@ TangentPostprocessResult ComputeFrozenTangentPostprocess(
     const double dshear = 2.0 * (dbx * by + bx * dby);
     const double dfx_density = (dnormal * hx + dshear * hy) / (2.0 * kMu0);
     const double dfy_density = (dshear * hx - dnormal * hy) / (2.0 * kMu0);
-    const double weight = terms.area_m2 * model.depth_m;
     result.force_x_n_per_a += weight * dfx_density;
     result.force_y_n_per_a += weight * dfy_density;
-    const double cx = (p[0].x_m + p[1].x_m + p[2].x_m) / 3.0;
-    const double cy = (p[0].y_m + p[1].y_m + p[2].y_m) / 3.0;
     result.torque_nm_per_a += weight
         * (cx * dfy_density - cy * dfx_density);
   }
-  for (const double angle : options.airgap_angles_rad) {
-    const double x = options.airgap_radius_m * std::cos(angle);
-    const double y = options.airgap_radius_m * std::sin(angle);
+  for (size_t sample = 0; sample < options.airgap_angles_rad.size(); ++sample) {
+    const double angle = options.airgap_angles_rad[sample];
+    const FrozenAirgapProbe* probe = reusable_plan == nullptr
+        ? nullptr : &reusable_plan->probes[sample];
+    const double cosine = probe == nullptr ? std::cos(angle) : probe->cosine;
+    const double sine = probe == nullptr ? std::sin(angle) : probe->sine;
+    const double x = options.airgap_radius_m * cosine;
+    const double y = options.airgap_radius_m * sine;
     int32_t containing = -1;
     double lambda[3] = {};
-    for (size_t element = 0; element < model.triangles.size(); ++element) {
-      const NonlinearTriangle& triangle = model.triangles[element];
-      Node p[3] = { model.nodes[triangle.node[0]],
-        model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
-      double candidate[3] = {};
-      if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
-          && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
-        containing = static_cast<int32_t>(element);
-        std::copy(candidate, candidate + 3, lambda);
-        break;
+    if (probe != nullptr) {
+      containing = probe->containing_element;
+      std::copy(probe->lambda, probe->lambda + 3, lambda);
+    } else {
+      for (size_t element = 0; element < model.triangles.size(); ++element) {
+        const NonlinearTriangle& triangle = model.triangles[element];
+        Node p[3] = { model.nodes[triangle.node[0]],
+          model.nodes[triangle.node[1]], model.nodes[triangle.node[2]] };
+        double candidate[3] = {};
+        if (TriangleBarycentric(p, x, y, candidate) && candidate[0] >= -1e-12
+            && candidate[1] >= -1e-12 && candidate[2] >= -1e-12) {
+          containing = static_cast<int32_t>(element);
+          std::copy(candidate, candidate + 3, lambda);
+          break;
+        }
       }
     }
     if (containing < 0 || !IsAirPostprocessMaterial(
@@ -5680,7 +5837,7 @@ TangentPostprocessResult ComputeFrozenTangentPostprocess(
     }
     double nodal_bx[3] = {}, nodal_by[3] = {};
     if (!SmoothedElementB(model, derivative.a_wb_per_m, derivative.bx_t,
-            derivative.by_t, incident, edge_elements, containing,
+            derivative.by_t, *incident, *edge_elements, containing,
             nodal_bx, nodal_by)) {
       result.status = Status::kMeshInvalid;
       return result;
@@ -5691,7 +5848,7 @@ TangentPostprocessResult ComputeFrozenTangentPostprocess(
       by += lambda[local] * nodal_by[local];
     }
     result.airgap_radial_flux_density_t_per_a.push_back(
-        bx * std::cos(angle) + by * std::sin(angle));
+        bx * cosine + by * sine);
   }
   result.status = std::isfinite(result.force_x_n_per_a)
           && std::isfinite(result.force_y_n_per_a)
@@ -8021,6 +8178,11 @@ struct MotorBatchTiming {
   double artifact_read_validate_seconds = 0.0;
   double solver_initialize_seconds = 0.0;
   NonlinearBatchTiming nonlinear;
+  double postprocess_plan_compute_seconds = 0.0;
+  double postprocess_plan_seconds = 0.0;
+  double base_postprocess_seconds = 0.0;
+  double tangent_operator_seconds = 0.0;
+  double tangent_postprocess_seconds = 0.0;
   double postprocess_seconds = 0.0;
   double measured_before_response_write_seconds = 0.0;
 };
@@ -8235,6 +8397,16 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
            << ", \"gpu_download_seconds\": " << timing->nonlinear.gpu_download_seconds
            << ", \"state_update_seconds\": " << timing->nonlinear.state_update_seconds
            << ", \"finalize_seconds\": " << timing->nonlinear.finalize_seconds
+           << ", \"postprocess_plan_compute_seconds\": "
+           << timing->postprocess_plan_compute_seconds
+           << ", \"postprocess_plan_seconds\": "
+           << timing->postprocess_plan_seconds
+           << ", \"base_postprocess_seconds\": "
+           << timing->base_postprocess_seconds
+           << ", \"tangent_operator_seconds\": "
+           << timing->tangent_operator_seconds
+           << ", \"tangent_postprocess_seconds\": "
+           << timing->tangent_postprocess_seconds
            << ", \"postprocess_seconds\": " << timing->postprocess_seconds
            << ", \"measured_before_response_write_seconds\": "
            << timing->measured_before_response_write_seconds << "},\n";
@@ -8428,10 +8600,87 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
     }
     // A SolveBatch instance owns exactly one CSR operator.  Partition the
     // request chunk before initializing it, so only samples with identical
-    // v2 artifact-and-pose operators share a CUDA batch.
-    for (const std::vector<size_t>& group : GroupMotorBatchPreparedItemsByOperator(prepared)) {
+    // v2 artifact-and-pose operators share a CUDA batch.  The geometry-only
+    // WST plans are geometry-only CPU work.  Prepare a bounded window of them
+    // ahead while the current nonlinear state occupies the GPU.  Four plans
+    // keep memory bounded while allowing independent posed geometries to use
+    // otherwise-idle host cores; each result is released after its group is
+    // consumed.  Solve and postprocess math remain unchanged.
+    const std::vector<std::vector<size_t>> operator_groups =
+        GroupMotorBatchPreparedItemsByOperator(prepared);
+    struct PreparedFrozenPostprocessPlan {
+      FrozenPostprocessOptions options;
+      FrozenPostprocessPlan plan;
+      double compute_seconds = 0.0;
+      bool available = false;
+    };
+    auto build_group_frozen_plan = [&](size_t group_index) {
+      PreparedFrozenPostprocessPlan result;
+      const std::vector<size_t>& group = operator_groups[group_index];
+      if (group.empty())
+        return result;
+      const MotorBatchPreparedItem& representative = prepared[group.front()];
+      const MotorSampleRequest& item =
+          request.items[representative.request_index].request;
+      if (representative.artifact->has_sliding_band)
+        return result;
+      result.options.selected_group_number = item.selected_group_number;
+      result.options.air_group_number = item.air_group_number;
+      result.options.max_mask_iterations = 4096;
+      result.options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
+      for (double angle : item.airgap_angles_deg)
+        result.options.airgap_angles_rad.push_back(
+            angle * 3.141592653589793238462643383279502884 / 180.0);
+      if (item.sector_performance.enabled) {
+        MapSectorAirgapAnglesToRepresentative(
+            representative.artifact->sector_start_angle_deg
+                * 3.141592653589793238462643383279502884 / 180.0,
+            representative.artifact->sector_boundary_sign, &result.options);
+      }
+      const ProfileClock::time_point start = ProfileClock::now();
+      BuildFrozenPostprocessPlan(representative.model, result.options,
+          &result.plan);
+      result.compute_seconds = ProfileSecondsSince(start);
+      result.available = true;
+      return result;
+    };
+    auto launch_group_frozen_plan = [&](size_t group_index) {
+      try {
+        return std::async(std::launch::async, build_group_frozen_plan,
+            group_index);
+      } catch (const std::system_error&) {
+        return std::async(std::launch::deferred, build_group_frozen_plan,
+            group_index);
+      }
+    };
+    const size_t frozen_plan_prefetch_window = std::min<size_t>(
+        operator_groups.size(), std::min<size_t>(4,
+            std::max(1u, std::thread::hardware_concurrency())));
+    std::vector<std::future<PreparedFrozenPostprocessPlan>>
+        pending_frozen_plans(operator_groups.size());
+    for (size_t group_index = 0;
+         group_index < frozen_plan_prefetch_window; ++group_index) {
+      pending_frozen_plans[group_index] =
+          launch_group_frozen_plan(group_index);
+    }
+    for (size_t group_index = 0; group_index < operator_groups.size();
+         ++group_index) {
+      const std::vector<size_t>& group = operator_groups[group_index];
       if (group.empty())
         continue;
+      const ProfileClock::time_point plan_wait_start = ProfileClock::now();
+      PreparedFrozenPostprocessPlan prepared_frozen_plan =
+          pending_frozen_plans[group_index].get();
+      const double plan_wait_seconds = ProfileSecondsSince(plan_wait_start);
+      timing.postprocess_plan_compute_seconds +=
+          prepared_frozen_plan.compute_seconds;
+      timing.postprocess_plan_seconds += plan_wait_seconds;
+      timing.postprocess_seconds += plan_wait_seconds;
+      const size_t launch_index = group_index + frozen_plan_prefetch_window;
+      if (launch_index < operator_groups.size()) {
+        pending_frozen_plans[launch_index] =
+            launch_group_frozen_plan(launch_index);
+      }
       const MotorBatchPreparedItem& representative = prepared[group.front()];
       if (cached_fingerprint != representative.operator_key) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
@@ -8501,11 +8750,37 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
               prepared_item.artifact->sector_boundary_sign, &base_post_options);
         }
         const ProfileClock::time_point postprocess_start = ProfileClock::now();
-        FrozenPostprocessResult postprocess = prepared_item.artifact->has_sliding_band
-            ? ComputeAirGapElementPostprocess(prepared_item.model, solution,
-                  base_post_options)
-            : ComputeFrozenPostprocess(prepared_item.model, solution,
-                  base_post_options);
+        FrozenPostprocessPlan item_frozen_plan;
+        const FrozenPostprocessPlan* frozen_plan = nullptr;
+        if (!prepared_item.artifact->has_sliding_band) {
+          if (prepared_frozen_plan.available
+              && FrozenPostprocessPlanMatches(prepared_frozen_plan.plan,
+                  prepared_item.model, base_post_options)) {
+            frozen_plan = &prepared_frozen_plan.plan;
+          } else {
+            const ProfileClock::time_point plan_start = ProfileClock::now();
+            BuildFrozenPostprocessPlan(prepared_item.model, base_post_options,
+                &item_frozen_plan);
+            const double plan_seconds = ProfileSecondsSince(plan_start);
+            timing.postprocess_plan_compute_seconds += plan_seconds;
+            timing.postprocess_plan_seconds += plan_seconds;
+            frozen_plan = &item_frozen_plan;
+          }
+        }
+        const ProfileClock::time_point base_postprocess_start =
+            ProfileClock::now();
+        FrozenPostprocessResult postprocess;
+        if (prepared_item.artifact->has_sliding_band) {
+          postprocess = ComputeAirGapElementPostprocess(prepared_item.model,
+              solution, base_post_options);
+        } else if (frozen_plan->status != Status::kOk) {
+          postprocess.status = frozen_plan->status;
+        } else {
+          postprocess = ComputeFrozenPostprocess(prepared_item.model, solution,
+              base_post_options, frozen_plan);
+        }
+        timing.base_postprocess_seconds += ProfileSecondsSince(
+            base_postprocess_start);
         if (postprocess.status == Status::kOk
             && !base_airgap_repeat_signs.empty()
             && !ApplySectorAirgapRepeatSigns(base_airgap_repeat_signs,
@@ -8532,11 +8807,15 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
                     ->suspension_spatial_order % 2) == 0 ? 1 : -1),
                 &tangent_post_options);
           }
-          std::vector<double> tangent_stress_mask;
-          if (!prepared_item.artifact->has_sliding_band) {
-            responses[index].tangent_status = BuildWeightedStressMask(
+          FrozenPostprocessPlan tangent_frozen_plan;
+          const FrozenPostprocessPlan* tangent_plan = frozen_plan;
+          if (!prepared_item.artifact->has_sliding_band
+              && !FrozenPostprocessPlanMatches(*tangent_plan,
+                  prepared_item.model, tangent_post_options)) {
+            responses[index].tangent_status = BuildFrozenPostprocessPlan(
                 prepared_item.model, tangent_post_options,
-                &tangent_stress_mask);
+                &tangent_frozen_plan);
+            tangent_plan = &tangent_frozen_plan;
           }
           NonlinearP1FixtureSolver sector_tangent_solver;
           NonlinearP1FixtureSolver* tangent_solver = &cached_solver;
@@ -8549,11 +8828,15 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
               tangent_solver = &sector_tangent_solver;
             }
           }
+          const ProfileClock::time_point tangent_operator_start =
+              ProfileClock::now();
           std::vector<TangentSolveResult> tangent_results =
               responses[index].tangent_status == Status::kOk
               ? tangent_solver->SolveTangentMultiRhs(solution,
                     item.tangent_multi_rhs.rhs, options, &batched_pcg_launches)
               : std::vector<TangentSolveResult> {};
+          timing.tangent_operator_seconds += ProfileSecondsSince(
+              tangent_operator_start);
           if (responses[index].tangent_status == Status::kOk
               && tangent_results.size() != item.tangent_multi_rhs.rhs.size())
             responses[index].tangent_status = Status::kInternalError;
@@ -8576,9 +8859,11 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
                       tangent_post_options)
                 : ComputeFrozenTangentPostprocess(prepared_item.model, solution,
                       tangent.field_derivative, tangent_post_options,
-                      tangent_stress_mask);
-            timing.postprocess_seconds += ProfileSecondsSince(
+                      tangent_plan->mask, tangent_plan);
+            const double tangent_postprocess_seconds = ProfileSecondsSince(
                 tangent_postprocess_start);
+            timing.postprocess_seconds += tangent_postprocess_seconds;
+            timing.tangent_postprocess_seconds += tangent_postprocess_seconds;
             if (tangent_postprocess.status != Status::kOk) {
               responses[index].tangent_status = tangent_postprocess.status;
               continue;
@@ -10286,8 +10571,24 @@ int SelfTest()
   postprocess_options.airgap_angles_rad = { 0.0, 0.5 * 3.141592653589793238462643383279502884 };
   const FrozenPostprocessResult postprocess = ComputeFrozenPostprocess(
       postprocess_model, postprocess_solution, postprocess_options);
+  FrozenPostprocessPlan reusable_postprocess_plan;
+  const Status reusable_postprocess_plan_status = BuildFrozenPostprocessPlan(
+      postprocess_model, postprocess_options, &reusable_postprocess_plan);
+  const FrozenPostprocessResult reused_postprocess =
+      reusable_postprocess_plan_status == Status::kOk
+      ? ComputeFrozenPostprocess(postprocess_model, postprocess_solution,
+            postprocess_options, &reusable_postprocess_plan)
+      : FrozenPostprocessResult {};
   expect(postprocess.status == Status::kOk,
       std::string("weighted-stress mask postprocess: ") + StatusName(postprocess.status));
+  expect(reusable_postprocess_plan_status == Status::kOk
+          && reused_postprocess.status == postprocess.status
+          && Near(reused_postprocess.force_x_n, postprocess.force_x_n, 1e-12)
+          && Near(reused_postprocess.force_y_n, postprocess.force_y_n, 1e-12)
+          && Near(reused_postprocess.torque_nm, postprocess.torque_nm, 1e-12)
+          && reused_postprocess.airgap_samples.size()
+              == postprocess.airgap_samples.size(),
+      "reused frozen postprocess plan preserves load and field results");
   if (postprocess.status == Status::kOk) {
     expect(Near(postprocess.force_x_n, 0.0, 1e-8), "uniform-field weighted Fx cancellation");
     expect(Near(postprocess.force_y_n, 0.0, 1e-8), "uniform-field weighted Fy cancellation");
