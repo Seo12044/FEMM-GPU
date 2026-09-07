@@ -360,6 +360,40 @@ gpu_linear_p1_poc.exe --internal-solve-host request.json response-host.json
 gpu_linear_p1_poc.exe --internal-solve-device request.json response-device.json
 ```
 
+## Cyclic native-AGE torque sector (`gpu_femm_motor_batch_v4`)
+
+V4 is a separate, base-field-only path for a genuinely cropped native FEMM
+air-gap-element (AGE) sector. It preserves v1/v2/v3 behavior. The mesh is
+`gpu_femm_mesh_v4`; its `sector` uses `gpu_femm_motor_sector_v2` and retains
+the v1 field names, with `full_machine_sector_count = k` for any integer
+`k >= 2` and `angle_deg = 360/k`. Cut-node pairs must be the exact rotation
+through that angle. A nonempty AGE record is mandatory.
+
+The circuit partner arrays are a signed generator, not a C2 involution:
+applying its index permutation and orientations exactly `k` times must return
+every circuit to itself with sign `+1`. The full-machine flux vector is
+reconstructed by scatter-summing every signed generator copy.
+
+V4 accepts only zero/drive nonlinear samples. Its request carries
+`"tangent_multi_rhs": []` (or `null`) and
+`"sector_performance":{"schema_version":"gpu_femm_motor_sector_performance_v2",...}`;
+any tangent RHS is rejected. Displacement is rejected by the normal
+sliding-band request check. Suspension/tangent work remains on the validated
+full-circle route.
+
+AGE torque is integrated on the stored sector and normalized as
+`T_full = k*T_sector`; returned `Fx_N` and `Fy_N` are zero by full rotational
+cancellation. FEMM constructs a virtual globally sorted 360-degree AGE ring,
+even when the physical mesh is cropped. Radial-B Fourier probes therefore use
+`angle mod angle_deg`, with P/AP sign from `floor(angle/angle_deg)`. Neither the
+physical cut angle nor the stored q0 node angle is subtracted. The v4
+`sector_reconstruction` object uses schema
+`gpu_femm_motor_sector_reconstruction_v2`, reports
+`output_normalization:"full_machine"`,
+`load_extraction_method:"native_air_gap_element_signed_sector"`, the scalar
+torque multiplier, generator arrays, start/angle/count, and the invariance
+certificate SHA.
+
 ## Numerical implementation
 
 - Field values and solver storage use `double`.

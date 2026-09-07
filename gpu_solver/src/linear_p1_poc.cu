@@ -4327,6 +4327,9 @@ struct GpuFemmMeshArtifact {
   std::string canonical_identity_sha256;
   bool has_sliding_band = false;
   bool has_motor_sector = false;
+  // v4 is a cyclic, native-AGE torque-only sector. Keep it separate from
+  // v3's conforming-mesh/WST sector so old protocol semantics cannot drift.
+  bool has_native_age_sector = false;
   double sector_start_angle_deg = 0.0;
   double sector_angle_deg = 360.0;
   int32_t full_machine_sector_count = 1;
@@ -4359,7 +4362,8 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const bool motor_v1 = schema->string == "gpu_femm_mesh_v1";
   const bool motor_v2 = schema->string == "gpu_femm_mesh_v2";
   const bool motor_v3 = schema->string == "gpu_femm_mesh_v3";
-  if ((!neutral_schema && !motor_v1 && !motor_v2 && !motor_v3)
+  const bool motor_v4 = schema->string == "gpu_femm_mesh_v4";
+  if ((!neutral_schema && !motor_v1 && !motor_v2 && !motor_v3 && !motor_v4)
       || !(neutral_schema
               ? ExactObject(root, { "schema_version", "source_fem_sha256",
                     "canonical_identity_sha256", "resolved" }, error)
@@ -4395,11 +4399,11 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
                           "base_motor_fem_sha256", "model", "pose", "nodes_mm",
                           "triangles", "regions", "materials", "circuits",
                           "outer_dirichlet", "air_gap_elements" }, error)
-                    : ExactObject(*resolved, { "source_fem_sha256",
-                          "base_motor_fem_sha256", "model", "pose", "nodes_mm",
-                          "triangles", "regions", "materials", "circuits",
-                          "outer_dirichlet", "air_gap_elements", "node_constraints",
-                          "sector" }, error))))) {
+                     : ((motor_v3 || motor_v4) ? ExactObject(*resolved, { "source_fem_sha256",
+                           "base_motor_fem_sha256", "model", "pose", "nodes_mm",
+                           "triangles", "regions", "materials", "circuits",
+                           "outer_dirichlet", "air_gap_elements", "node_constraints",
+                           "sector" }, error) : false))))) {
     if (error->empty())
       *error = "invalid GPU FEMM mesh artifact header";
     return false;
@@ -4420,16 +4424,16 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
   const StrictJson* materials = JsonMember(*resolved, "materials", StrictJson::Type::kArray, error);
   const StrictJson* circuits = JsonMember(*resolved, "circuits", StrictJson::Type::kArray, error);
   const StrictJson* boundary = JsonMember(*resolved, "outer_dirichlet", StrictJson::Type::kObject, error);
-  const StrictJson* node_constraints = (generic_neutral_schema || motor_v3)
+  const StrictJson* node_constraints = (generic_neutral_schema || motor_v3 || motor_v4)
       ? JsonMember(*resolved, "node_constraints", StrictJson::Type::kArray, error)
       : nullptr;
-  const StrictJson* sector = motor_v3
+  const StrictJson* sector = (motor_v3 || motor_v4)
       ? JsonMember(*resolved, "sector", StrictJson::Type::kObject, error) : nullptr;
   if (resolved_sha == nullptr || base_sha == nullptr || model == nullptr
       || (!neutral_schema && pose == nullptr) || nodes == nullptr || triangles == nullptr || regions == nullptr
       || materials == nullptr || circuits == nullptr || boundary == nullptr
-      || ((generic_neutral_schema || motor_v3) && node_constraints == nullptr)
-      || (motor_v3 && sector == nullptr)
+       || ((generic_neutral_schema || motor_v3 || motor_v4) && node_constraints == nullptr)
+       || ((motor_v3 || motor_v4) && sector == nullptr)
       || !(neutral_schema ? JsonLowerSha256(resolved_sha->string)
                           : JsonSha256(resolved_sha->string))
       || !(neutral_schema ? JsonLowerSha256(base_sha->string)
@@ -4476,7 +4480,7 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
 
   GpuFemmMeshArtifact parsed;
   parsed.schema_version = schema->string;
-  bool is_sliding_band_motor = motor_v2;
+  bool is_sliding_band_motor = motor_v2 || motor_v4;
   if (motor_v3) {
     const auto sector_ages = resolved->object.find("air_gap_elements");
     if (sector_ages == resolved->object.end()
@@ -4486,6 +4490,18 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       return false;
     }
     is_sliding_band_motor = false;
+  }
+  if (motor_v4) {
+    const auto sector_ages = resolved->object.find("air_gap_elements");
+    if (sector_ages == resolved->object.end()
+        || (sector_ages->second.type != StrictJson::Type::kArray
+            && sector_ages->second.type != StrictJson::Type::kObject)
+        || (sector_ages->second.type == StrictJson::Type::kArray
+            && sector_ages->second.array.empty())) {
+      *error = "gpu_femm_mesh_v4 requires a nonempty native AGE sector";
+      return false;
+    }
+    parsed.has_native_age_sector = true;
   }
   parsed.has_sliding_band = is_sliding_band_motor;
   parsed.pose_fem_sha256 = source_sha->string;
@@ -4694,7 +4710,7 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     parsed.model.dirichlet_nodes.push_back(node);
     parsed.model.dirichlet_a_wb_per_m.push_back(0.0);
   }
-  if (generic_neutral_schema || motor_v3) {
+  if (generic_neutral_schema || motor_v3 || motor_v4) {
     for (const StrictJson& entry : node_constraints->array) {
       if (!ExactObject(entry, { "node_a", "node_b", "relation" }, error))
         return false;
@@ -4717,7 +4733,7 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
       parsed.model.node_constraints.push_back(constraint);
     }
   }
-  if (motor_v3) {
+  if (motor_v3 || motor_v4) {
     if (!ExactObject(*sector, { "schema_version", "sector_start_angle_deg",
             "angle_deg",
             "full_machine_sector_count", "electrical_pole_pairs",
@@ -4758,9 +4774,9 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
          || boundary_relation == nullptr || circuit_partners == nullptr
          || circuit_orientations == nullptr || apex_nodes == nullptr
          || invariance_sha == nullptr || !JsonLowerSha256(invariance_sha->string)
-        || sector_schema->string != "gpu_femm_motor_sector_v1"
-        || angle->number != 180.0 || !JsonInteger(*repeats, &repeat_count)
-        || repeat_count != 2 || !JsonInteger(*pole_pairs, &p) || p <= 0
+           || sector_schema->string != (motor_v4 ? "gpu_femm_motor_sector_v2" : "gpu_femm_motor_sector_v1")
+           || !(angle->number > 0.0) || !JsonInteger(*repeats, &repeat_count)
+           || repeat_count < 2 || !JsonInteger(*pole_pairs, &p) || p <= 0
         || !JsonInteger(*suspension_order, &suspension_n)
         || suspension_n != p + 1
         || (boundary_relation->string != "periodic"
@@ -4769,7 +4785,21 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
             != static_cast<size_t>(parsed.model.circuit_count)
         || circuit_orientations->array.size()
             != static_cast<size_t>(parsed.model.circuit_count)) {
-      *error = "motor sector v1 requires exact 180-degree, two-sector, p and p+1 harmonic metadata";
+       *error = "motor sector requires positive k, p and p+1 harmonic metadata";
+       return false;
+    }
+    if ((!motor_v4 && (angle->number != 180.0 || repeat_count != 2))
+        || (motor_v4 && angle->number != 360.0 / static_cast<double>(repeat_count))) {
+      *error = "motor sector angle/count are inconsistent";
+      return false;
+    }
+    // A p-pole-pair scalar potential can have only a P/AP relation under a
+    // sector rotation when its electrical phase advance is an integer pi.
+    // Do not silently accept a Bloch phase in this real-valued solver.
+    if (motor_v4 && ((2 * p) % repeat_count != 0
+        || (boundary_relation->string == "antiperiodic")
+            != (((2 * p / repeat_count) % 2) != 0))) {
+      *error = "native AGE sector boundary relation does not match electrical phase advance";
       return false;
     }
     parsed.has_motor_sector = true;
@@ -4790,10 +4820,29 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
     for (const SignedNodeConstraint& constraint : parsed.model.node_constraints) {
       const Node& a = parsed.model.nodes[constraint.node_a];
       const Node& b = parsed.model.nodes[constraint.node_b];
-      if (std::hypot(a.x_m + b.x_m, a.y_m + b.y_m)
-          > sector_geometry_tolerance_m) {
-        *error = "motor sector non-self constraint nodes must be related by an exact 180-degree rotation";
-        return false;
+      if (!motor_v4) {
+        // Preserve v3's original exact C2 predicate; using cos(pi) introduces
+        // an avoidable floating residual into its established validation path.
+        if (std::hypot(a.x_m + b.x_m, a.y_m + b.y_m)
+            > sector_geometry_tolerance_m) {
+          *error = "motor sector non-self constraint nodes must be related by an exact 180-degree rotation";
+          return false;
+        }
+      } else {
+        // Canonical wire ordering (`node_a < node_b`) is unrelated to the
+        // geometric generator direction. Accept either R(a)=b or R(b)=a.
+        const double sector_angle_rad = angle->number
+            * 3.141592653589793238462643383279502884 / 180.0;
+        const double cosine = std::cos(sector_angle_rad);
+        const double sine = std::sin(sector_angle_rad);
+        const double forward = std::hypot(b.x_m - (cosine * a.x_m - sine * a.y_m),
+            b.y_m - (sine * a.x_m + cosine * a.y_m));
+        const double reverse = std::hypot(a.x_m - (cosine * b.x_m - sine * b.y_m),
+            a.y_m - (sine * b.x_m + cosine * b.y_m));
+        if (std::min(forward, reverse) > sector_geometry_tolerance_m) {
+          *error = "motor sector non-self constraint nodes must be related by the sector rotation";
+          return false;
+        }
       }
     }
     for (const StrictJson& apex : apex_nodes->array) {
@@ -4833,11 +4882,14 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
           static_cast<int8_t>(orientation));
     }
     for (size_t circuit = 0; circuit < parsed.circuit_partner_indices.size(); ++circuit) {
-      const int32_t partner = parsed.circuit_partner_indices[circuit];
-      if (parsed.circuit_partner_indices[partner] != static_cast<int32_t>(circuit)
-          || parsed.circuit_partner_orientations[circuit]
-              * parsed.circuit_partner_orientations[partner] != 1) {
-        *error = "motor sector circuit partner mapping must be an oriented involution";
+      int32_t current = static_cast<int32_t>(circuit);
+      int sign = 1;
+      for (int32_t copy = 0; copy < repeat_count; ++copy) {
+        sign *= parsed.circuit_partner_orientations[current];
+        current = parsed.circuit_partner_indices[current];
+      }
+      if (current != static_cast<int32_t>(circuit) || sign != 1) {
+        *error = "motor sector circuit generator must close after k copies with positive orientation";
         return false;
       }
     }
@@ -4936,6 +4988,14 @@ bool ParseGpuFemmMeshArtifactJson(const std::string& text, GpuFemmMeshArtifact* 
         age.quad_points.push_back(parsed_point);
       }
       parsed.model.air_gap_elements.push_back(std::move(age));
+    }
+    if (motor_v4 && !std::all_of(parsed.model.air_gap_elements.begin(),
+            parsed.model.air_gap_elements.end(), [&](const AirGapElement& age) {
+              return age.antiperiodic == (parsed.sector_boundary_sign < 0)
+                  && age.arc_length_deg == parsed.sector_angle_deg;
+            })) {
+      *error = "native AGE sector periodicity or arc length disagrees with sector metadata";
+      return false;
     }
   }
   if (ValidateNonlinearModel(parsed.model) != Status::kOk) {
@@ -6958,10 +7018,13 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
   const bool v3 = protocol_field != root.object.end()
       && protocol_field->second.type == StrictJson::Type::kString
       && protocol_field->second.string == "gpu_femm_motor_sample_v3";
+  const bool v4 = protocol_field != root.object.end()
+      && protocol_field->second.type == StrictJson::Type::kString
+      && protocol_field->second.string == "gpu_femm_motor_sample_v4";
   const bool has_tangent_field = root.type == StrictJson::Type::kObject
       && root.object.find("tangent_multi_rhs") != root.object.end();
   if (request == nullptr || error == nullptr
-      || (!v1 && !v2 && !v3)
+       || (!v1 && !v2 && !v3 && !v4)
       || (v1 && !ExactObject(root, legacy_fields, error))
       || (v2 && !has_tangent_field)
       || (v2
@@ -6971,7 +7034,7 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
               "selected_group_number", "air_group_number", "airgap_radius_mm",
               "airgap_angles_deg", "rotor_angle_deg", "displacement_mm",
               "tangent_multi_rhs" }, error))
-      || (v3
+       || ((v3 || v4)
           && !ExactObject(root, { "protocol", "mesh_artifact_path",
               "mesh_artifact_sha256", "base_motor_fem_sha256",
               "source_fem_sha256", "circuit_currents_A",
@@ -6997,7 +7060,8 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
       || angles == nullptr || rotor == nullptr || displacement == nullptr
       || (protocol->string != "gpu_femm_motor_sample_v1"
           && protocol->string != "gpu_femm_motor_sample_v2"
-          && protocol->string != "gpu_femm_motor_sample_v3")
+           && protocol->string != "gpu_femm_motor_sample_v3"
+           && protocol->string != "gpu_femm_motor_sample_v4")
       || path->string.empty() || !JsonSha256(artifact_sha->string) || !JsonSha256(base_sha->string)
       || !JsonSha256(source_sha->string)
       || !JsonInteger(*selected, &selected_group) || !JsonInteger(*air, &air_group)
@@ -7025,7 +7089,7 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
   request->tangent_requested = false;
   request->tangent_multi_rhs.rhs.clear();
   request->sector_performance = {};
-  if (v2 || v3) {
+  if (v2 || v3 || v4) {
     const StrictJson& tangent = root.object.at("tangent_multi_rhs");
     // MATLAB homogeneous struct arrays commonly encode an unused nested
     // struct as [] or null.  Both are explicit no-op values.
@@ -7079,7 +7143,7 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
       request->tangent_requested = true;
     }
   }
-  if (v3) {
+  if (v3 || v4) {
     const StrictJson& sector_request = root.object.at("sector_performance");
     if (!ExactObject(sector_request, { "schema_version",
             "model_invariance_certificate_sha256" }, error))
@@ -7092,13 +7156,21 @@ bool ReadMotorSampleRequestValue(const StrictJson& root, MotorSampleRequest* req
     if (sector_schema == nullptr
         || certificate_sha == nullptr
         || !JsonLowerSha256(certificate_sha->string)
-        || sector_schema->string != "gpu_femm_motor_sector_performance_v1") {
+           || sector_schema->string != (v4
+               ? "gpu_femm_motor_sector_performance_v2"
+               : "gpu_femm_motor_sector_performance_v1")) {
       *error = "invalid gpu_femm_motor_sector_performance_v1 request";
       return false;
     }
     request->sector_performance.enabled = true;
     request->sector_performance.model_invariance_certificate_sha256 =
         certificate_sha->string;
+  }
+  // Native AGE cyclic sectors are deliberately nonlinear base-only.  Tangent
+  // and suspension calculations retain their validated full-circle routes.
+  if (v4 && request->tangent_requested) {
+    *error = "gpu_femm_motor_sample_v4 rejects tangent_multi_rhs";
+    return false;
   }
   return true;
 }
@@ -7115,7 +7187,9 @@ bool ReadMotorSampleRequestJson(const std::string& json, MotorSampleRequest* req
 bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMeshArtifact& artifact)
 {
   const bool sector_request = request.protocol == "gpu_femm_motor_sample_v3";
-  if (sector_request != artifact.has_motor_sector
+  const bool native_sector_request = request.protocol == "gpu_femm_motor_sample_v4";
+  if (sector_request != (artifact.has_motor_sector && !artifact.has_native_age_sector)
+      || native_sector_request != artifact.has_native_age_sector
       || (sector_request && (artifact.schema_version != "gpu_femm_mesh_v3"
           || artifact.sector_angle_deg != 180.0
           || artifact.full_machine_sector_count != 2
@@ -7124,9 +7198,16 @@ bool RequestMatchesArtifact(const MotorSampleRequest& request, const GpuFemmMesh
               != artifact.electrical_pole_pairs + 1
           || artifact.sector_boundary_sign
               != ((artifact.electrical_pole_pairs % 2) == 0 ? 1 : -1)
-          || !request.sector_performance.enabled
-          || request.sector_performance.model_invariance_certificate_sha256
-              != artifact.model_invariance_certificate_sha256)))
+           || !request.sector_performance.enabled
+           || request.sector_performance.model_invariance_certificate_sha256
+               != artifact.model_invariance_certificate_sha256))
+      || (native_sector_request && (artifact.schema_version != "gpu_femm_mesh_v4"
+           || artifact.full_machine_sector_count < 2
+           || artifact.sector_angle_deg != 360.0 / artifact.full_machine_sector_count
+           || !artifact.has_sliding_band || artifact.model.air_gap_elements.empty()
+           || !request.sector_performance.enabled
+           || request.sector_performance.model_invariance_certificate_sha256
+               != artifact.model_invariance_certificate_sha256)))
     return false;
   const bool matching_pose = artifact.has_sliding_band
       ? request.displacement_mm[0] == 0.0 && request.displacement_mm[1] == 0.0
@@ -7268,6 +7349,45 @@ std::vector<int8_t> MapSectorAirgapAnglesToRepresentative(
       angle = sector_start_angle_rad;
     const bool odd_copy = (std::abs(copy) % 2) != 0;
     signs.push_back(odd_copy ? repeat_sign : 1);
+  }
+  return signs;
+}
+
+// Fold global probes into a general k-sector AGE.  FEMM's writepoly expands
+// all sector copies into a virtual 360-degree ring, sorts it in global angle,
+// then emits q0 as the predecessor that brackets global zero.  Consequently
+// the native AGE Fourier basis is global-zero referenced even when a cropped
+// physical sector starts elsewhere.  P/AP parity follows those same global
+// virtual copies, not the declared crop cut or q0's stored local node angle.
+std::vector<int8_t> MapNativeAgeSectorAirgapAnglesToRepresentative(
+    const GpuFemmMeshArtifact& artifact, FrozenPostprocessOptions* options)
+{
+  std::vector<int8_t> signs;
+  if (options == nullptr || artifact.full_machine_sector_count < 2)
+    return signs;
+  constexpr double kPi = 3.141592653589793238462643383279502884;
+  const double span = artifact.sector_angle_deg * kPi / 180.0;
+  if (!(span > 0.0))
+    return signs;
+  signs.reserve(options->airgap_angles_rad.size());
+  for (double& angle : options->airgap_angles_rad) {
+    const double turns = std::floor(angle / span);
+    int64_t copy = static_cast<int64_t>(turns);
+    double local = angle - static_cast<double>(copy) * span;
+    const double tolerance = 64.0 * std::numeric_limits<double>::epsilon()
+        * std::max(1.0, std::abs(local));
+    if (local < -tolerance) {
+      local += span;
+      --copy;
+    } else if (local >= span - tolerance) {
+      local -= span;
+      ++copy;
+    }
+    if (std::abs(local) <= tolerance)
+      local = 0.0;
+    angle = local;
+    const bool odd_copy = (std::abs(copy) % 2) != 0;
+    signs.push_back(odd_copy && artifact.sector_boundary_sign < 0 ? -1 : 1);
   }
   return signs;
 }
@@ -7810,7 +7930,8 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
   if (protocol == nullptr || chunk == nullptr || items == nullptr
       || (protocol->string != "gpu_femm_motor_batch_v1"
           && protocol->string != "gpu_femm_motor_batch_v2"
-          && protocol->string != "gpu_femm_motor_batch_v3")
+           && protocol->string != "gpu_femm_motor_batch_v3"
+           && protocol->string != "gpu_femm_motor_batch_v4")
       || !JsonInteger(*chunk, &max_items)
       || max_items < 1 || max_items > 4096 || items->array.empty() || items->array.size() > 4096) {
     if (error->empty())
@@ -7828,10 +7949,10 @@ bool ReadMotorBatchRequestJson(const std::string& json, MotorBatchRequest* reque
     const StrictJson* sample = JsonMember(item, "request", StrictJson::Type::kObject, error);
     MotorBatchItem parsed;
     const std::string expected_sample_protocol = request->protocol
-            == "gpu_femm_motor_batch_v3"
-        ? "gpu_femm_motor_sample_v3"
+            == "gpu_femm_motor_batch_v4" ? "gpu_femm_motor_sample_v4"
+        : (request->protocol == "gpu_femm_motor_batch_v3" ? "gpu_femm_motor_sample_v3"
         : (request->protocol == "gpu_femm_motor_batch_v2"
-              ? "gpu_femm_motor_sample_v2" : "gpu_femm_motor_sample_v1");
+              ? "gpu_femm_motor_sample_v2" : "gpu_femm_motor_sample_v1"));
     if (id == nullptr || sample == nullptr || !BatchTaskIdValid(id->string)
         || ids.count(id->string) != 0 || !ReadMotorSampleRequestValue(*sample, &parsed.request, error)) {
       if (error->empty())
@@ -8118,6 +8239,26 @@ std::vector<double> ReconstructSectorCircuitFluxLinkage(
   return full;
 }
 
+std::vector<double> ReconstructCyclicSectorCircuitFluxLinkage(
+    const std::vector<double>& sector_flux, const GpuFemmMeshArtifact& artifact)
+{
+  if (sector_flux.size() != artifact.circuit_partner_indices.size()
+      || sector_flux.size() != artifact.circuit_partner_orientations.size())
+    return {};
+  std::vector<double> full(sector_flux.size(), 0.0);
+  for (size_t source = 0; source < sector_flux.size(); ++source) {
+    int32_t target = static_cast<int32_t>(source);
+    int sign = 1;
+    for (int32_t copy = 0; copy < artifact.full_machine_sector_count; ++copy) {
+      full[target] += static_cast<double>(sign) * sector_flux[source];
+      sign *= artifact.circuit_partner_orientations[target]
+          * artifact.sector_boundary_sign;
+      target = artifact.circuit_partner_indices[target];
+    }
+  }
+  return full;
+}
+
 void ApplyBaseSectorReconstruction(const GpuFemmMeshArtifact& artifact,
     const MotorSampleRequest& request, MotorBatchResponseDto* dto)
 {
@@ -8132,7 +8273,8 @@ void ApplyBaseSectorReconstruction(const GpuFemmMeshArtifact& artifact,
   dto->base_field_repeat_sign = artifact.sector_boundary_sign;
   dto->tangent_field_repeat_sign = static_cast<int8_t>(
       (artifact.suspension_spatial_order % 2) == 0 ? 1 : -1);
-  dto->base_torque_multiplier = 2.0;
+  dto->base_torque_multiplier = artifact.has_native_age_sector
+      ? static_cast<double>(artifact.full_machine_sector_count) : 2.0;
   const int8_t cross_repeat_sign = static_cast<int8_t>(
       dto->base_field_repeat_sign * dto->tangent_field_repeat_sign);
   dto->tangent_force_multiplier = 1.0 - cross_repeat_sign;
@@ -8145,14 +8287,16 @@ void ApplyBaseSectorReconstruction(const GpuFemmMeshArtifact& artifact,
   dto->model_invariance_certificate_sha256 =
       artifact.model_invariance_certificate_sha256;
   if (dto->status == Status::kOk) {
-    // A vector load from the opposite 180-degree sector is rotated by pi.
-    // The quadratic base stress is periodic, so the two vector contributions
-    // cancel exactly while axial torque contributions add.
+    // A complete rotational orbit cancels the vector load while its scalar
+    // axial torque adds. v4 is AGE torque-only; no sector force formula is
+    // exposed as a physical result.
     dto->force_x_n = 0.0;
     dto->force_y_n = 0.0;
     dto->torque_nm *= dto->base_torque_multiplier;
-    dto->circuit_flux_linkage_wb = ReconstructSectorCircuitFluxLinkage(
-        dto->circuit_flux_linkage_wb, artifact, dto->base_field_repeat_sign);
+    dto->circuit_flux_linkage_wb = artifact.has_native_age_sector
+        ? ReconstructCyclicSectorCircuitFluxLinkage(dto->circuit_flux_linkage_wb, artifact)
+        : ReconstructSectorCircuitFluxLinkage(dto->circuit_flux_linkage_wb, artifact,
+              dto->base_field_repeat_sign);
     if (dto->circuit_flux_linkage_wb.empty())
       dto->status = Status::kInternalError;
   }
@@ -8241,7 +8385,9 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
     output << "],\n  \"mesh_element_count\": " << dto.mesh_element_count << ",\n";
     if (dto.sector_reconstruction_enabled) {
       output << "  \"sector_reconstruction\": {\"schema_version\": "
-             << "\"gpu_femm_motor_sector_reconstruction_response_v1\", "
+             << (dto.sector_uses_native_age
+                 ? "\"gpu_femm_motor_sector_reconstruction_v2\", "
+                 : "\"gpu_femm_motor_sector_reconstruction_response_v1\", ")
              << "\"status\": \""
              << (dto.sector_reconstruction_status == Status::kOk ? "PASS" : "FAIL")
              << "\", \"error_identifier\": \""
@@ -8271,9 +8417,11 @@ void WriteMotorBatchItemResponseJson(std::ostream& output, const MotorSampleRequ
                     : "weighted_stress_tensor_periodic_pair_mask")
              << "\", \"periodic_pair_aware_weighted_stress_mask\": "
              << (!dto.sector_uses_native_age ? "true" : "false")
-             << ", \"constraint_source\": \"cropped_sector_artifact\""
-             << ", \"operator_construction\": "
-             << "\"same_topology_dual_signed_reduction\""
+              << ", \"constraint_source\": \"cropped_sector_artifact\""
+              << ", \"operator_construction\": "
+              << (dto.sector_uses_native_age
+                  ? "\"native_age_sector_base_only\""
+                  : "\"same_topology_dual_signed_reduction\"")
              << ", \"tangent_operator_storage\": \"shared_single_upload\""
              << ", \"tangent_physical_operator_count\": "
              << dto.tangent_operator_evidence.physical_operator_count
@@ -8592,7 +8740,8 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         continue;
       }
       NonlinearModel tangent_model;
-      if (item.sector_performance.enabled
+      if (item.tangent_requested && item.sector_performance.enabled
+          && !artifact.has_native_age_sector
           && !MakeMotorSectorTangentModel(artifact, model, &tangent_model))
         tangent_model.nodes.clear();
       const std::string operator_key = MotorBatchOperatorKey(item, *load, model);
@@ -8744,6 +8893,10 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
         FrozenPostprocessOptions base_post_options = post_options;
         std::vector<int8_t> base_airgap_repeat_signs;
         if (item.sector_performance.enabled
+            && prepared_item.artifact->has_native_age_sector) {
+          base_airgap_repeat_signs = MapNativeAgeSectorAirgapAnglesToRepresentative(
+              *prepared_item.artifact, &base_post_options);
+        } else if (item.sector_performance.enabled
             && !prepared_item.artifact->has_sliding_band) {
           base_airgap_repeat_signs = MapSectorAirgapAnglesToRepresentative(
               prepared_item.artifact->sector_start_angle_deg
@@ -9600,6 +9753,65 @@ int SelfTest()
   expect(ParseGpuFemmMeshArtifactJson(sliding_mesh_artifact, &sliding_artifact, &parser_error)
           && sliding_artifact.has_sliding_band && sliding_artifact.model.air_gap_elements.size() == 1,
       std::string("gpu_femm_mesh_v2 sliding-band parser: ") + parser_error);
+  // Parser-only v4 fixture: it proves the new cyclic AGE contract accepts a
+  // 90-degree P cut and rejects neither AGE data nor k>2 generator metadata.
+  std::string native_age_sector_mesh = sector_mesh_artifact;
+  replace_once(&native_age_sector_mesh, "gpu_femm_mesh_v3", "gpu_femm_mesh_v4");
+  replace_once(&native_age_sector_mesh,
+      "\"pose\":{\"rotor_angle_deg\":3,\"displacement_mm\":[0.1,0]}",
+      "\"pose\":{\"rotor_angle_deg\":0,\"displacement_mm\":[0,0]}");
+  replace_once(&native_age_sector_mesh, "gpu_femm_motor_sector_v1",
+      "gpu_femm_motor_sector_v2");
+  replace_once(&native_age_sector_mesh, "\"angle_deg\":180,\"full_machine_sector_count\":2,"
+      "\"electrical_pole_pairs\":3,\"suspension_spatial_order\":4,\"boundary_relation\":\"antiperiodic\"",
+      "\"angle_deg\":90,\"full_machine_sector_count\":4,"
+      "\"electrical_pole_pairs\":4,\"suspension_spatial_order\":5,\"boundary_relation\":\"periodic\"");
+  replace_once(&native_age_sector_mesh,
+      "\"node_constraints\":[{\"node_a\":1,\"node_b\":2,\"relation\":\"antiperiodic\"}]",
+      "\"node_constraints\":[{\"node_a\":1,\"node_b\":3,\"relation\":\"periodic\"}]");
+  const std::string age_only = v2_boundary.substr(v1_boundary.size() + 1);
+  replace_once(&native_age_sector_mesh, "\"air_gap_elements\":[]", age_only);
+  replace_once(&native_age_sector_mesh, "\"arc_length_deg\":360",
+      "\"arc_length_deg\":90");
+  GpuFemmMeshArtifact native_age_sector_artifact;
+  parser_error.clear();
+  expect(ParseGpuFemmMeshArtifactJson(native_age_sector_mesh,
+             &native_age_sector_artifact, &parser_error)
+          && native_age_sector_artifact.has_native_age_sector
+          && native_age_sector_artifact.has_sliding_band
+          && native_age_sector_artifact.full_machine_sector_count == 4
+          && native_age_sector_artifact.sector_angle_deg == 90.0,
+      std::string("gpu_femm_mesh_v4 accepts 90-degree native AGE sector: ")
+          + parser_error);
+  std::string scalar_native_age_sector_mesh = native_age_sector_mesh;
+  replace_once(&scalar_native_age_sector_mesh, "\"air_gap_elements\":[{",
+      "\"air_gap_elements\":{");
+  replace_once(&scalar_native_age_sector_mesh, "}],\"node_constraints\"",
+      "},\"node_constraints\"");
+  GpuFemmMeshArtifact scalar_native_age_sector_artifact;
+  parser_error.clear();
+  expect(ParseGpuFemmMeshArtifactJson(scalar_native_age_sector_mesh,
+             &scalar_native_age_sector_artifact, &parser_error)
+          && scalar_native_age_sector_artifact.has_native_age_sector
+          && scalar_native_age_sector_artifact.model.air_gap_elements.size() == 1,
+      std::string("gpu_femm_mesh_v4 accepts MATLAB scalar native AGE spelling: ")
+          + parser_error);
+  std::string invalid_native_age_rotation = native_age_sector_mesh;
+  replace_once(&invalid_native_age_rotation, "\"node_b\":3", "\"node_b\":2");
+  GpuFemmMeshArtifact rejected_native_age_rotation;
+  parser_error.clear();
+  expect(!ParseGpuFemmMeshArtifactJson(invalid_native_age_rotation,
+             &rejected_native_age_rotation, &parser_error),
+      "gpu_femm_mesh_v4 rejects a non-rotational sector cut pair");
+  std::string reverse_canonical_native_age_rotation = native_age_sector_mesh;
+  replace_once(&reverse_canonical_native_age_rotation,
+      "\"node_a\":1,\"node_b\":3", "\"node_a\":3,\"node_b\":1");
+  GpuFemmMeshArtifact reverse_canonical_native_age_artifact;
+  parser_error.clear();
+  expect(ParseGpuFemmMeshArtifactJson(reverse_canonical_native_age_rotation,
+             &reverse_canonical_native_age_artifact, &parser_error),
+      std::string("gpu_femm_mesh_v4 accepts reverse-directed canonical 90-degree pair: ")
+          + parser_error);
   std::string scalar_sliding_mesh_artifact = sliding_mesh_artifact;
   const std::string age_array_open = "\"air_gap_elements\":[{";
   const size_t age_array_open_at = scalar_sliding_mesh_artifact.find(age_array_open);
@@ -9699,7 +9911,106 @@ int SelfTest()
           && parsed_sector_base_only.sector_performance.enabled
           && !parsed_sector_base_only.tangent_requested
           && RequestMatchesArtifact(parsed_sector_base_only, sector_artifact),
-      "motor sample v3 accepts explicit base-only zero/reference item");
+       "motor sample v3 accepts explicit base-only zero/reference item");
+  std::string native_age_sector_request_json = sector_base_only_request_json;
+  replace_once(&native_age_sector_request_json, "gpu_femm_motor_sample_v3",
+      "gpu_femm_motor_sample_v4");
+  replace_once(&native_age_sector_request_json,
+      "gpu_femm_motor_sector_performance_v1",
+      "gpu_femm_motor_sector_performance_v2");
+  replace_once(&native_age_sector_request_json, "\"rotor_angle_deg\":3",
+      "\"rotor_angle_deg\":0");
+  replace_once(&native_age_sector_request_json, "\"displacement_mm\":[0.1,0]",
+      "\"displacement_mm\":[0,0]");
+  MotorSampleRequest parsed_native_age_sector_request;
+  parser_error.clear();
+  expect(ReadMotorSampleRequestJson(native_age_sector_request_json,
+             &parsed_native_age_sector_request, &parser_error)
+          && parsed_native_age_sector_request.protocol == "gpu_femm_motor_sample_v4"
+          && !parsed_native_age_sector_request.tangent_requested,
+      std::string("motor sample v4 accepts base-only native-AGE sector item: ")
+          + parser_error);
+  MotorSampleRequest displaced_native_age_request = parsed_native_age_sector_request;
+  displaced_native_age_request.displacement_mm[0] = 0.01;
+  expect(RequestMatchesArtifact(parsed_native_age_sector_request,
+             native_age_sector_artifact)
+          && !RequestMatchesArtifact(parsed_native_age_sector_request,
+              sector_artifact)
+          && !RequestMatchesArtifact(displaced_native_age_request,
+              native_age_sector_artifact),
+      "v4 strictly binds its native-AGE mesh schema and rejects displacement");
+  std::string native_age_tangent_request_json = sector_request_json;
+  replace_once(&native_age_tangent_request_json, "gpu_femm_motor_sample_v3",
+      "gpu_femm_motor_sample_v4");
+  replace_once(&native_age_tangent_request_json,
+      "gpu_femm_motor_sector_performance_v1",
+      "gpu_femm_motor_sector_performance_v2");
+  MotorSampleRequest rejected_native_age_tangent;
+  parser_error.clear();
+  expect(!ReadMotorSampleRequestJson(native_age_tangent_request_json,
+             &rejected_native_age_tangent, &parser_error),
+      "motor sample v4 rejects tangent/suspension work");
+  GpuFemmMeshArtifact cyclic_flux_artifact = sector_artifact;
+  cyclic_flux_artifact.has_native_age_sector = true;
+  cyclic_flux_artifact.full_machine_sector_count = 4;
+  cyclic_flux_artifact.sector_boundary_sign = -1;
+  cyclic_flux_artifact.circuit_partner_indices = { 1, 2, 3, 0 };
+  cyclic_flux_artifact.circuit_partner_orientations = { 1, 1, 1, 1 };
+  const std::vector<double> cyclic_flux = ReconstructCyclicSectorCircuitFluxLinkage(
+      { 1.0, 2.0, 3.0, 4.0 }, cyclic_flux_artifact);
+  expect(cyclic_flux == std::vector<double>({ -2.0, 2.0, -2.0, 2.0 }),
+      "anti-periodic C4 circuit scatter-sum includes field sign on every copy");
+  FrozenPostprocessOptions cyclic_angle_options;
+  constexpr double kCyclicSelfTestPi = 3.141592653589793238462643383279502884;
+  cyclic_angle_options.airgap_angles_rad = { 0.0, 0.5 * kCyclicSelfTestPi,
+      kCyclicSelfTestPi, 1.5 * kCyclicSelfTestPi };
+  cyclic_flux_artifact.sector_start_angle_deg = 0.0;
+  cyclic_flux_artifact.sector_angle_deg = 90.0;
+  cyclic_flux_artifact.sector_boundary_sign = -1;
+  // Deliberately place q0 away from both global zero and the declared crop
+  // cut.  writepoly stores this local node as the predecessor that brackets
+  // global zero in its expanded/sorted virtual ring, so it must not shift the
+  // native AGE Fourier probe phase.
+  cyclic_flux_artifact.model.nodes = {
+      { std::cos(30.0 * kCyclicSelfTestPi / 180.0),
+        std::sin(30.0 * kCyclicSelfTestPi / 180.0) } };
+  AirGapElement cyclic_anchor_age;
+  cyclic_anchor_age.center_x_m = 0.0;
+  cyclic_anchor_age.center_y_m = 0.0;
+  AirGapQuadPoint cyclic_anchor_point;
+  cyclic_anchor_point.node[0] = 0;
+  cyclic_anchor_age.quad_points.push_back(cyclic_anchor_point);
+  cyclic_flux_artifact.model.air_gap_elements = { cyclic_anchor_age };
+  const std::vector<int8_t> cyclic_angle_signs =
+      MapNativeAgeSectorAirgapAnglesToRepresentative(cyclic_flux_artifact,
+          &cyclic_angle_options);
+  expect(cyclic_angle_signs == std::vector<int8_t>({ 1, -1, 1, -1 })
+          && Near(cyclic_angle_options.airgap_angles_rad[0], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[1], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[2], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[3], 0.0, 1e-14),
+      "native AGE sector preserves global-zero phase and AP copy parity");
+  cyclic_flux_artifact.sector_start_angle_deg = 15.0;
+  cyclic_angle_options.airgap_angles_rad = {
+      0.0,
+      15.0 * kCyclicSelfTestPi / 180.0,
+      90.0 * kCyclicSelfTestPi / 180.0,
+      105.0 * kCyclicSelfTestPi / 180.0,
+      -90.0 * kCyclicSelfTestPi / 180.0,
+      180.0 * kCyclicSelfTestPi / 180.0 };
+  const std::vector<int8_t> shifted_cyclic_angle_signs =
+      MapNativeAgeSectorAirgapAnglesToRepresentative(cyclic_flux_artifact,
+          &cyclic_angle_options);
+  expect(shifted_cyclic_angle_signs == std::vector<int8_t>({ 1, 1, -1, -1, -1, 1 })
+          && Near(cyclic_angle_options.airgap_angles_rad[0], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[1],
+              15.0 * kCyclicSelfTestPi / 180.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[2], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[3],
+              15.0 * kCyclicSelfTestPi / 180.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[4], 0.0, 1e-14)
+          && Near(cyclic_angle_options.airgap_angles_rad[5], 0.0, 1e-14),
+      "native AGE Br ignores crop/q0 offsets and uses global AP parity");
   const std::string mixed_sector_batch =
       std::string("{\"protocol\":\"gpu_femm_motor_batch_v3\","
           "\"max_items_per_chunk\":2,\"items\":["
@@ -11060,8 +11371,8 @@ int main(int argc, char** argv)
         << "  \"schema_version\": \"gpu_femm_capabilities_v1\",\n"
         << "  \"sample_protocol\": \"gpu_femm_planar_dc_sample_v1\",\n"
         << "  \"sample_protocols\": [\"gpu_femm_planar_dc_sample_v1\", \"gpu_femm_magnetostatic_sample_v1\"],\n"
-        << "  \"motor_sample_protocols\": [\"gpu_femm_motor_sample_v1\", \"gpu_femm_motor_sample_v2\", \"gpu_femm_motor_sample_v3\"],\n"
-        << "  \"motor_batch_protocols\": [\"gpu_femm_motor_batch_v1\", \"gpu_femm_motor_batch_v2\", \"gpu_femm_motor_batch_v3\"],\n"
+        << "  \"motor_sample_protocols\": [\"gpu_femm_motor_sample_v1\", \"gpu_femm_motor_sample_v2\", \"gpu_femm_motor_sample_v3\", \"gpu_femm_motor_sample_v4\"],\n"
+        << "  \"motor_batch_protocols\": [\"gpu_femm_motor_batch_v1\", \"gpu_femm_motor_batch_v2\", \"gpu_femm_motor_batch_v3\", \"gpu_femm_motor_batch_v4\"],\n"
         << "  \"problem_types\": [\"planar\", \"axisymmetric\"],\n"
         << "  \"frequency_hz\": [0],\n"
         << "  \"precision\": \"fp64\",\n"
@@ -11073,6 +11384,7 @@ int main(int argc, char** argv)
         << "  \"motor_sector_performance_180_v1\": true,\n"
         << "  \"motor_sector_posed_periodic_wst_v1\": true,\n"
         << "  \"motor_sector_native_age_v1\": false,\n"
+        << "  \"motor_sector_native_age_cyclic_v1\": true,\n"
         << "  \"full_field_output\": true,\n"
         << "  \"ac_complex\": false,\n"
         << "  \"axisymmetric\": true,\n"
