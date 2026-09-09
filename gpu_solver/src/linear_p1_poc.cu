@@ -232,7 +232,21 @@ bool BuildJacobiInverseDiagonal(const std::vector<double>& diagonal,
 // Row/vector work and scalar reductions are parallel.  The fixed tree avoids
 // atomics and keeps one deterministic reduction order for every batch width.
 constexpr int kPcgBlockThreads = 512;
-constexpr int kPcgCooperativeShardsPerItem = 8;
+constexpr int kPcgMaxCooperativeShardsPerItem = 32;
+constexpr int kPcgMinCooperativeRows = 4096;
+
+// Spread a small batch over SMs without assigning a mostly empty block to a
+// shard. The power-of-two partition is deterministic for this device/shape.
+// Occupancy is checked separately before any cooperative launch.
+int PcgCooperativeShardCount(int rows, size_t items, int multiprocessors)
+{
+  if (rows < kPcgMinCooperativeRows || items == 0 || items > 4 || multiprocessors <= 0) return 0;
+  const int limit = std::min({ kPcgMaxCooperativeShardsPerItem,
+      rows / kPcgBlockThreads, multiprocessors / static_cast<int>(items) });
+  int shards = 1;
+  while (shards <= limit / 2) shards *= 2;
+  return shards >= 2 ? shards : 0;
+}
 
 // Every lane owns the same strided index sequence for every batch width.  The
 // fixed pairwise tree is deterministic; its warp tail preserves the same
@@ -797,19 +811,17 @@ __global__ void CooperativeDeterministicPcgKernel(
     grid.sync();
     if (!controls[global_any_index])
       break;
+    // Each thread owns both K*p and its contribution to p'*K*p. No other
+    // thread consumes matrix_direction until the collective sum has completed.
+    double direction_matrix_local = 0.0;
     if (item_controls[kActive]) {
       for (int row = begin + lane; row < end; row += kPcgBlockThreads) {
         double sum = 0.0;
         for (int32_t entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
           sum += values[entry] * direction[column_indices[entry]];
         matrix_direction[row] = sum;
+        direction_matrix_local += direction[row] * sum;
       }
-    }
-    grid.sync();
-    double direction_matrix_local = 0.0;
-    if (item_controls[kActive]) {
-      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
-        direction_matrix_local += direction[i] * matrix_direction[i];
     }
     const double direction_matrix_sum = CooperativeItemSum(direction_matrix_local,
         reduction_scratch, partials, scalars, item, shard, shards_per_item, 2, grid);
@@ -824,19 +836,15 @@ __global__ void CooperativeDeterministicPcgKernel(
       }
     }
     grid.sync();
+    double residual_local = 0.0;
     if (item_controls[kActive]) {
       const double alpha = scalars[static_cast<size_t>(item) * 3 + 1]
           / direction_matrix_sum;
       for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
         x[i] += alpha * direction[i];
         residual[i] -= alpha * matrix_direction[i];
-      }
-    }
-    grid.sync();
-    double residual_local = 0.0;
-    if (item_controls[kActive]) {
-      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
         residual_local += residual[i] * residual[i];
+      }
     }
     const double residual_sum = CooperativeItemSum(residual_local, reduction_scratch,
         partials, scalars, item, shard, shards_per_item, 2, grid);
@@ -915,6 +923,7 @@ __global__ void CooperativeDeterministicPcgKernel(
       grid.sync();
     }
 
+    double preconditioned_local = 0.0;
     if (item_controls[kActive]) {
       for (int i = begin + lane; i < end; i += kPcgBlockThreads) {
         if constexpr (kUseInverseDiagonal)
@@ -923,13 +932,8 @@ __global__ void CooperativeDeterministicPcgKernel(
           preconditioned[i] = residual[i] / diagonal[i];
         if (item_controls[kRestart])
           direction[i] = preconditioned[i];
-      }
-    }
-    grid.sync();
-    double preconditioned_local = 0.0;
-    if (item_controls[kActive]) {
-      for (int i = begin + lane; i < end; i += kPcgBlockThreads)
         preconditioned_local += residual[i] * preconditioned[i];
+      }
     }
     const double new_rho = CooperativeItemSum(preconditioned_local, reduction_scratch,
         partials, scalars, item, shard, shards_per_item, 2, grid);
@@ -1349,8 +1353,25 @@ class GpuCsrSolver {
   {
     SolveInfo result;
     result.status = Status::kInvalidArgument;
-    if (rhs.size() != static_cast<size_t>(n_) || solution == nullptr)
+    if (!initialized_ || rhs.size() != static_cast<size_t>(n_) || solution == nullptr)
       return result;
+    // A single large equation system needs row parallelism too. Reuse the
+    // shared-operator batch implementation rather than copying K or keeping
+    // a second cooperative launch/validation path. Small fixtures retain the
+    // established single-block arithmetic; unsupported devices still fall
+    // back inside SolveCurrentOperatorBatch.
+    if (n_ >= kPcgMinCooperativeRows) {
+      std::vector<SolveInfo> infos;
+      std::vector<std::vector<double>> solutions;
+      const Status status = SolveCurrentOperatorBatch({ rhs }, relative_tolerance,
+          max_iterations, &infos, &solutions, nullptr);
+      if (status != Status::kOk) {
+        result.status = status;
+        return result;
+      }
+      *solution = std::move(solutions.front());
+      return infos.front();
+    }
     Status copy_status = CopyToDevice(rhs_.get(), rhs.data(), rhs.size() * sizeof(double));
     if (copy_status != Status::kOk) {
       result.status = copy_status;
@@ -1557,8 +1578,8 @@ class GpuCsrSolver {
   // Device nonlinear assembly writes these numeric buffers directly.  The
   // immutable CSR graph remains owned here, while this narrow API avoids a
   // host round trip for values, diagonal and RHS between Newton assembly and
-  // PCG.  It is intentionally batch-only: the established single-solve path
-  // remains the conservative reference implementation.
+  // PCG. Single-RHS callers may share the same cooperative linear solver,
+  // but still assemble and upload their operator through UpdateValues.
   Status PrepareDeviceBatch(size_t count)
   {
     if (!initialized_ || count == 0)
@@ -1672,7 +1693,7 @@ class GpuCsrSolver {
           || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
           || (status = batch_info_.allocate(count)) != Status::kOk
           || (status = batch_cooperative_partials_.allocate(
-                  count * kPcgCooperativeShardsPerItem)) != Status::kOk
+                  count * kPcgMaxCooperativeShardsPerItem)) != Status::kOk
           || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
           || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk)
         return status;
@@ -1701,7 +1722,7 @@ class GpuCsrSolver {
         || (status = batch_preconditioned_.allocate(count * n_)) != Status::kOk
         || (status = batch_matrix_direction_.allocate(count * n_)) != Status::kOk
         || (status = batch_info_.allocate(count)) != Status::kOk
-        || (status = batch_cooperative_partials_.allocate(count * kPcgCooperativeShardsPerItem)) != Status::kOk
+        || (status = batch_cooperative_partials_.allocate(count * kPcgMaxCooperativeShardsPerItem)) != Status::kOk
         || (status = batch_cooperative_scalars_.allocate(count * 3)) != Status::kOk
         || (status = batch_cooperative_controls_.allocate(count * 4 + 1)) != Status::kOk)
       return status;
@@ -1718,12 +1739,10 @@ class GpuCsrSolver {
       size_t count, size_t nnz, double relative_tolerance,
       int max_iterations, bool use_inverse_diagonal, bool shared_operator)
   {
-    // The B=32 path already occupies almost every SM on the target GPU.  This
-    // path is deliberately limited to small batches where eight shards/item
-    // can fit resident at once and increase row-level parallelism.
-    // Keep the tiny fixture/exact-bit-parity path on the established kernel;
-    // the cooperative launch overhead cannot pay back below a real motor mesh.
-    if (count == 0 || count > 4 || n_ < 4096)
+    // Keep large batches and tiny systems on the established one-block path.
+    // Small batches use a device/row-count bounded partition, independent of
+    // model type, rotor geometry, currents, or the calling application.
+    if (count == 0 || count > 4 || n_ < kPcgMinCooperativeRows)
       return CooperativeLaunchResult::kNotSupported;
     int device = 0;
     int cooperative_supported = 0;
@@ -1743,15 +1762,15 @@ class GpuCsrSolver {
               CooperativeDeterministicPcgKernel<true>, kPcgBlockThreads, 0)
         : cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm,
               CooperativeDeterministicPcgKernel<false>, kPcgBlockThreads, 0);
-    const size_t required_blocks = count * kPcgCooperativeShardsPerItem;
-    if (occupancy_status != cudaSuccess || active_blocks_per_sm <= 0
+    int shard_count = PcgCooperativeShardCount(n_, count, properties.multiProcessorCount);
+    const size_t required_blocks = count * shard_count;
+    if (shard_count == 0 || occupancy_status != cudaSuccess || active_blocks_per_sm <= 0
         || required_blocks > static_cast<size_t>(active_blocks_per_sm)
                 * static_cast<size_t>(properties.multiProcessorCount)) {
       cudaGetLastError();
       return CooperativeLaunchResult::kNotSupported;
     }
     int item_count = static_cast<int>(count);
-    int shard_count = kPcgCooperativeShardsPerItem;
     int values_per_item = shared_operator ? 0 : static_cast<int>(nnz);
     const int32_t* row_offsets = row_offsets_.get();
     const int32_t* column_indices = column_indices_.get();
@@ -8656,7 +8675,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
   // per item. Static topology/contributor routes remain covered by the 512 MiB
   // safety reserve below.
   const size_t bytes_per_item = values_per_item == 0 || nodes_per_item == 0 ? 0
-                                                                            : sizeof(double) * (values_per_item + 9 * nodes_per_item + 4 * triangles_per_item + circuits_per_item + kPcgCooperativeShardsPerItem + 3)
+                                                                            : sizeof(double) * (values_per_item + 9 * nodes_per_item + 4 * triangles_per_item + circuits_per_item + kPcgMaxCooperativeShardsPerItem + 3)
           + sizeof(int) * 5;
   const int32_t vram_limit = memory_known && bytes_per_item > 0
       ? static_cast<int32_t>(std::max<size_t>(1, std::min<size_t>(kMotorBatchMaxParallelWidth, free_bytes > kMotorBatchSafetyReserveBytes ? (free_bytes - kMotorBatchSafetyReserveBytes) / bytes_per_item : 1)))
@@ -9356,9 +9375,11 @@ bool SameBits(const SolveResult& left, const SolveResult& right)
       && std::memcmp(left.bx_t.data(), right.bx_t.data(), left.bx_t.size() * sizeof(double)) == 0 && std::memcmp(left.by_t.data(), right.by_t.data(), left.by_t.size() * sizeof(double)) == 0;
 }
 
+#include "pcg_regression_tests.inc"
+
 int SelfTest()
 {
-  int failures = 0;
+  int failures = PcgRegressionTests(67) + PcgRegressionTests(129);
   auto expect = [&failures](bool condition, const std::string& message) {
     if (!condition) {
       std::cerr << "FAIL: " << message << '\n';

@@ -149,6 +149,10 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_femm_gpu_prepare.py"
     )
+    add_test(NAME gpu_femm_benchmark_parity_gate
+      COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_saved_batch.py"
+    )
   endif()
   set_tests_properties(gpu_linear_p1_selftest PROPERTIES
     LABELS "gpu;requires_cuda"
@@ -185,6 +189,10 @@ if(BUILD_TESTING)
     )
     set_tests_properties(gpu_femm_project_neutral_prepare PROPERTIES
       LABELS "gpu;cli;no_cuda"
+      TIMEOUT 10
+    )
+    set_tests_properties(gpu_femm_benchmark_parity_gate PROPERTIES
+      LABELS "gpu;no_cuda;benchmark"
       TIMEOUT 10
     )
   endif()

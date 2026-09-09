@@ -56,6 +56,13 @@ includes host assembly and CUDA work; it is not part of the primary batched
 GPU timing counters. Use a new executable path when adopting a different
 solver build, and keep any caller-side binary fingerprint validation intact.
 
+Large single-RHS solves and small batches share the same cooperative CUDA PCG
+implementation. Row partitioning uses matrix size and GPU capacity, not motor
+geometry or an application's worker count. Devices that cannot support the
+cooperative launch retain the single-block path. See
+[PCG implementation and benchmarks](gpu_solver/PERFORMANCE.md) for the measured
+changes and validation procedure.
+
 ## Requirements
 
 The current Windows build has been tested with:

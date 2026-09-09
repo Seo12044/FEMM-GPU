@@ -411,12 +411,25 @@ certificate SHA.
   quadrature points; signed constraints assemble directly in reduced CSR.
 - Auto mode keeps small one-off workloads on the host and retries the exact
   Newton iteration there if device-plan setup or execution fails.
-- Supported GPUs can use cooperative multi-block PCG for small batches on
-  large meshes. Other cases use the deterministic fallback kernel.
+- Supported GPUs use cooperative multi-block PCG for a large single RHS as
+  well as small batches. The common CSR solver chooses a power-of-two row
+  partition from the matrix size and device SM count (up to 32 shards per
+  RHS), then checks cooperative-launch support and resident-grid capacity.
+  Other cases use the existing single-block-per-RHS kernel. No model-specific
+  dimensions, circuit counts, or application settings select this path.
+- Row-local PCG updates and their norm/dot-product contributions are fused.
+  Cross-row barriers, fixed-tree reductions, true linear-residual verification,
+  and nonlinear tolerances are retained. The same device, executable, and
+  batch shape repeat deterministically; different partitions need not produce
+  bit-identical intermediate iterates.
 - V1 force and torque use a default weighted-stress mask; radial air-gap B uses
   smoothed nodal values from the P1 element field.
 - V2 force, torque, and radial air-gap B use the native air-gap element Fourier
   reconstruction.
+
+Performance evidence and the short saved-request A/B procedure are recorded in
+[PERFORMANCE.md](PERFORMANCE.md). A new binary has a new executable hash; callers
+must preserve that provenance instead of rebinding an older checkpoint.
 
 ## Status codes
 
