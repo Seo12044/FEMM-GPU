@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.18)
 
+# Standalone CUDA builds need their own project/test initialization. When
+# included by the legacy FEMM project, retain the parent's configuration.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(FemmGpuStandalone LANGUAGES CXX)
+  include(CTest)
+endif()
+
 # Kept separate from the legacy MFC targets so a normal FEMM build never
 # requires a CUDA toolkit. Leave empty to use the CUDA toolchain default.
 set(GPU_SOLVER_CUDA_ARCHITECTURES "" CACHE STRING
@@ -123,7 +130,7 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_BINARY_DIR}/nonlinear_pm_coil_single_sample_response.json"
   )
   set_tests_properties(gpu_nonlinear_p1_single_sample_adapter PROPERTIES
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
   )
   add_test(NAME gpu_bh_curve_35pn230
     COMMAND $<TARGET_FILE:gpu_bh_curve_poc> --fixture

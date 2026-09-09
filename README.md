@@ -37,6 +37,25 @@ are not supported. The
 standalone preparer accepts `.fem` files only when every feature can be mapped
 exactly to this supported subset.
 
+## Nonlinear convergence
+
+Production solves first use the existing batched Newton iteration. An item
+that exhausts its nonlinear iteration budget gets one bounded, residual-based
+Newton recovery. Backtracking accepts a step only when it reduces the magnetic
+equation residual. Recovery uses the reference host assembler and CUDA PCG;
+it is not a CPU FEMM fallback. Already-converged batch items are unchanged.
+
+Recovery must satisfy both the original relative undamped-step threshold
+(`1e-6`) and a relative equation-residual threshold (`1e-8`). It does not change
+materials, currents, mesh, boundary conditions, or acceptance tolerances.
+Invalid inputs and linear-solver failures do not enter nonlinear recovery.
+An exhausted recovery still returns `NONLINEAR_SOLVE_NOT_CONVERGED`.
+
+Batch profiling reports `nonlinear_recovery_seconds` separately. This span
+includes host assembly and CUDA work; it is not part of the primary batched
+GPU timing counters. Use a new executable path when adopting a different
+solver build, and keep any caller-side binary fingerprint validation intact.
+
 ## Requirements
 
 The current Windows build has been tested with:

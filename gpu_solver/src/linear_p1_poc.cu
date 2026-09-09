@@ -2147,6 +2147,7 @@ struct NonlinearOptions {
   int max_newton_iterations = 32;
   int max_linear_iterations = 128;
   double linear_relative_tolerance = 1e-13;
+  bool recover_nonconvergence = false;
 };
 
 constexpr double kMu0 = 4.0e-7 * 3.141592653589793238462643383279502884;
@@ -2170,6 +2171,7 @@ NonlinearOptions ProductionSampleOptions()
   options.max_newton_iterations = 128;
   options.linear_relative_tolerance = kMotorLinearRelativeTolerance;
   options.max_linear_iterations = kMotorMaxLinearIterations;
+  options.recover_nonconvergence = true;
   return options;
 }
 
@@ -2179,6 +2181,7 @@ struct NonlinearSolveResult {
   std::vector<double> bx_t;
   std::vector<double> by_t;
   std::vector<double> residual_history;
+  double verified_equation_residual_relative = std::numeric_limits<double>::infinity();
   std::vector<double> circuit_currents_a;
   std::vector<double> circuit_flux_linkage_wb;
   // Compatibility field for frozen single-circuit callers only.
@@ -3165,6 +3168,7 @@ struct NonlinearBatchTiming {
   double gpu_download_seconds = 0.0;
   double state_update_seconds = 0.0;
   double finalize_seconds = 0.0;
+  double recovery_seconds = 0.0;
 };
 
 enum class NonlinearAssemblyMode { kAuto,
@@ -3293,6 +3297,8 @@ class NonlinearP1FixtureSolver {
     result.a_wb_per_m = std::move(a);
     return FinalizeResult(&result);
   }
+
+  #include "safeguarded_nonlinear_solve.inc"
 
   // Independent nonlinear states share one immutable symbolic CSR and device
   // assembly plan. Every active state is dispatched in one batched assembly
@@ -3619,6 +3625,19 @@ class NonlinearP1FixtureSolver {
         if (timing != nullptr)
           timing->finalize_seconds += ProfileSecondsSince(finalize_start);
       }
+    if (options.recover_nonconvergence && options.max_newton_iterations > 0) {
+      for (size_t item = 0; item < results.size(); ++item) {
+        if (results[item].info.status != Status::kNonlinearSolveNotConverged)
+          continue;
+        const int original_iterations = results[item].info.iterations;
+        const ProfileClock::time_point recovery_start = ProfileClock::now();
+        NonlinearSolveResult recovered = SolveSafeguarded(currents[item], options);
+        if (timing != nullptr)
+          timing->recovery_seconds += ProfileSecondsSince(recovery_start);
+        recovered.info.iterations += original_iterations;
+        results[item] = std::move(recovered);
+      }
+    }
     return results;
   }
 
@@ -8546,6 +8565,7 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
            << ", \"gpu_download_seconds\": " << timing->nonlinear.gpu_download_seconds
            << ", \"state_update_seconds\": " << timing->nonlinear.state_update_seconds
            << ", \"finalize_seconds\": " << timing->nonlinear.finalize_seconds
+           << ", \"nonlinear_recovery_seconds\": " << timing->nonlinear.recovery_seconds
            << ", \"postprocess_plan_compute_seconds\": "
            << timing->postprocess_plan_compute_seconds
            << ", \"postprocess_plan_seconds\": "
@@ -8873,6 +8893,7 @@ int MotorBatchAdapter(const std::string& request_path, const std::string& respon
       timing.nonlinear.gpu_download_seconds += chunk_timing.gpu_download_seconds;
       timing.nonlinear.state_update_seconds += chunk_timing.state_update_seconds;
       timing.nonlinear.finalize_seconds += chunk_timing.finalize_seconds;
+      timing.nonlinear.recovery_seconds += chunk_timing.recovery_seconds;
       for (size_t local = 0; local < group.size(); ++local) {
         const MotorBatchPreparedItem& prepared_item = prepared[group[local]];
         const size_t index = prepared_item.request_index;
@@ -11237,6 +11258,32 @@ int SelfTest()
     const NonlinearSolveResult nonlinear_limited = nonlinear_solver.Solve(2.0, no_iterations);
     expect(nonlinear_limited.info.status == Status::kNonlinearSolveNotConverged,
         "nonlinear iteration cap returns NONLINEAR_SOLVE_NOT_CONVERGED");
+    const NonlinearSolveResult guarded = nonlinear_solver.SolveSafeguarded({ 2.0 }, {});
+    expect(guarded.info.status == Status::kOk
+            && guarded.verified_equation_residual_relative <= 1e-12,
+        "safeguarded Newton verifies the nonlinear equations at the returned state");
+    expect(guarded.a_wb_per_m.size() == nonlinear.a_wb_per_m.size()
+            && Near(guarded.flux_linkage_wb, nonlinear.flux_linkage_wb, 1e-9),
+        "safeguarded nonlinear PM/coil recovery matches reference flux");
+    const NonlinearSolveResult guarded_limited = nonlinear_solver.SolveSafeguarded({ 2.0 }, no_iterations);
+    expect(guarded_limited.info.status == Status::kNonlinearSolveNotConverged,
+        "safeguarded recovery obeys the nonlinear iteration budget");
+    no_iterations.recover_nonconvergence = true;
+    const auto bounded = nonlinear_solver.SolveBatch({ { 2.0 } }, no_iterations);
+    expect(bounded[0].info.status == Status::kNonlinearSolveNotConverged
+            && bounded[0].info.iterations == 0,
+        "automatic recovery cannot bypass a zero iteration budget");
+    const auto normal = nonlinear_solver.SolveBatch({ { 2.0 }, { -2.0 } }, ProductionSampleOptions());
+    NonlinearOptions no_recovery = ProductionSampleOptions();
+    no_recovery.recover_nonconvergence = false;
+    const auto control = nonlinear_solver.SolveBatch({ { 2.0 }, { -2.0 } }, no_recovery);
+    expect(normal[0].info.status == Status::kOk && normal[1].info.status == Status::kOk
+            && normal[0].a_wb_per_m == control[0].a_wb_per_m
+            && normal[1].a_wb_per_m == control[1].a_wb_per_m,
+        "recovery leaves already converged batch states bit-identical");
+    expect(nonlinear_solver.SolveSafeguarded({ std::numeric_limits<double>::infinity() }, {}).info.status
+            == Status::kInvalidArgument,
+        "safeguarded recovery rejects nonfinite current input");
   }
 
   NonlinearModel invalid_circuit = NonlinearTwoCircuitFixture();
