@@ -20,7 +20,7 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def compare(reference, actual, path="", differences=None):
+def compare(reference, actual, path="", differences=None, violations=None):
     if differences is None:
         differences = {}
     if isinstance(reference, dict):
@@ -29,21 +29,23 @@ def compare(reference, actual, path="", differences=None):
         for key in reference:
             if key in ("timing", "cache", "convergence"):
                 continue
-            compare(reference[key], actual[key], f"{path}.{key}", differences)
+            compare(reference[key], actual[key], f"{path}.{key}", differences, violations)
     elif isinstance(reference, list):
         assert isinstance(actual, list), f"{path}: expected array"
         assert len(reference) == len(actual), f"{path}: array length changed"
         for a, b in zip(reference, actual):
-            compare(a, b, path, differences)
+            compare(a, b, path, differences, violations)
     elif isinstance(reference, float):
         assert isinstance(actual, (float, int)) and not isinstance(actual, bool), path
         assert math.isfinite(reference) and math.isfinite(actual), path
         delta = abs(reference - actual)
         differences[path] = max(differences.get(path, 0.0), delta)
         # A numerical comparison gate, never a production convergence setting.
-        assert math.isclose(reference, actual, rel_tol=1e-8, abs_tol=1e-9), (
-            f"{path}: {reference} != {actual} (absolute difference {delta})"
-        )
+        if not math.isclose(reference, actual, rel_tol=1e-8, abs_tol=1e-9):
+            error = f"{path}: {reference} != {actual} (absolute difference {delta})"
+            if violations is None:
+                raise AssertionError(error)
+            violations.append(error)
     else:
         assert type(reference) is type(actual), f"{path}: value type changed"
         assert reference == actual, f"{path}: {reference!r} != {actual!r}"
@@ -54,21 +56,39 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
+    for label in ("baseline", "candidate"):
+        parser.add_argument(f"--{label}-preconditioner", choices=("jacobi", "block-jacobi"))
     parser.add_argument("--request", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--continue-on-parity-failure", action="store_true",
+                        help="Collect numeric mismatches; report/exit still FAIL. Solver failures still stop.")
     args = parser.parse_args()
     assert args.rounds > 0 and args.timeout > 0
     args.output.mkdir(parents=True, exist_ok=False)
     executables = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     report = {"status": "RUNNING", "requested_count": len(args.request),
-              "executables": {k: {"path": str(v), "sha256": sha256(v)}
+              "executables": {k: {"path": str(v), "sha256": sha256(v),
+                                  "preconditioner": getattr(args, f"{k}_preconditioner")}
                               for k, v in executables.items()}, "requests": []}
     (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    try:
+        run_requests(args, executables, report)
+        assert report["status"] == "PASS", "observable parity failed; see retained report"
+    except BaseException as error:
+        report["status"] = "FAILED"
+        report["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def run_requests(args, executables, report):
     for index, request in enumerate(args.request):
         request = request.resolve()
         evidence = {"path": str(request), "sha256": sha256(request), "runs": []}
+        report["requests"].append(evidence)
         reference = None
         maxima = {}
         for repeat in range(args.rounds):
@@ -76,8 +96,13 @@ def main():
             for label in order:
                 output = args.output / f"request_{index:02d}_{label}_{repeat}.json"
                 start = time.perf_counter()
+                command = [str(executables[label])]
+                mode = getattr(args, f"{label}_preconditioner")
+                if mode is not None:
+                    command += ["--preconditioner", mode]
+                command += ["--motor-batch-profile", str(request), str(output)]
                 completed = subprocess.run(
-                    [str(executables[label]), "--motor-batch-profile", str(request), str(output)],
+                    command,
                     capture_output=True, timeout=args.timeout,
                 )
                 elapsed = time.perf_counter() - start
@@ -91,13 +116,16 @@ def main():
                     assert math.isfinite(residual) and 0 <= residual < 1e-6
                 if reference is None:
                     reference = response
-                compare(reference, response, differences=maxima)
+                violations = []
+                compare(reference, response, differences=maxima,
+                        violations=violations if args.continue_on_parity_failure else None)
                 record = {"binary": label, "round": repeat, "wall_seconds": elapsed,
+                          "parity": "FAIL" if violations else "PASS", "parity_errors": violations,
                           "timing": response["timing"],
                           "iterations": [x["response"]["convergence"]["iterations"]
                                          for x in response["items"]]}
                 evidence["runs"].append(record)
-                print(f"{request.name} {label} {repeat}: {elapsed:.3f} s; parity PASS", flush=True)
+                print(f"{request.name} {label} {repeat}: {elapsed:.3f} s; parity {record['parity']}", flush=True)
         assert sha256(request) == evidence["sha256"], "request changed during benchmark"
         evidence["max_absolute_differences"] = maxima
         evidence["median_wall_seconds"] = {
@@ -105,12 +133,11 @@ def main():
             for label in executables}
         evidence["speedup"] = (evidence["median_wall_seconds"]["baseline"]
                                / evidence["median_wall_seconds"]["candidate"])
-        report["requests"].append(evidence)
         (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     for label, exe in executables.items():
         assert sha256(exe) == report["executables"][label]["sha256"], "binary changed during benchmark"
-    report["status"] = "PASS"
-    (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report["status"] = "FAIL" if any(run["parity"] == "FAIL" for request in report["requests"]
+                                     for run in request["runs"]) else "PASS"
 
 
 if __name__ == "__main__":

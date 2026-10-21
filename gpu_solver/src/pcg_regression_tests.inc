@@ -1,6 +1,6 @@
 // Included by SelfTest after the CSR solver is defined. Synthetic SPD systems
 // exercise row/shard tails and cross-shard dependencies without any FEMM/CAD run.
-int PcgRegressionTests(int side)
+int PcgRegressionTests(int side, PcgPreconditioner mode = PcgPreconditioner::kJacobi)
 {
   int failures = 0;
   auto expect = [&failures](bool ok, const char* message) {
@@ -56,7 +56,7 @@ int PcgRegressionTests(int side)
     exact[row] = std::sin(0.17 * row) + 0.3 * std::cos(0.071 * row);
   }
   const auto rhs = multiply(matrix, exact);
-  GpuCsrSolver solver;
+  GpuCsrSolver solver(mode);
   expect(solver.Initialize(matrix) == Status::kOk, "large synthetic CSR initialize");
   std::vector<double> single;
   SolveInfo single_info = solver.Solve(rhs, 1e-10, 2000, &single);
@@ -121,6 +121,12 @@ int PcgRegressionTests(int side)
   expect(solver.UpdateValues(indefinite) == Status::kOk
           && solver.Solve(rhs, 1e-10, 10, &output).status == Status::kLinearSolveBreakdown,
       "large bad diagonal retains breakdown status");
+  expect(solver.Solve(nonfinite_rhs, 1e-10, 10, &output).status == Status::kNumericalNonfinite,
+      "earlier nonfinite RHS takes precedence over negative diagonal");
+  nonfinite_rhs[17] = rhs[17];
+  nonfinite_rhs[count - 1] = std::numeric_limits<double>::quiet_NaN();
+  expect(solver.Solve(nonfinite_rhs, 1e-10, 10, &output).status == Status::kLinearSolveBreakdown,
+      "earlier negative diagonal takes precedence over later nonfinite RHS");
   expect(solver.UpdateValues(matrix) == Status::kOk, "restore valid operator");
   const SolveInfo restored = solver.Solve(rhs, 1e-10, 2000, &output);
   expect(verified(matrix, rhs, output, restored),

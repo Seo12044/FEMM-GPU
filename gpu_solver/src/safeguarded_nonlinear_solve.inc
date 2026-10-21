@@ -57,6 +57,8 @@ NonlinearSolveResult SolveSafeguarded(const std::vector<double>& currents,
     std::vector<double> free_solution;
     const SolveInfo linear = recovery_solver.Solve(rhs, options.linear_relative_tolerance,
         options.max_linear_iterations, &free_solution);
+    result.linear_iterations += linear.iterations;
+    result.last_linear_tolerance = options.linear_relative_tolerance;
     if (linear.status != Status::kOk) { result.info = linear; break; }
     const std::vector<double> candidate = ExpandAssemblySolution(assembly, free_solution);
     double step_norm = 0.0, candidate_norm = 0.0;

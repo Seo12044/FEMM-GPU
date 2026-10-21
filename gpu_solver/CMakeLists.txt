@@ -19,6 +19,19 @@ add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
   src/native_airgap_matrix.cpp
 )
+# CUDA's Visual Studio dependency scanner can omit local .inc/.cuh includes.
+# List them explicitly so an incremental build cannot test an old kernel.
+if(CMAKE_GENERATOR MATCHES "Visual Studio" AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
+  set(GPU_SOLVER_CUDA_HEADERS
+    axisymmetric_p1.h native_airgap_matrix.h signed_node_constraints.h
+    safeguarded_nonlinear_solve.inc pcg_regression_tests.inc
+    nonlinear_tolerance_tests.inc block_preconditioner_tests.inc
+    block_jacobi_preconditioner.cuh pcg_spmv_layout.cuh pcg_spmv_layout_tests.inc)
+  list(TRANSFORM GPU_SOLVER_CUDA_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/src/")
+  string(REPLACE ";" "\\;" GPU_SOLVER_CUDA_HEADERS "${GPU_SOLVER_CUDA_HEADERS}")
+  set_property(SOURCE src/linear_p1_poc.cu APPEND PROPERTY VS_SETTINGS
+    "AdditionalDependencies=${GPU_SOLVER_CUDA_HEADERS}")
+endif()
 # Keep the historical executable name for the MATLAB integration and publish
 # a neutral name for standalone users.  Both files are byte-identical.
 add_custom_command(TARGET gpu_linear_p1_poc POST_BUILD
@@ -110,6 +123,12 @@ if(BUILD_TESTING)
   add_test(NAME gpu_linear_p1_selftest
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --self-test
   )
+  add_test(NAME gpu_block_jacobi_selftest
+    COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --preconditioner block-jacobi --self-test
+  )
+  set_tests_properties(gpu_block_jacobi_selftest PROPERTIES
+    LABELS "gpu;requires_cuda;preconditioner" TIMEOUT 30
+  )
   add_test(NAME gpu_linear_p1_femm_reference
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --femm-reference
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/linear_square_v1/linear_square"
@@ -118,6 +137,15 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --nonlinear-reference
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
+  )
+  add_test(NAME gpu_block_jacobi_nonlinear_reference
+    COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --preconditioner block-jacobi --nonlinear-reference
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1"
+  )
+  set_tests_properties(gpu_block_jacobi_nonlinear_reference PROPERTIES
+    LABELS "gpu;requires_cuda;femm_fixture;nonlinear;preconditioner"
+    TIMEOUT 30
   )
   add_test(NAME gpu_nonlinear_p1_postprocess_reference
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --postprocess-reference
@@ -140,6 +168,13 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:gpu_femm_mesh_noop_solver> ignored-mesh-stem
   )
   if(Python3_Interpreter_FOUND)
+    add_test(NAME gpu_preconditioner_cli
+      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_preconditioner_cli.py"
+        $<TARGET_FILE:gpu_linear_p1_poc>
+    )
+    set_tests_properties(gpu_preconditioner_cli PROPERTIES
+      LABELS "gpu;cli;requires_cuda;preconditioner" TIMEOUT 120
+    )
     add_test(NAME gpu_femm_project_neutral_cli
       COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_femm_gpu_cli.py"

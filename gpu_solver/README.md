@@ -26,6 +26,41 @@ start.
 `gpu_bh_curve_poc --fixture <directory>` tests B-H preprocessing and
 interpolation separately.
 
+The default Jacobi path uses fused PCG vector work and a bounded hybrid
+Sliced-ELL/CSR memory layout for larger systems. It keeps FP64, each row's
+entry order and the true-residual convergence checks. No input setting is
+needed. See [PERFORMANCE.md](PERFORMANCE.md) for validation and measured
+saved-motor results; this optimization is separate from block-Jacobi below.
+
+### Preconditioner selection
+
+The default is still Jacobi. An experimental FP64 8-node block-Jacobi
+preconditioner can be selected before any command:
+
+```powershell
+femm_gpu.exe --preconditioner jacobi --motor-batch-profile request.json jacobi.json
+femm_gpu.exe --preconditioner block-jacobi --motor-batch-profile request.json block.json
+```
+
+The block option uses Cholesky inverses of contiguous principal submatrices.
+It shares factors across equal numeric operators and retains them between
+solves. A different CSR structure or coefficient invalidates reuse; sharing
+a mesh alone is insufficient. Unfactorable blocks use a counted diagonal
+fallback, while PCG still validates the original equation and diagonal.
+
+This option is not automatically faster. It helps the manufactured coupled
+matrix test but is slower on the saved motor workloads tested so far, and
+some force components exceed the strict binary-to-binary comparison gate.
+See [PERFORMANCE.md](PERFORMANCE.md) before using it for a production campaign.
+No MATLAB launcher setting is changed. Standalone callers that cache results
+must include the command-line preconditioner choice in their run identity.
+
+The batch profile records the mode, block size, construction/reuse/fallback
+counts, setup time, and returned nonlinear PCG iteration counts. Setup counts
+cover the normal batched nonlinear path, not separately executed recovery or
+tangent solves. Existing request schemas and final convergence tolerances
+are unchanged.
+
 ## `gpu_femm_planar_dc_mesh_v1`
 
 This neutral artifact contains `source_fem_sha256`, model/mesh/material data,
@@ -405,7 +440,8 @@ certificate SHA.
   contributions use a fixed reduction order.
 - The established host nonlinear assembly remains available and is selected
   automatically if device-plan setup or execution fails.
-- Linear systems use a GPU-resident CSR Jacobi-PCG solver.
+- Linear systems use GPU-resident Jacobi-PCG by default. Assembly retains CSR;
+  matrix-vector products use the bounded hybrid Sliced-ELL/CSR layout above.
 - Planar, axisymmetric, and signed-periodic numeric operators share the same
   deterministic device-assembly plan. Axisymmetric elements use seven stored
   quadrature points; signed constraints assemble directly in reduced CSR.
