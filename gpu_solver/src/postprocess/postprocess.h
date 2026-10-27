@@ -88,6 +88,18 @@ bool TriangleBarycentric(const Node p[3], double x_m, double y_m, double lambda[
 Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostprocessOptions &options,
                                std::vector<double> *mask);
 
+// CPU topology preparation is independent of magnetic current states. Only
+// SolveWeightedStressMask touches CUDA; the caller owns the prepared value.
+struct PreparedWeightedStressMask {
+  Assembly assembly;
+  std::vector<double> fixed_mask;
+};
+Status PrepareWeightedStressMask(const NonlinearModel &model,
+                                 const FrozenPostprocessOptions &options,
+                                 PreparedWeightedStressMask *prepared);
+Status SolveWeightedStressMask(const PreparedWeightedStressMask &prepared,
+                               const FrozenPostprocessOptions &options, std::vector<double> *mask);
+
 bool SmoothedElementB(const NonlinearModel &model, const std::vector<double> &a,
                       const std::vector<double> &bx, const std::vector<double> &by,
                       const std::vector<std::vector<int32_t>> &incident,
@@ -99,6 +111,9 @@ bool FrozenPostprocessPlanMatches(const FrozenPostprocessPlan &plan, const Nonli
 Status BuildFrozenPostprocessPlan(const NonlinearModel &model,
                                   const FrozenPostprocessOptions &options,
                                   FrozenPostprocessPlan *plan);
+Status BuildFrozenPostprocessPlanWithMask(const NonlinearModel &model,
+                                          const FrozenPostprocessOptions &options,
+                                          std::vector<double> mask, FrozenPostprocessPlan *plan);
 FrozenPostprocessResult
 ComputeFrozenPostprocess(const NonlinearModel &model, const NonlinearSolveResult &solution,
                          const FrozenPostprocessOptions &options,

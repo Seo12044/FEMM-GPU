@@ -33,6 +33,26 @@ def worker(jobs):
 
 
 class MotorWorkerTests(unittest.TestCase):
+    def test_prefetched_mask_selection_failure_is_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = []
+            for index, selected in enumerate((20, 21, 20)):
+                value = request()
+                value["items"][0]["request"]["selected_group_number"] = selected
+                path = root/f"input_{index}.json"
+                path.write_text(json.dumps(value), encoding="utf-8")
+                jobs.append(dict(session="a"*64, sequence=index+1, request_path=str(path),
+                                 response_path=str(root/f"response_{index}.json"),
+                                 request_sha256=sha256(path)))
+            ack = worker(jobs)
+            self.assertEqual([a["exit_code"] for a in ack], [0, 1, 0])
+            responses = [json.loads((root/f"response_{i}.json").read_text()) for i in range(3)]
+            self.assertEqual(responses[1]["status"], "FAIL")
+            compare(responses[0], responses[2], strict=True)
+            for job in jobs:
+                self.assertEqual(sha256(job["request_path"]), job["request_sha256"])
+
     def test_queue_preserves_all_fields_convergence_and_counters(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

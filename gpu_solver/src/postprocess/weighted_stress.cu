@@ -21,10 +21,11 @@ bool IsAirPostprocessMaterial(const NonlinearMaterial &material,
                                        : material_index == options.air_material_label;
 }
 
-Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostprocessOptions &options,
-                               std::vector<double> *mask)
+Status PrepareWeightedStressMask(const NonlinearModel &model,
+                                 const FrozenPostprocessOptions &options,
+                                 PreparedWeightedStressMask *prepared)
 {
-  if (mask == nullptr ||
+  if (prepared == nullptr ||
       ((options.selected_group_number < 0) &&
        (options.selected_material_label < 0 ||
         static_cast<size_t>(options.selected_material_label) >= model.materials.size())) ||
@@ -38,6 +39,8 @@ Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostproc
       !(options.mask_relative_tolerance > 0.0) || !std::isfinite(options.mask_relative_tolerance) ||
       options.max_mask_iterations <= 0)
     return Status::kInvalidArgument;
+
+  *prepared = PreparedWeightedStressMask{};
 
   const Status validation = ValidateNonlinearModel(model);
   if (validation != Status::kOk)
@@ -123,9 +126,9 @@ Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostproc
   if (sparse_validation != Status::kOk)
     return sparse_validation;
   if (std::all_of(fixed.begin(), fixed.end(), [](double value) { return std::isfinite(value); })) {
-    mask->assign(node_count, 0.0);
+    prepared->fixed_mask.assign(node_count, 0.0);
     for (size_t node = 0; node < node_count; ++node)
-      (*mask)[node] = fixed[node] > 0.5 ? 1.0 : 0.0;
+      prepared->fixed_mask[node] = fixed[node] > 0.5 ? 1.0 : 0.0;
     return Status::kOk;
   }
   // The weighting field is a scalar geometric mask.  It is periodic across a
@@ -144,11 +147,21 @@ Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostproc
       mask_model.dirichlet_a_wb_per_m.push_back(fixed[node]);
     }
   }
-  Assembly assembly;
   const std::vector<double> full_rhs(node_count, 0.0);
-  const Status reduction = ReduceSignedSystem(mask_model, stiffness, full_rhs, &assembly);
-  if (reduction != Status::kOk)
-    return reduction;
+  return ReduceSignedSystem(mask_model, stiffness, full_rhs, &prepared->assembly);
+}
+
+Status SolveWeightedStressMask(const PreparedWeightedStressMask &prepared,
+                               const FrozenPostprocessOptions &options, std::vector<double> *mask)
+{
+  if (!mask || !(options.mask_relative_tolerance > 0) ||
+      !std::isfinite(options.mask_relative_tolerance) || options.max_mask_iterations <= 0)
+    return Status::kInvalidArgument;
+  if (!prepared.fixed_mask.empty()) {
+    *mask = prepared.fixed_mask;
+    return Status::kOk;
+  }
+  const Assembly &assembly = prepared.assembly;
   GpuCsrSolver solver;
   const Status initialize = solver.Initialize(assembly);
   if (initialize != Status::kOk)
@@ -167,6 +180,16 @@ Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostproc
   for (double &value : *mask)
     value = value > 0.5 ? 1.0 : 0.0;
   return Status::kOk;
+}
+
+Status BuildWeightedStressMask(const NonlinearModel &model, const FrozenPostprocessOptions &options,
+                               std::vector<double> *mask)
+{
+  if (!mask)
+    return Status::kInvalidArgument;
+  PreparedWeightedStressMask prepared;
+  const Status status = PrepareWeightedStressMask(model, options, &prepared);
+  return status == Status::kOk ? SolveWeightedStressMask(prepared, options, mask) : status;
 }
 
 } // namespace gpu_femm

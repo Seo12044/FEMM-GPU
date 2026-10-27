@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--linear-solver", choices=("pcg", "cudss"), default="pcg")
+    parser.add_argument("--baseline-transport", choices=("one-shot", "stream"), default="one-shot")
     parser.add_argument("--request", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
@@ -53,7 +54,9 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     requests = [path.resolve() for path in args.request]
-    report = dict(status="RUNNING", runs=[], requests=[dict(path=str(p), sha256=sha256(p))
+    report = dict(status="RUNNING", baseline_transport=args.baseline_transport,
+                  maximum_differences={}, runs=[],
+                  requests=[dict(path=str(p), sha256=sha256(p))
                   for p in requests], binaries={name: dict(path=str(path), sha256=sha256(path))
                   for name, path in (("baseline", args.baseline), ("candidate", args.candidate))})
     reference = None
@@ -63,8 +66,9 @@ def main():
             for label in order:
                 outputs = [args.output/f"{label}_{repeat}_{i:03d}.json" for i in range(len(requests))]
                 start = time.perf_counter()
-                if label == "candidate":
-                    ack = run_stream(args.candidate, args.linear_solver, requests, outputs, args.timeout)
+                if label == "candidate" or args.baseline_transport == "stream":
+                    executable = args.candidate if label == "candidate" else args.baseline
+                    ack = run_stream(executable, args.linear_solver, requests, outputs, args.timeout)
                 else:
                     ack = []
                     for request, output in zip(requests, outputs):
@@ -82,7 +86,8 @@ def main():
                 if reference is None:
                     reference = responses
                 for before, after in zip(reference, responses):
-                    compare(before, after, strict=True)
+                    compare(before, after, strict=True,
+                            differences=report["maximum_differences"])
                 report["runs"].append(dict(mode=label, round=repeat, wall_seconds=elapsed,
                                            acknowledgements=ack, strict_parity="PASS"))
                 print(f"{label} round {repeat}: {elapsed:.3f} s, strict parity PASS", flush=True)

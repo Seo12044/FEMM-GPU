@@ -1,5 +1,7 @@
 #include "app/motor_batch.h"
 #include "app/sample_adapter.h"
+#include "app/cpu_task.h"
+#include "core/profile.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,6 +22,47 @@
 
 namespace gpu_femm
 {
+
+void PrefetchMotorBatchMasks(MotorBatchPrefetch *input)
+{
+  std::vector<std::future<MotorBatchPrefetch::MaskPreparation>> pending;
+  std::vector<std::string> keys;
+  for (size_t index = 0; index < input->request.items.size() && keys.size() < 4; ++index) {
+    const auto &item = input->request.items[index].request;
+    const auto &load = *input->loads[input->load_plan.item_slots[index]];
+    if (load.status != Status::kOk || load.artifact.has_sliding_band ||
+        load.artifact_sha256 != item.mesh_artifact_sha256 ||
+        !RequestMatchesArtifact(item, load.artifact))
+      continue;
+    NonlinearModel model;
+    if (!ApplySlidingBandRotorAngle(item, load.artifact, &model))
+      continue;
+    const std::string key = MotorBatchOperatorKey(item, load, model);
+    const std::string selection = key + ":" + std::to_string(item.selected_group_number) + ":" +
+                                  std::to_string(item.air_group_number);
+    if (std::find(keys.begin(), keys.end(), selection) != keys.end())
+      continue;
+    keys.push_back(selection);
+    pending.push_back(LaunchCpuTask([key, item, model = std::move(model)]() {
+      MotorBatchPrefetch::MaskPreparation result;
+      result.operator_key = key;
+      result.selected_group_number = item.selected_group_number;
+      result.air_group_number = item.air_group_number;
+      FrozenPostprocessOptions options;
+      options.selected_group_number = item.selected_group_number;
+      options.air_group_number = item.air_group_number;
+      options.max_mask_iterations = 4096;
+      auto mask = std::make_shared<PreparedWeightedStressMask>();
+      const auto start = ProfileClock::now();
+      result.status = PrepareWeightedStressMask(model, options, mask.get());
+      result.compute_seconds = ProfileSecondsSince(start);
+      result.mask = std::move(mask);
+      return result;
+    }));
+  }
+  for (auto &future : pending)
+    input->masks.push_back(future.get());
+}
 
 static bool BatchTaskIdValid(const std::string &id)
 {

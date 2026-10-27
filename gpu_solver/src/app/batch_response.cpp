@@ -321,6 +321,9 @@ bool WriteMotorBatchResponse(const std::string &path, const MotorBatchRequest *r
            << ", \"direct_analyses\": " << direct_solver_stats.analyses
            << ", \"direct_factorizations\": " << direct_solver_stats.factorizations
            << ", \"direct_solves\": " << direct_solver_stats.solves
+           << ", \"direct_parallel_batches\": " << direct_solver_stats.parallel_batches
+           << ", \"direct_peak_parallel_width\": " << direct_solver_stats.peak_parallel_width
+           << ", \"direct_ordering_reuses\": " << direct_solver_stats.ordering_reuses
            << ", \"direct_factor_reuses\": " << direct_solver_stats.factor_reuses
            << ", \"direct_analysis_seconds\": " << direct_solver_stats.analysis_seconds
            << ", \"direct_factor_seconds\": " << direct_solver_stats.factor_seconds

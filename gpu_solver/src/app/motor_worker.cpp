@@ -39,8 +39,9 @@ std::unique_ptr<Job> PrepareJob(const std::string &line, const char *executable)
     StrictJson root;
     std::string error;
     if (!StrictJsonParser(line).Parse(&root, &error) ||
-        !ExactObject(root, {"session", "sequence", "request_path", "response_path",
-                            "request_sha256"}, &error))
+        !ExactObject(root,
+                     {"session", "sequence", "request_path", "response_path", "request_sha256"},
+                     &error))
       throw std::runtime_error("invalid stream job envelope");
     const auto *session = JsonMember(root, "session", StrictJson::Type::kString, &error);
     const auto *sequence = JsonMember(root, "sequence", StrictJson::Type::kNumber, &error);
@@ -84,7 +85,7 @@ std::unique_ptr<Job> PrepareJob(const std::string &line, const char *executable)
         if (slot >= input->loads.size())
           return;
         LoadMotorBatchArtifact(input->load_plan.representative_paths[slot],
-                              input->loads[slot].get());
+                               input->loads[slot].get());
       }
     };
     std::vector<std::thread> loaders;
@@ -99,6 +100,7 @@ std::unique_ptr<Job> PrepareJob(const std::string &line, const char *executable)
     load();
     for (auto &thread : loaders)
       thread.join();
+    PrefetchMotorBatchMasks(input.get());
     input->prepare_seconds = ProfileSecondsSince(started);
     job->input = std::move(input);
   } catch (const std::exception &error) {
@@ -107,7 +109,7 @@ std::unique_ptr<Job> PrepareJob(const std::string &line, const char *executable)
   job->prepare_end = ProfileClock::now();
   return job;
 }
-}
+} // namespace
 
 int MotorBatchWorker(const char *executable_path)
 {
@@ -149,15 +151,14 @@ int MotorBatchWorker(const char *executable_path)
     const auto solve_begin = ProfileClock::now();
     const double prepare_seconds = job->input ? job->input->prepare_seconds : 0.0;
     if (job->error.empty()) {
-      if ((session.empty() || session == job->session) &&
-          job->sequence == previous_sequence + 1) {
+      if ((session.empty() || session == job->session) && job->sequence == previous_sequence + 1) {
         session = job->session;
         previous_sequence = job->sequence;
         try {
           // Per-transaction diagnostics must not inherit earlier job counts.
           direct_solver_stats = {};
           result = MotorBatchAdapter(job->request_path, job->response_path, true,
-                                    NonlinearAssemblyMode::kAuto, std::move(job->input));
+                                     NonlinearAssemblyMode::kAuto, std::move(job->input));
         } catch (const std::exception &error) {
           job->error = error.what();
         }
@@ -175,15 +176,14 @@ int MotorBatchWorker(const char *executable_path)
       return std::chrono::duration<double>(point - worker_start).count();
     };
     std::cout << "{\"session\":\"" << EscapeJsonString(job->session)
-              << "\",\"sequence\":" << job->sequence
-              << ",\"request_sha256\":\"" << job->request_sha256
-              << "\",\"exit_code\":" << result
+              << "\",\"sequence\":" << job->sequence << ",\"request_sha256\":\""
+              << job->request_sha256 << "\",\"exit_code\":" << result
               << ",\"prepare_seconds\":" << prepare_seconds
               << ",\"prepare_begin_seconds\":" << since_start(job->prepare_begin)
               << ",\"prepare_end_seconds\":" << since_start(job->prepare_end)
               << ",\"solve_begin_seconds\":" << since_start(solve_begin)
-              << ",\"solve_end_seconds\":" << since_start(solve_end)
-              << ",\"error\":\"" << EscapeJsonString(job->error) << "\"}" << std::endl;
+              << ",\"solve_end_seconds\":" << since_start(solve_end) << ",\"error\":\""
+              << EscapeJsonString(job->error) << "\"}" << std::endl;
   }
   producer.join();
   return 0;

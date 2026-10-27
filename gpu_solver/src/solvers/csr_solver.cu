@@ -90,9 +90,8 @@ Status GpuCsrSolver::Initialize(const Assembly &assembly)
   host_column_indices_ = assembly.column_indices;
   if (backend_ == LinearSolverBackend::kCudss) {
 #ifdef GPU_FEMM_ENABLE_CUDSS
-    status =
-        direct_plan_.Initialize(n_, host_row_offsets_, host_column_indices_, row_offsets_.get(),
-                                column_indices_.get(), values_.get(), rhs_.get(), solution_.get());
+    status = direct_plan_.Initialize(n_, host_row_offsets_, host_column_indices_,
+                                     row_offsets_.get(), column_indices_.get());
 #endif
   } else
     status = spmv_layout_.Initialize(host_row_offsets_, host_column_indices_, interleaved_);

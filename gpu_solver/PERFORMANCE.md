@@ -1,9 +1,84 @@
 # GPU solver performance
 
+## Deterministic solve pipeline, 2026-10-27
+
+The direct backend now dispatches independent numeric matrices through two
+nonblocking CUDA streams. Each context has its own deterministic FP64 cuDSS
+handle, factors, error state and events. A shared numeric matrix still uses
+one reusable factorization. Full-CSR checks retain their original per-system
+reduction order, tolerances, symmetry/diagonal guards and failure isolation.
+Pinned result buffers and stream-local waits replace per-item device-wide
+synchronization. A failed submission drains owned work before buffers may be
+reused. The cuDSS host API is serialized; this is not concurrent analysis from
+arbitrary worker threads.
+
+Uniform batch was tested and rejected: installed cuDSS 1.0 returns
+NOT_SUPPORTED with UBATCH_SIZE > 1 and deterministic mode. Reproducibility
+was not disabled to make batching work. NVIDIA documents that restriction in
+[the deterministic-mode contract](https://docs.nvidia.com/cuda/cudss/latest/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_DETERMINISTIC_MODE).
+Four independent streams also increased the six-request wall time in the
+initial trial; the retained width is two, not the maximum possible width.
+
+Only CPU reordering metadata (permutation and ND partition tree) is cached
+across graphs. Reuse requires the same CUDA device and exact CSR row offsets
+and column indices, including same-size/different-pattern rejection. The
+process-local FIFO holds at most 64 entries / 128 MiB of array payload. No
+numeric factors, coefficients, field solutions, filenames or mtime receipts
+enter that cache. cuDSS performs symbolic analysis for each independent context.
+NVIDIA describes this reuse in [user-provided ND data](https://docs.nvidia.com/cuda/cudss/latest/advanced_features.html).
+
+Weighted-stress preparation is no longer described as CPU-only: it contains
+a GPU mask solve. CPU Laplacian preparation may run ahead, while its GPU solve
+is submitted on the dispatcher. CPU stencil construction overlaps the magnetic
+solve. Completed non-tangent CPU postprocessing overlaps the next operator;
+at most one such result group is pending, and one dispatcher publishes output.
+Tangent or fallback work that can invoke CUDA remains on that dispatcher.
+The persistent producer also prepares at most four exact non-AGE masks for its
+one following transaction. Material selection is part of that mask identity.
+Move-owned inputs survive the deferred fallback if CPU thread creation fails.
+
+Postprocessing is in `src/app/motor_postprocess.cpp`; transport, dispatch,
+physics and CSR/direct-solver ownership remain separate modules. The neutral
+CLI, one-shot route and default Jacobi PCG remain supported. No motor geometry,
+material, angle/current sampling, convergence gate or caller hash is changed.
+Use `benchmark_streaming_batch.py --baseline-transport stream` for a fair
+persistent-worker versus persistent-worker comparison; its original one-shot
+baseline remains the default. Only timing fields are excluded from parity.
+The new direct factor/solve timers sum CUDA-event durations across contexts;
+overlapping durations must not be added to the parent wall-time span or used
+as hardware utilization percentages. Analysis timers remain host wall times.
+
+Release evidence on the same RTX 4060 Ti / CUDA 13.3 / MSVC 19.44:
+
+| Complete six-request sequence | Previous streaming | New pipeline | Method |
+|---|---:|---:|---|
+| cuDSS | 40.544118 s | 39.301573 s | Three alternating A/B rounds, median wall; 3.06% shorter |
+| Default Jacobi PCG | 130.883349 s | 130.308417 s | One compatibility pair, not an established speedup |
+
+All **648 item executions** (81 slots including overlapping saved subsets)
+match every non-timing field exactly, including convergence residuals and
+iterations, force, torque, circuit flux, air-gap samples and cache counters.
+Maximum observable difference is zero. These are saved-input comparisons,
+not a full-optimization timing or a sustained GPU-utilization guarantee. The
+cuDSS improvement is modest; do not describe it as a large acceleration.
+
+Baseline SHA-256:
+`a2f62e377301e101182b55f4d57cb8fa24d541048e629eb7902e5c5db8cac212`.
+Release SHA-256 (both executable names byte-identical):
+`30ee81c5f15e32990a082701eda1c69f8358bc41db97133df5d51feb990b02db`.
+Raw evidence: local `../pipeline-20261027/{cudss-release,pcg-release}/report.json`.
+`stage12`, `stage3` and `cudss-final` are intermediate experiments, not release
+timings. cuDSS-enabled CTest **18/18 PASS**; disabled build **16/16 PASS**.
+Compute Sanitizer direct-backend memcheck and synccheck report **0 errors**;
+memcheck reports **0 leaked bytes**. Tests include mixed singular/valid/zero
+states, changing widths, exact-repeat determinism, same-size/different-CSR
+cache rejection, and prefetched-mask selection failure followed by a valid job.
+No additional CAD or full FEMM validation sweep was created.
+
 ## Ready-work streaming, 2026-10-27
 
 `--motor-worker` is an opt-in JSON-lines transport for batches that become
-ready over time. One thread owns CUDA and invokes the unchanged batch adapter;
+ready over time. One thread owns CUDA and invokes the batch adapter;
 a CPU producer reads/hashes/parses the next request and its artifacts, with
 up to four host loaders. At most one following transaction is prepared and
 each transaction has at most 32 items. The one-shot commands, PCG default,
@@ -122,8 +197,9 @@ shifted in application memory.
 Symbolic analysis is reused for one initialized graph. Numerical factors
 are retained only for a private, unchanged operator. A coefficient update
 invalidates them, including off-diagonal-only changes and writes to the same
-device address. Distinct batch operators refactor sequentially using one
-factor workspace per solver; they cannot inherit a previous slot's factors.
+device address. Distinct batch operators have independent numeric factors;
+the deterministic pipeline above may overlap two such contexts, but they
+cannot inherit a previous slot's factors.
 The real nonlinear benchmarks therefore have many factorizations but few
 analyses, not one numerical factorization for an entire nonlinear campaign.
 
@@ -132,7 +208,7 @@ Tests cover manufactured solutions and an independent residual at
 host/device coefficient updates, reinitialization, singular and malformed
 systems, matrix scales `1e-140` and `1e140`, invalid tolerances and budgets,
 and 100 deterministic refactorizations with no warmed GPU-memory growth.
-Four concurrent independent plans also verify solution isolation and exact
+Four calling threads also verify safe serialized dispatch, solution isolation and exact
 phase accounting. Geometry-mask prefetch threads publish their diagnostics
 under a mutex; each plan retains its own factors and buffers.
 Neutral periodic, anti-periodic, and axisymmetric fixtures compare full

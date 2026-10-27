@@ -206,6 +206,22 @@ Status BuildFrozenPostprocessPlan(const NonlinearModel &model,
                                   const FrozenPostprocessOptions &options,
                                   FrozenPostprocessPlan *plan)
 {
+  if (!plan)
+    return Status::kInvalidArgument;
+  std::vector<double> mask;
+  const Status status = BuildWeightedStressMask(model, options, &mask);
+  if (status != Status::kOk) {
+    *plan = FrozenPostprocessPlan{};
+    plan->status = status;
+    return status;
+  }
+  return BuildFrozenPostprocessPlanWithMask(model, options, std::move(mask), plan);
+}
+
+Status BuildFrozenPostprocessPlanWithMask(const NonlinearModel &model,
+                                          const FrozenPostprocessOptions &options,
+                                          std::vector<double> mask, FrozenPostprocessPlan *plan)
+{
   if (plan == nullptr)
     return Status::kInvalidArgument;
   *plan = FrozenPostprocessPlan{};
@@ -217,9 +233,12 @@ Status BuildFrozenPostprocessPlan(const NonlinearModel &model,
   plan->air_material_label = options.air_material_label;
   plan->airgap_radius_m = options.airgap_radius_m;
   plan->airgap_angles_rad = options.airgap_angles_rad;
-  plan->status = BuildWeightedStressMask(model, options, &plan->mask);
-  if (plan->status != Status::kOk)
+  if (mask.size() != model.nodes.size() ||
+      !std::all_of(mask.begin(), mask.end(), [](double v) { return v == 0 || v == 1; })) {
+    plan->status = Status::kInvalidArgument;
     return plan->status;
+  }
+  plan->mask = std::move(mask);
   plan->incident.assign(model.nodes.size(), {});
   plan->mask_gradient_x.resize(model.triangles.size());
   plan->mask_gradient_y.resize(model.triangles.size());

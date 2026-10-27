@@ -42,6 +42,7 @@ set(GPU_SOLVER_CORE_SOURCES
   src/app/batch_prepare.cpp
   src/app/batch_response.cpp
   src/app/motor_batch.cpp
+  src/app/motor_postprocess.cpp
   src/app/motor_worker.cpp
   src/native_airgap_matrix.cpp
 )

@@ -25,6 +25,8 @@ extern LinearSolverBackend selected_linear_solver;
 struct DirectSolverStats {
   size_t analyses = 0, factorizations = 0, solves = 0, factor_reuses = 0;
   size_t peak_device_estimate_bytes = 0;
+  size_t parallel_batches = 0, peak_parallel_width = 0;
+  size_t ordering_reuses = 0;
   double analysis_seconds = 0, factor_seconds = 0, solve_seconds = 0;
 };
 extern DirectSolverStats direct_solver_stats;

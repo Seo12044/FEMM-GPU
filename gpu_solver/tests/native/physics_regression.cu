@@ -104,6 +104,24 @@ int PhysicsRegressionTests()
   FrozenPostprocessPlan reusable_postprocess_plan;
   const Status reusable_postprocess_plan_status = BuildFrozenPostprocessPlan(
       postprocess_model, postprocess_options, &reusable_postprocess_plan);
+  PreparedWeightedStressMask prepared_mask;
+  std::vector<double> solved_mask;
+  FrozenPostprocessPlan split_plan;
+  expect(PrepareWeightedStressMask(postprocess_model, postprocess_options, &prepared_mask) ==
+                 Status::kOk &&
+             SolveWeightedStressMask(prepared_mask, postprocess_options, &solved_mask) ==
+                 Status::kOk &&
+             solved_mask == reusable_postprocess_plan.mask &&
+             BuildFrozenPostprocessPlanWithMask(postprocess_model, postprocess_options, solved_mask,
+                                                &split_plan) == Status::kOk &&
+             split_plan.mask_gradient_x == reusable_postprocess_plan.mask_gradient_x &&
+             split_plan.mask_gradient_y == reusable_postprocess_plan.mask_gradient_y &&
+             split_plan.element_weight == reusable_postprocess_plan.element_weight,
+         "split CPU/GPU mask preparation and CPU stencils preserve exact geometry");
+  FrozenPostprocessPlan invalid_mask_plan;
+  expect(BuildFrozenPostprocessPlanWithMask(postprocess_model, postprocess_options, {0.0},
+                                            &invalid_mask_plan) == Status::kInvalidArgument,
+         "incomplete prepared mask is rejected");
   const FrozenPostprocessResult reused_postprocess =
       reusable_postprocess_plan_status == Status::kOk
           ? ComputeFrozenPostprocess(postprocess_model, postprocess_solution, postprocess_options,

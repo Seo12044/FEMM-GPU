@@ -57,8 +57,19 @@ struct MotorBatchPrefetch {
   MotorBatchRequest request;
   MotorBatchArtifactLoadPlan load_plan;
   std::vector<std::unique_ptr<MotorBatchArtifactLoad>> loads;
+  struct MaskPreparation {
+    std::string operator_key;
+    int32_t selected_group_number = -1, air_group_number = -1;
+    Status status = Status::kInternalError;
+    std::shared_ptr<const PreparedWeightedStressMask> mask;
+    double compute_seconds = 0;
+  };
+  std::vector<MaskPreparation> masks;
   double prepare_seconds = 0.0;
 };
+
+// Strictly CPU-only, bounded to the first four distinct non-AGE operators.
+void PrefetchMotorBatchMasks(MotorBatchPrefetch *input);
 
 void LoadMotorBatchArtifact(const std::string &path, MotorBatchArtifactLoad *load);
 
@@ -163,6 +174,18 @@ struct MotorBatchTiming {
   double postprocess_seconds = 0.0;
   double measured_before_response_write_seconds = 0.0;
 };
+
+struct MotorBatchPostprocessResult {
+  std::vector<MotorBatchResponseDto> responses;
+  std::vector<size_t> indices;
+  MotorBatchTiming timing;
+};
+
+MotorBatchPostprocessResult PostprocessMotorBatchGroup(
+    const MotorBatchRequest &request, const std::vector<MotorBatchPreparedItem> &prepared,
+    const std::vector<size_t> &group, std::vector<NonlinearSolveResult> chunk_solutions,
+    FrozenPostprocessPlan prepared_plan, NonlinearP1Solver &solver, const NonlinearOptions &options,
+    int *launches);
 
 MotorBatchResponseDto MakeMotorBatchResponseDto(Status status, const MotorSampleRequest &request,
                                                 const NonlinearSolveResult *solution,

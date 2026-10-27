@@ -167,6 +167,86 @@ int CudssRegressionTests()
     }
   }
   GpuCsrSolver solver(PcgPreconditioner::kJacobi, true, LinearSolverBackend::kCudss);
+  {
+    const auto a = matrix(7);
+    GpuCsrSolver first(PcgPreconditioner::kJacobi, true, LinearSolverBackend::kCudss);
+    const auto b = multiply(a, std::vector<double>(7, 1));
+    std::vector<double> result;
+    expect(first.Initialize(a) == Status::kOk &&
+               verified(a, b, result, first.Solve(b, 1e-10, 100, &result)),
+           "ordering cache source equation");
+    const auto reuses = direct_solver_stats.ordering_reuses;
+    GpuCsrSolver second(PcgPreconditioner::kJacobi, true, LinearSolverBackend::kCudss);
+    expect(second.Initialize(a) == Status::kOk &&
+               verified(a, b, result, second.Solve(b, 1e-10, 100, &result)) &&
+               direct_solver_stats.ordering_reuses == reuses + 1,
+           "exact CSR ordering reuse across independent plans");
+    const int permutation[] = {0, 2, 1, 3, 4, 5, 6};
+    std::vector<std::vector<std::pair<int32_t, double>>> rows(7);
+    for (int row = 0; row < 7; ++row)
+      for (int j = a.row_offsets[row]; j < a.row_offsets[row + 1]; ++j)
+        rows[permutation[row]].push_back({permutation[a.column_indices[j]], a.values[j]});
+    auto changed = a;
+    changed.row_offsets = {0};
+    changed.column_indices.clear();
+    changed.values.clear();
+    for (auto &row : rows) {
+      std::sort(row.begin(), row.end());
+      for (const auto &entry : row) {
+        changed.column_indices.push_back(entry.first);
+        changed.values.push_back(entry.second);
+      }
+      changed.row_offsets.push_back(static_cast<int32_t>(changed.values.size()));
+    }
+    const auto changed_rhs = multiply(changed, std::vector<double>(7, 1));
+    expect(second.Initialize(changed) == Status::kOk &&
+               verified(changed, changed_rhs, result,
+                        second.Solve(changed_rhs, 1e-10, 100, &result)) &&
+               direct_solver_stats.ordering_reuses == reuses + 1,
+           "same dimensions and nnz with different CSR cannot reuse ordering");
+  }
+  {
+    const auto a = matrix(33), changed = matrix(33, -.8);
+    expect(solver.Initialize(a) == Status::kOk, "parallel batch initialization");
+    for (size_t width : {2u, 4u, 3u, 1u, 4u, 5u, 32u}) {
+      std::vector<Assembly> matrices;
+      std::vector<std::vector<double>> rhs;
+      for (size_t slot = 0; slot < width; ++slot) {
+        matrices.push_back(slot % 2 ? changed : a);
+        rhs.push_back(multiply(matrices.back(), std::vector<double>(33, .25 + slot)));
+      }
+      std::vector<SolveInfo> infos;
+      std::vector<std::vector<double>> xs;
+      expect(solver.SolveBatch(matrices, rhs, 1e-10, 100, &infos, &xs, nullptr) == Status::kOk,
+             "parallel width changes and bounded tail");
+      for (size_t slot = 0; slot < width && slot < infos.size(); ++slot)
+        expect(verified(matrices[slot], rhs[slot], xs[slot], infos[slot]),
+               "parallel distinct coefficients and RHS remain isolated");
+    }
+    std::vector<SolveInfo> infos;
+    std::vector<std::vector<double>> xs;
+    const auto b = multiply(a, std::vector<double>(33, 1));
+    expect(solver.SolveBatch({a, a, a}, {b, std::vector<double>(33, 0), b}, 1e-10, 100, &infos, &xs,
+                             nullptr) == Status::kOk &&
+               verified(a, b, xs[0], infos[0]) && xs[1] == std::vector<double>(33, 0) &&
+               verified(a, b, xs[2], infos[2]),
+           "zero RHS within numeric batch");
+    auto singular_batch = matrix(33, 0);
+    singular_batch.diagonal[0] = 0;
+    singular_batch.values[0] = 0;
+    expect(solver.SolveBatch({a, singular_batch, a}, {b, b, b}, 1e-10, 100, &infos, &xs, nullptr) ==
+                   Status::kOk &&
+               verified(a, b, xs[0], infos[0]) && infos[1].status != Status::kOk &&
+               verified(a, b, xs[2], infos[2]),
+           "invalid numeric slot preserves its neighbours");
+    expect(direct_solver_stats.peak_parallel_width >= 2 && direct_solver_stats.parallel_batches > 0,
+           "independent deterministic streams are actually exercised");
+    const auto snapshot = xs;
+    expect(solver.SolveBatch({a, singular_batch, a}, {b, b, b}, 1e-10, 100, &infos, &xs, nullptr) ==
+                   Status::kOk &&
+               xs == snapshot,
+           "parallel execution retains bitwise repeatability");
+  }
   auto singular = matrix(2, 1);
   singular.diagonal = {1, 1};
   singular.values = {1, 1, 1, 1};
@@ -175,6 +255,15 @@ int CudssRegressionTests()
   expect(solver.Solve({1, 1}, 1e-10, 100, &x).status != Status::kOk,
          "non-positive minor cannot be accepted");
   auto good = matrix(2);
+  {
+    std::vector<SolveInfo> infos;
+    std::vector<std::vector<double>> xs;
+    expect(solver.SolveBatch({good, singular, good}, {{1, 2}, {1, 1}, {2, 3}}, 1e-10, 100, &infos,
+                             &xs, nullptr) == Status::kOk &&
+               verified(good, {1, 2}, xs[0], infos[0]) && infos[1].status != Status::kOk &&
+               verified(good, {2, 3}, xs[2], infos[2]),
+           "asynchronous factor error does not accept or poison adjacent slots");
+  }
   expect(solver.UpdateValues(good) == Status::kOk, "update after numeric failure");
   expect(verified(good, {1, 2}, x, solver.Solve({1, 2}, 1e-10, 100, &x)),
          "failed factorization is not reused");

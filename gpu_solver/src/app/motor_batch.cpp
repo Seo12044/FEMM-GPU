@@ -1,4 +1,5 @@
 #include "app/motor_batch.h"
+#include "app/cpu_task.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -228,17 +229,16 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
     }
     // A SolveBatch instance owns exactly one CSR operator.  Partition the
     // request chunk before initializing it, so only samples with identical
-    // v2 artifact-and-pose operators share a CUDA batch.  The geometry-only
-    // WST plans are geometry-only CPU work.  Prepare a bounded window of them
-    // ahead while the current nonlinear state occupies the GPU.  Four plans
-    // keep memory bounded while allowing independent posed geometries to use
-    // otherwise-idle host cores; each result is released after its group is
-    // consumed.  Solve and postprocess math remain unchanged.
+    // v2 artifact-and-pose operators share a CUDA batch. Prepare the WST
+    // topology on CPU workers, dispatch its auxiliary GPU solve on this thread,
+    // then overlap pure-CPU stencil construction with the magnetic solve.
     const std::vector<std::vector<size_t>> operator_groups =
         GroupMotorBatchPreparedItemsByOperator(prepared);
     struct PreparedFrozenPostprocessPlan {
       FrozenPostprocessOptions options;
       FrozenPostprocessPlan plan;
+      std::shared_ptr<const PreparedWeightedStressMask> mask;
+      Status mask_status = Status::kInternalError;
       double compute_seconds = 0.0;
       bool available = false;
     };
@@ -265,17 +265,29 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
                                               &result.options);
       }
       const ProfileClock::time_point start = ProfileClock::now();
-      BuildFrozenPostprocessPlan(representative.model, result.options, &result.plan);
+      if (prefetch) {
+        for (const auto &ready : prefetch->masks) {
+          if (ready.operator_key == representative.operator_key &&
+              ready.selected_group_number == item.selected_group_number &&
+              ready.air_group_number == item.air_group_number) {
+            result.mask_status = ready.status;
+            result.mask = ready.mask;
+            result.compute_seconds = ready.compute_seconds;
+            result.available = true;
+            return result;
+          }
+        }
+      }
+      auto mask = std::make_shared<PreparedWeightedStressMask>();
+      result.mask_status =
+          PrepareWeightedStressMask(representative.model, result.options, mask.get());
+      result.mask = std::move(mask);
       result.compute_seconds = ProfileSecondsSince(start);
       result.available = true;
       return result;
     };
     auto launch_group_frozen_plan = [&](size_t group_index) {
-      try {
-        return std::async(std::launch::async, build_group_frozen_plan, group_index);
-      } catch (const std::system_error &) {
-        return std::async(std::launch::deferred, build_group_frozen_plan, group_index);
-      }
+      return LaunchCpuTask([&, group_index]() { return build_group_frozen_plan(group_index); });
     };
     const size_t frozen_plan_prefetch_window =
         std::min<size_t>(operator_groups.size(),
@@ -285,6 +297,21 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
     for (size_t group_index = 0; group_index < frozen_plan_prefetch_window; ++group_index) {
       pending_frozen_plans[group_index] = launch_group_frozen_plan(group_index);
     }
+    std::future<MotorBatchPostprocessResult> pending_postprocess;
+    auto consume_postprocess = [&]() {
+      if (!pending_postprocess.valid())
+        return;
+      auto result = pending_postprocess.get();
+      for (size_t index : result.indices)
+        responses[index] = std::move(result.responses[index]);
+      timing.nonlinear_pcg_iterations += result.timing.nonlinear_pcg_iterations;
+      timing.postprocess_plan_compute_seconds += result.timing.postprocess_plan_compute_seconds;
+      timing.postprocess_plan_seconds += result.timing.postprocess_plan_seconds;
+      timing.base_postprocess_seconds += result.timing.base_postprocess_seconds;
+      timing.tangent_operator_seconds += result.timing.tangent_operator_seconds;
+      timing.tangent_postprocess_seconds += result.timing.tangent_postprocess_seconds;
+      timing.postprocess_seconds += result.timing.postprocess_seconds;
+    };
     for (size_t group_index = 0; group_index < operator_groups.size(); ++group_index) {
       const std::vector<size_t> &group = operator_groups[group_index];
       if (group.empty())
@@ -300,6 +327,35 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
         pending_frozen_plans[launch_index] = launch_group_frozen_plan(launch_index);
       }
       const MotorBatchPreparedItem &representative = prepared[group.front()];
+      std::future<PreparedFrozenPostprocessPlan> finishing_plan;
+      if (prepared_frozen_plan.available) {
+        const auto mask_start = ProfileClock::now();
+        std::vector<double> mask;
+        Status status = prepared_frozen_plan.mask_status;
+        if (status == Status::kOk)
+          status = SolveWeightedStressMask(*prepared_frozen_plan.mask, prepared_frozen_plan.options,
+                                           &mask);
+        const double mask_seconds = ProfileSecondsSince(mask_start);
+        timing.postprocess_plan_compute_seconds += mask_seconds;
+        timing.postprocess_plan_seconds += mask_seconds;
+        timing.postprocess_seconds += mask_seconds;
+        auto finish = [&, status, options = prepared_frozen_plan.options,
+                       mask = std::move(mask)]() mutable {
+          PreparedFrozenPostprocessPlan result;
+          result.available = true;
+          result.options = options;
+          const auto start = ProfileClock::now();
+          result.plan.status = status;
+          if (status == Status::kOk)
+            BuildFrozenPostprocessPlanWithMask(representative.model, options, std::move(mask),
+                                               &result.plan);
+          result.compute_seconds = ProfileSecondsSince(start);
+          return result;
+        };
+        finishing_plan = LaunchCpuTask(std::move(finish));
+        // The prepared Laplacian is no longer needed after its owned solve.
+        prepared_frozen_plan.mask.reset();
+      }
       if (cached_fingerprint != representative.operator_key) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
         const Status initialize_status = cached_solver.Initialize(representative.model);
@@ -343,177 +399,45 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
       timing.nonlinear.state_update_seconds += chunk_timing.state_update_seconds;
       timing.nonlinear.finalize_seconds += chunk_timing.finalize_seconds;
       timing.nonlinear.recovery_seconds += chunk_timing.recovery_seconds;
-      for (size_t local = 0; local < group.size(); ++local) {
-        const MotorBatchPreparedItem &prepared_item = prepared[group[local]];
-        const size_t index = prepared_item.request_index;
-        const MotorSampleRequest &item = request.items[index].request;
-        NonlinearSolveResult &solution = chunk_solutions[local];
-        timing.nonlinear_pcg_iterations += solution.linear_iterations;
-        if (solution.info.status != Status::kOk) {
-          responses[index] =
-              MakeMotorBatchResponseDto(solution.info.status, item, &solution, nullptr);
-          continue;
-        }
-        FrozenPostprocessOptions post_options;
-        post_options.selected_group_number = item.selected_group_number;
-        post_options.air_group_number = item.air_group_number;
-        post_options.max_mask_iterations = 4096;
-        post_options.airgap_radius_m = item.airgap_radius_mm * 1e-3;
-        for (double angle : item.airgap_angles_deg)
-          post_options.airgap_angles_rad.push_back(angle * 3.141592653589793238462643383279502884 /
-                                                   180.0);
-        FrozenPostprocessOptions base_post_options = post_options;
-        std::vector<int8_t> base_airgap_repeat_signs;
-        if (item.sector_performance.enabled && prepared_item.artifact->has_native_age_sector) {
-          base_airgap_repeat_signs = MapNativeAgeSectorAirgapAnglesToRepresentative(
-              *prepared_item.artifact, &base_post_options);
-        } else if (item.sector_performance.enabled && !prepared_item.artifact->has_sliding_band) {
-          base_airgap_repeat_signs = MapSectorAirgapAnglesToRepresentative(
-              prepared_item.artifact->sector_start_angle_deg *
-                  3.141592653589793238462643383279502884 / 180.0,
-              prepared_item.artifact->sector_boundary_sign, &base_post_options);
-        }
-        const ProfileClock::time_point postprocess_start = ProfileClock::now();
-        FrozenPostprocessPlan item_frozen_plan;
-        const FrozenPostprocessPlan *frozen_plan = nullptr;
-        if (!prepared_item.artifact->has_sliding_band) {
-          if (prepared_frozen_plan.available &&
-              FrozenPostprocessPlanMatches(prepared_frozen_plan.plan, prepared_item.model,
-                                           base_post_options)) {
-            frozen_plan = &prepared_frozen_plan.plan;
-          } else {
-            const ProfileClock::time_point plan_start = ProfileClock::now();
-            BuildFrozenPostprocessPlan(prepared_item.model, base_post_options, &item_frozen_plan);
-            const double plan_seconds = ProfileSecondsSince(plan_start);
-            timing.postprocess_plan_compute_seconds += plan_seconds;
-            timing.postprocess_plan_seconds += plan_seconds;
-            frozen_plan = &item_frozen_plan;
-          }
-        }
-        const ProfileClock::time_point base_postprocess_start = ProfileClock::now();
-        FrozenPostprocessResult postprocess;
-        if (prepared_item.artifact->has_sliding_band) {
-          postprocess =
-              ComputeAirGapElementPostprocess(prepared_item.model, solution, base_post_options);
-        } else if (frozen_plan->status != Status::kOk) {
-          postprocess.status = frozen_plan->status;
-        } else {
-          postprocess = ComputeFrozenPostprocess(prepared_item.model, solution, base_post_options,
-                                                 frozen_plan);
-        }
-        timing.base_postprocess_seconds += ProfileSecondsSince(base_postprocess_start);
-        if (postprocess.status == Status::kOk && !base_airgap_repeat_signs.empty() &&
-            !ApplySectorAirgapRepeatSigns(base_airgap_repeat_signs, &postprocess))
-          postprocess.status = Status::kInternalError;
-        timing.postprocess_seconds += ProfileSecondsSince(postprocess_start);
-        responses[index] =
-            MakeMotorBatchResponseDto(postprocess.status, item, &solution,
-                                      postprocess.status == Status::kOk ? &postprocess : nullptr);
-        if (item.sector_performance.enabled) {
-          ApplyBaseSectorReconstruction(*prepared_item.artifact, item, &responses[index]);
-          responses[index].sector_reconstruction_status = responses[index].status;
-        }
-        if (postprocess.status == Status::kOk && item.tangent_requested) {
-          responses[index].tangent_status = Status::kOk;
-          FrozenPostprocessOptions tangent_post_options = post_options;
-          std::vector<int8_t> tangent_airgap_repeat_signs;
-          if (item.sector_performance.enabled && !prepared_item.artifact->has_sliding_band) {
-            tangent_airgap_repeat_signs = MapSectorAirgapAnglesToRepresentative(
-                prepared_item.artifact->sector_start_angle_deg *
-                    3.141592653589793238462643383279502884 / 180.0,
-                static_cast<int8_t>(
-                    (prepared_item.artifact->suspension_spatial_order % 2) == 0 ? 1 : -1),
-                &tangent_post_options);
-          }
-          FrozenPostprocessPlan tangent_frozen_plan;
-          const FrozenPostprocessPlan *tangent_plan = frozen_plan;
-          if (!prepared_item.artifact->has_sliding_band &&
-              !FrozenPostprocessPlanMatches(*tangent_plan, prepared_item.model,
-                                            tangent_post_options)) {
-            responses[index].tangent_status = BuildFrozenPostprocessPlan(
-                prepared_item.model, tangent_post_options, &tangent_frozen_plan);
-            tangent_plan = &tangent_frozen_plan;
-          }
-          NonlinearP1Solver sector_tangent_solver;
-          NonlinearP1Solver *tangent_solver = &cached_solver;
-          if (item.sector_performance.enabled) {
-            if (prepared_item.tangent_model.nodes.empty()) {
-              responses[index].tangent_status = Status::kInvalidArgument;
-            } else {
-              responses[index].tangent_status =
-                  sector_tangent_solver.Initialize(prepared_item.tangent_model);
-              tangent_solver = &sector_tangent_solver;
-            }
-          }
-          const ProfileClock::time_point tangent_operator_start = ProfileClock::now();
-          std::vector<TangentSolveResult> tangent_results =
-              responses[index].tangent_status == Status::kOk
-                  ? tangent_solver->SolveTangentMultiRhs(solution, item.tangent_multi_rhs.rhs,
-                                                         options, &batched_pcg_launches)
-                  : std::vector<TangentSolveResult>{};
-          timing.tangent_operator_seconds += ProfileSecondsSince(tangent_operator_start);
-          if (responses[index].tangent_status == Status::kOk &&
-              tangent_results.size() != item.tangent_multi_rhs.rhs.size())
-            responses[index].tangent_status = Status::kInternalError;
-          if (item.sector_performance.enabled && !tangent_results.empty())
-            responses[index].tangent_operator_evidence = tangent_results.front().operator_evidence;
-          for (TangentSolveResult &tangent : tangent_results) {
-            if (tangent.info.status != Status::kOk) {
-              responses[index].tangent_status = tangent.info.status;
-              continue;
-            }
-            const ProfileClock::time_point tangent_postprocess_start = ProfileClock::now();
-            TangentPostprocessResult tangent_postprocess =
-                prepared_item.artifact->has_sliding_band
-                    ? ComputeAirGapElementTangentPostprocess(
-                          prepared_item.model,
-                          item.sector_performance.enabled ? prepared_item.tangent_model
-                                                          : prepared_item.model,
-                          solution, tangent.field_derivative, tangent_post_options)
-                    : ComputeFrozenTangentPostprocess(
-                          prepared_item.model, solution, tangent.field_derivative,
-                          tangent_post_options, tangent_plan->mask, tangent_plan);
-            const double tangent_postprocess_seconds =
-                ProfileSecondsSince(tangent_postprocess_start);
-            timing.postprocess_seconds += tangent_postprocess_seconds;
-            timing.tangent_postprocess_seconds += tangent_postprocess_seconds;
-            if (tangent_postprocess.status != Status::kOk) {
-              responses[index].tangent_status = tangent_postprocess.status;
-              continue;
-            }
-            if (!tangent_airgap_repeat_signs.empty() &&
-                !ApplySectorTangentAirgapRepeatSigns(tangent_airgap_repeat_signs,
-                                                     &tangent_postprocess)) {
-              responses[index].tangent_status = Status::kInternalError;
-              continue;
-            }
-            TangentRhsResponseDto dto;
-            dto.name = tangent.name;
-            dto.circuit_current_derivative_a_per_a = tangent.circuit_current_derivative_a_per_a;
-            dto.force_x_n_per_a = tangent_postprocess.force_x_n_per_a;
-            dto.force_y_n_per_a = tangent_postprocess.force_y_n_per_a;
-            dto.torque_nm_per_a = tangent_postprocess.torque_nm_per_a;
-            dto.circuit_flux_linkage_derivative_wb_per_a =
-                tangent.field_derivative.circuit_flux_linkage_wb;
-            dto.airgap_radial_flux_density_derivative_t_per_a =
-                std::move(tangent_postprocess.airgap_radial_flux_density_t_per_a);
-            dto.linear_convergence = tangent.info;
-            if (item.sector_performance.enabled &&
-                !ApplyTangentSectorReconstruction(*prepared_item.artifact, responses[index],
-                                                  &dto)) {
-              responses[index].tangent_status = Status::kInternalError;
-              continue;
-            }
-            responses[index].tangent_rhs.push_back(std::move(dto));
-          }
-          if (responses[index].tangent_status == Status::kOk &&
-              responses[index].tangent_rhs.size() != item.tangent_multi_rhs.rhs.size())
-            responses[index].tangent_status = Status::kInternalError;
-          if (item.sector_performance.enabled)
-            responses[index].sector_reconstruction_status = responses[index].tangent_status;
-        }
+      if (finishing_plan.valid()) {
+        const auto wait_start = ProfileClock::now();
+        prepared_frozen_plan = finishing_plan.get();
+        const double wait_seconds = ProfileSecondsSince(wait_start);
+        timing.postprocess_plan_compute_seconds += prepared_frozen_plan.compute_seconds;
+        timing.postprocess_plan_seconds += wait_seconds;
+        timing.postprocess_seconds += wait_seconds;
+      }
+      const auto &representative_request = request.items[representative.request_index].request;
+      const bool cpu_only = std::all_of(group.begin(), group.end(), [&](size_t index) {
+        const auto &item = request.items[prepared[index].request_index].request;
+        return !item.tangent_requested &&
+               (representative.artifact->has_sliding_band ||
+                (prepared_frozen_plan.available &&
+                 prepared_frozen_plan.plan.status == Status::kOk &&
+                 item.airgap_angles_deg == representative_request.airgap_angles_deg &&
+                 item.airgap_radius_mm == representative_request.airgap_radius_mm &&
+                 item.selected_group_number == representative_request.selected_group_number &&
+                 item.air_group_number == representative_request.air_group_number &&
+                 item.sector_performance.enabled ==
+                     representative_request.sector_performance.enabled));
+      });
+      auto postprocess_group = [&, group, options, chunk_solutions = std::move(chunk_solutions),
+                                prepared_frozen_plan = std::move(prepared_frozen_plan)]() mutable {
+        return PostprocessMotorBatchGroup(request, prepared, group, std::move(chunk_solutions),
+                                          std::move(prepared_frozen_plan.plan), cached_solver,
+                                          options, &batched_pcg_launches);
+      };
+      // At most one previous result group is retained. Only the dispatcher
+      // publishes responses; tangent/fallback paths that may use CUDA stay here.
+      consume_postprocess();
+      if (cpu_only)
+        pending_postprocess = LaunchCpuTask(std::move(postprocess_group));
+      else {
+        pending_postprocess = std::async(std::launch::deferred, std::move(postprocess_group));
+        consume_postprocess();
       }
     }
+    consume_postprocess();
   }
   timing.measured_before_response_write_seconds = ProfileSecondsSince(total_start);
   if (!WriteMotorBatchResponse(response_path, &request, responses, request.max_items_per_chunk,
