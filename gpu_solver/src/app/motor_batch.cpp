@@ -29,28 +29,38 @@ namespace gpu_femm
 {
 
 int MotorBatchAdapter(const std::string &request_path, const std::string &response_path,
-                      bool include_timing, NonlinearAssemblyMode assembly_mode)
+                      bool include_timing, NonlinearAssemblyMode assembly_mode,
+                      std::unique_ptr<MotorBatchPrefetch> prefetch)
 {
   const ProfileClock::time_point total_start = ProfileClock::now();
   MotorBatchTiming timing;
-  std::ifstream input(request_path);
-  std::stringstream bytes;
-  bytes << input.rdbuf();
   MotorBatchRequest request;
   std::string error;
-  if (!input || !ReadMotorBatchRequestJson(bytes.str(), &request, &error)) {
-    std::cerr << "FAIL motor batch request: " << error << '\n';
-    return 1; // No trusted item identity exists to write a resumable response.
+  if (prefetch) {
+    request = std::move(prefetch->request);
+  } else {
+    std::ifstream input(request_path);
+    std::stringstream bytes;
+    bytes << input.rdbuf();
+    if (!input || !ReadMotorBatchRequestJson(bytes.str(), &request, &error)) {
+      std::cerr << "FAIL motor batch request: " << error << '\n';
+      return 1; // No trusted item identity exists to write a resumable response.
+    }
   }
   timing.request_read_parse_seconds = ProfileSecondsSince(total_start);
   const ProfileClock::time_point preflight_start = ProfileClock::now();
-  const MotorBatchArtifactLoadPlan artifact_load_plan = MakeMotorBatchArtifactLoadPlan(request);
+  const MotorBatchArtifactLoadPlan artifact_load_plan =
+      prefetch ? std::move(prefetch->load_plan) : MakeMotorBatchArtifactLoadPlan(request);
   std::vector<std::unique_ptr<MotorBatchArtifactLoad>> cached_artifact_loads(
       artifact_load_plan.canonical_paths.size());
   const size_t preflight_slot = artifact_load_plan.item_slots.front();
-  cached_artifact_loads[preflight_slot] = std::make_unique<MotorBatchArtifactLoad>();
-  LoadMotorBatchArtifact(artifact_load_plan.representative_paths[preflight_slot],
-                         cached_artifact_loads[preflight_slot].get());
+  if (prefetch) {
+    cached_artifact_loads = std::move(prefetch->loads);
+  } else {
+    cached_artifact_loads[preflight_slot] = std::make_unique<MotorBatchArtifactLoad>();
+    LoadMotorBatchArtifact(artifact_load_plan.representative_paths[preflight_slot],
+                           cached_artifact_loads[preflight_slot].get());
+  }
   // Derive the batch cap from the real CSR footprint, not a sample-count
   // heuristic.  The preflight is read-only and repeats the normal strict
   // request validation before any CUDA allocation, while reusing the parsed

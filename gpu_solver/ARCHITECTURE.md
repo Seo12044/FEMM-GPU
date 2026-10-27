@@ -48,6 +48,21 @@ type previously had a `FixtureSolver` name despite handling production batches.
 
 ## Verification
 
+`app/motor_worker.cpp` implements the opt-in `--motor-worker` transport.
+One calling thread owns all CUDA operations; a bounded producer prepares the
+next immutable request and artifacts on the CPU. Input preparation may overlap
+the current adapter, but no two GPU adapters execute concurrently. Each job
+uses the existing parser, operator grouping, numerical solver and serializer.
+Neither the one-shot CLI nor its PCG default changes.
+
+The producer reads and hashes every artifact for each submitted transaction.
+It does not reuse a parsed mesh based on path, size or timestamp. At most one
+following transaction is prepared in addition to the active one, each with
+at most 32 items. Prepared inputs own their storage through adapter completion.
+The JSON-lines completion binds session, monotonically increasing submission
+number and request-byte SHA-256; EOF drains accepted work and exits. Clients
+must enforce their own per-active-job deadline and own process cancellation.
+
 Run the ordinary CTest suite in both cuDSS-enabled and disabled builds.
 `gpu_femm_source_layout` also guards the small entry point, independently
 compiled sources, header guards and production/test boundary without CUDA.

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,15 @@ struct MotorBatchArtifactLoad {
   std::string artifact_sha256;
   std::string fingerprint;
   GpuFemmMeshArtifact artifact;
+};
+
+// CPU-only input snapshot owned by the bounded streaming producer. Each
+// submission reads and hashes its files afresh; no timestamp-based cache.
+struct MotorBatchPrefetch {
+  MotorBatchRequest request;
+  MotorBatchArtifactLoadPlan load_plan;
+  std::vector<std::unique_ptr<MotorBatchArtifactLoad>> loads;
+  double prepare_seconds = 0.0;
 };
 
 void LoadMotorBatchArtifact(const std::string &path, MotorBatchArtifactLoad *load);
@@ -167,6 +177,7 @@ bool WriteMotorBatchResponse(const std::string &path, const MotorBatchRequest *r
 
 int MotorBatchAdapter(const std::string &request_path, const std::string &response_path,
                       bool include_timing = false,
-                      NonlinearAssemblyMode assembly_mode = NonlinearAssemblyMode::kAuto);
+                      NonlinearAssemblyMode assembly_mode = NonlinearAssemblyMode::kAuto,
+                      std::unique_ptr<MotorBatchPrefetch> prefetch = nullptr);
 
 } // namespace gpu_femm

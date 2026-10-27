@@ -42,6 +42,7 @@ set(GPU_SOLVER_CORE_SOURCES
   src/app/batch_prepare.cpp
   src/app/batch_response.cpp
   src/app/motor_batch.cpp
+  src/app/motor_worker.cpp
   src/native_airgap_matrix.cpp
 )
 set(GPU_SOLVER_TEST_SOURCES
@@ -289,6 +290,10 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cudss_cli.py"
         $<TARGET_FILE:gpu_linear_p1_poc>)
     set_tests_properties(gpu_cudss_cli PROPERTIES LABELS "gpu;cli;cudss" TIMEOUT 180)
+    add_test(NAME gpu_motor_worker
+      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_motor_worker.py"
+        $<TARGET_FILE:gpu_linear_p1_poc>)
+    set_tests_properties(gpu_motor_worker PROPERTIES LABELS "gpu;cli;streaming" TIMEOUT 90)
     add_test(NAME gpu_preconditioner_cli
       COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_preconditioner_cli.py"
         $<TARGET_FILE:gpu_linear_p1_poc>

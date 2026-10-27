@@ -1,5 +1,45 @@
 # GPU solver performance
 
+## Ready-work streaming, 2026-10-27
+
+`--motor-worker` is an opt-in JSON-lines transport for batches that become
+ready over time. One thread owns CUDA and invokes the unchanged batch adapter;
+a CPU producer reads/hashes/parses the next request and its artifacts, with
+up to four host loaders. At most one following transaction is prepared and
+each transaction has at most 32 items. The one-shot commands, PCG default,
+FP64 arithmetic, material evaluation and convergence criteria are unchanged.
+There is no path/mtime mesh shortcut and no simultaneous GPU solver processes.
+
+On RTX 4060 Ti / CUDA 13.3 / MSVC 19.44, six saved real-motor request sets
+(3 zero-current, 4 suspension, 6 sector, 4 displaced, 32 zero-current and
+32 loaded item slots; some overlap), measured as a complete sequence:
+
+| Backend | One-shot baseline | Streaming worker | Measurement |
+|---|---:|---:|---|
+| cuDSS | 45.275864 s | 40.597745 s | Median of three alternating A/B rounds; 10.33% shorter |
+| PCG | 129.665899 s | 127.075356 s | One A/B compatibility pair; 2.00% shorter |
+
+All **648 item executions** pass strict equality of all non-timing response
+fields, including force/torque, flux, residuals, iterations and cache counts.
+This is a sequence wall-time comparison, not a claim about pure GPU occupancy
+or an entire optimization campaign. Preparation still has to finish before
+its own job can run; postprocessing and host work inside the adapter remain.
+
+Candidate SHA-256:
+`a2f62e377301e101182b55f4d57cb8fa24d541048e629eb7902e5c5db8cac212`.
+Baseline SHA-256:
+`c169322bb01f668a1ff72becc7eb51b8e13f816677c5be882ef15d90b40d6826`.
+Evidence: local `../streaming-20261027/{cudss-final,pcg-final}/report.json`
+with every response, request/binary hash and per-job preparation/execution
+interval. `cudss-first` is preliminary, not the release timing. cuDSS-enabled
+CTest **18/18 PASS**; cuDSS-disabled **16/16 PASS**, including the new worker
+identity, rejection isolation, transaction bound and exact legacy-parity tests.
+
+Reproduce with `tests/benchmark_streaming_batch.py --baseline OLD --candidate
+NEW --linear-solver cudss --request SAVED.json --output NEW_DIRECTORY --rounds
+3`, adding one `--request` per saved request. Run on an otherwise idle GPU;
+no CAD, mesh generation or checkpoint migration is performed by the benchmark.
+
 ## Functional module split, 2026-10-27
 
 The former 11,797-line `src/linear_p1_poc.cu` is now a six-line entry point.

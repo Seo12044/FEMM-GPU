@@ -1,0 +1,23 @@
+{
+    "schema_version":"gpu_femm_mesh_v1",
+    "base_motor_fem_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_fem_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "canonical_identity_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "resolved":{
+      "source_fem_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "base_motor_fem_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "model":{"depth_mm":20,"problem_type":"planar","frequency_hz":0},
+      "pose":{"rotor_angle_deg":3,"displacement_mm":[0.1,0]},
+      "nodes_mm":[[0,0],[1,0],[1,1],[0,1],[0.5,0.5]],
+      "triangles":{"node_indices":[[0,1,4],[1,2,4],[2,3,4],[3,0,4]],"region_ids":[7,8,9,9]},
+      "regions":[
+        {"id":7,"group_number":20,"material_id":4,"circuit_index":-1,"turns":0,"pm_magnetization_deg":30},
+        {"id":8,"group_number":50,"material_id":9,"circuit_index":0,"turns":50,"pm_magnetization_deg":0},
+        {"id":9,"group_number":50,"material_id":9,"circuit_index":1,"turns":-50,"pm_magnetization_deg":0}],
+      "materials":[
+        {"id":4,"name":"PM","mu_x":1.05,"mu_y":1.05,"H_c_A_per_m":900000,"B_T":[],"H_A_per_m":[],"lam_type":0,"lam_fill":1},
+        {"id":9,"name":"Air","mu_x":1,"mu_y":1,"H_c_A_per_m":0,"B_T":[],"H_A_per_m":[],"lam_type":0,"lam_fill":1}],
+      "circuits":[{"index":0,"name":"coil_00","type":"series","current_A":2},{"index":1,"name":"coil_01","type":"series","current_A":-2}],
+      "outer_dirichlet":{"node_indices":[3],"A_Wb_per_m":[0]}
+    }
+  }

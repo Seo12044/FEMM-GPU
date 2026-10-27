@@ -1,6 +1,7 @@
 #include "app/cli.h"
 #include "app/sample_adapter.h"
 #include "app/motor_batch.h"
+#include "app/motor_worker.h"
 #include "commands.h"
 
 #include <iostream>
@@ -110,6 +111,9 @@ int gpu_femm::RunCli(int argc, char **argv)
   if (argc == 4 && std::string(argv[1]) == "--motor-batch-profile") {
     return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true);
   }
+  if (argc == 2 && std::string(argv[1]) == "--motor-worker") {
+    return gpu_femm::MotorBatchWorker(argv[0]);
+  }
   if (argc == 4 && std::string(argv[1]) == "--internal-motor-batch-profile-host") {
     return gpu_femm::MotorBatchAdapter(argv[2], argv[3], true,
                                        gpu_femm::NonlinearAssemblyMode::kHost);
@@ -133,6 +137,7 @@ int gpu_femm::RunCli(int argc, char **argv)
               << "  \"motor_batch_protocols\": [\"gpu_femm_motor_batch_v1\", "
                  "\"gpu_femm_motor_batch_v2\", \"gpu_femm_motor_batch_v3\", "
                  "\"gpu_femm_motor_batch_v4\"],\n"
+              << "  \"motor_batch_stream_v1\": true,\n"
               << "  \"problem_types\": [\"planar\", \"axisymmetric\"],\n"
               << "  \"frequency_hz\": [0],\n"
               << "  \"precision\": \"fp64\",\n"
@@ -170,6 +175,7 @@ int gpu_femm::RunCli(int argc, char **argv)
             << " | --motor-single-sample <request.json> <response.json>"
             << " | --motor-batch <request.json> <response.json>"
             << " | --motor-batch-profile <request.json> <response.json>"
+            << " | --motor-worker"
             << " | --mesh-artifact <gpu_femm_mesh_v1.json>"
             << " | --capabilities\n";
   return 2;
