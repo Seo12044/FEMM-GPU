@@ -63,6 +63,23 @@ The JSON-lines completion binds session, monotonically increasing submission
 number and request-byte SHA-256; EOF drains accepted work and exits. Clients
 must enforce their own per-active-job deadline and own process cancellation.
 
+The worker accepts one object per stdin line:
+
+- `session`: a constant 64-character lowercase hexadecimal nonce for this
+  worker; `sequence`: consecutive integers beginning at 1.
+- `request_path`, `response_path`: file paths. The response cannot overwrite
+  the request, executable or any artifact referenced by that request.
+- `request_sha256`: SHA-256 of the exact request bytes. The request uses the
+  existing motor-batch v1--v4 schema, capped at 32 items in streaming mode.
+
+An acknowledgement line returns the same identity fields, `exit_code` (0/1),
+`error`, and preparation/adapter timestamps relative to worker startup.
+Acknowledgement alone is not a sample-validation gate: consumers must still
+validate the response protocol, ordered task IDs, artifact provenance, actual
+currents, item statuses, backend evidence and convergence. Keep queued request
+and artifact files immutable until their acknowledgement. A rejected request
+consumes its valid envelope number but does not discard following jobs.
+
 Run the ordinary CTest suite in both cuDSS-enabled and disabled builds.
 `gpu_femm_source_layout` also guards the small entry point, independently
 compiled sources, header guards and production/test boundary without CUDA.
