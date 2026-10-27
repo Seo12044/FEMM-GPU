@@ -1,5 +1,55 @@
 # GPU solver performance
 
+## Functional module split, 2026-10-27
+
+The former 11,797-line `src/linear_p1_poc.cu` is now a six-line entry point.
+The core, physics, solvers, IO, postprocessors and application adapters are
+independently compiled modules; native fixtures and regression commands are
+in `tests/native`. See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership.
+PCG kernels are separate from CSR management. The largest numerical source
+is 825 lines after applying the checked-in formatting rules.
+
+This is a structural change, not a new convergence policy. FP64 equations,
+element/reduction order, kernel configurations, tolerances, backend defaults,
+CLI protocols and checkpoint-visible responses were retained. Removed code
+was limited to nine obsolete textual-include/header fragments, the unread
+`mapped_regions` accumulator, and two uncalled sector-compatibility helpers.
+File-local helpers no longer have unnecessary external declarations.
+
+Final Release validation with CUDA 13.3/MSVC 19.44:
+
+| Check | Result |
+| --- | --- |
+| cuDSS-enabled CTest suite | 17/17 PASS |
+| cuDSS-disabled CTest suite | 15/15 PASS; no cuDSS DLL dependency |
+| PCG old/new saved batches | 6 requests, 81 item pairs, exact equality |
+| cuDSS old/new saved batches | 6 requests, 81 item pairs, exact equality |
+| Complete nodal A and element B output | 2 operating points x 2 backends, 4 exact comparisons |
+| CUDA memcheck, PCG and cuDSS | 0 errors, 0 leaked bytes |
+| CUDA synccheck, PCG self-test | 0 errors |
+
+The saved batches cover no-load poses, suspension-current perturbations,
+native cyclic sectors, eccentric dynamics and 32-item no-load/load batches.
+Each backend was compared with the same backend before the split, not with
+the other linear solver. `--strict-parity` ignored timing only: force,
+torque, sampled B, linkage, residuals, iteration counts and cache counters
+all matched exactly. Maximum numeric difference was zero. Full-field checks
+also matched every returned nodal and element value. The capability JSON
+and executable alias were unchanged. These are result-preservation checks,
+not a speedup measurement.
+
+Local evidence under `../../refactor-20261027/`:
+
+- `ctest-enabled-final.log`, `ctest-disabled-final.log`.
+- `pcg-final/report.json`, `cudss-final/report.json` and retained responses.
+- `full-fields/report.json`, derived requests and full-field responses.
+- `memcheck-pcg-final.log`, `memcheck-cudss-final.log`, `synccheck-pcg-final.log`.
+
+The original production executable was not overwritten:
+`91d0413e80929bfd8d20227b243922e1cb67206b77aa265a7bdf378ebfb4947b`.
+The tested refactor binary is `build-refactor-20261027/Release`, SHA-256
+`c169322bb01f668a1ff72becc7eb51b8e13f816677c5be882ef15d90b40d6826`.
+
 ## Optional cuDSS direct backend, 2026-10-27
 
 The default remains Jacobi PCG. `GPU_SOLVER_ENABLE_CUDSS=ON` adds an explicit
@@ -10,7 +60,7 @@ motor force components exceed the existing binary-comparison gate. Do not
 describe that benchmark as an accuracy-gate PASS or silently replace a
 production PCG executable.
 
-Implementation: `src/cudss_direct_solver.cuh`. cuDSS solves the FP64 SPD inner
+Implementation: `src/solvers/cudss_direct_solver.cu`. cuDSS solves the FP64 SPD inner
 system with sparse Cholesky, retaining the existing nonlinear solve and all
 postprocessors. Deterministic mode is enabled; factor downcasting, hybrid
 CPU execution, and pivot perturbation are disabled. cuDSS 1.0 does not allow
@@ -180,7 +230,7 @@ Changes:
   include the packed values.
 
 Implementation: `src/pcg_spmv_layout.cuh` and the PCG kernels in
-`src/linear_p1_poc.cu`. No new library dependency or motor-specific heuristic
+`src/solvers/pcg_kernels.cu`. No new library dependency or motor-specific heuristic
 is introduced. The layout follows the general memory-access principles in
 NVIDIA's [Sliced ELL storage description](https://docs.nvidia.com/cuda/cusparse/storage-formats.html)
 and [coalesced-access guidance](https://developer.nvidia.com/blog/unlock-gpu-performance-global-memory-access-in-cuda/);
@@ -244,7 +294,8 @@ analysis checkpoint, or original solver executable is changed.
 `block-jacobi` uses FP64 Cholesky inverses of contiguous 8-node principal
 blocks. It is not a port of FEMM 5's CPU incomplete-LDL or an algebraic
 multigrid preconditioner. The kernel, cache and tests live in
-`src/block_jacobi_preconditioner.cuh` and `src/block_preconditioner_tests.inc`.
+`src/solvers/block_jacobi_preconditioner.cu` and
+`tests/native/block_preconditioner_regression.cu`.
 Both one-block and cooperative PCG paths support it. Jacobi keeps a separate
 kernel specialization and does not allocate the block cache.
 

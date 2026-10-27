@@ -14,24 +14,117 @@ set(GPU_SOLVER_CUDA_ARCHITECTURES "" CACHE STRING
 
 enable_language(CUDA)
 find_package(Threads REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+
+set(GPU_SOLVER_CORE_SOURCES
+  src/core/types.cpp
+  src/core/profile.cpp
+  src/core/cuda_buffer.cu
+  src/physics/linear_model.cpp
+  src/physics/nonlinear_model.cpp
+  src/physics/nonlinear_assembly.cu
+  src/solvers/options.cpp
+  src/solvers/block_jacobi_preconditioner.cu
+  src/solvers/pcg_spmv_layout.cu
+  src/solvers/cudss_direct_solver.cu
+  src/solvers/csr_solver.cu
+  src/solvers/pcg_kernels.cu
+  src/solvers/linear_solver.cu
+  src/solvers/nonlinear_solver.cu
+  src/io/strict_json.cpp
+  src/io/mesh_artifact.cpp
+  src/io/sample_request.cpp
+  src/io/json_output.cpp
+  src/postprocess/field_postprocess.cpp
+  src/postprocess/airgap_postprocess.cpp
+  src/postprocess/weighted_stress.cu
+  src/app/sample_adapter.cpp
+  src/app/batch_prepare.cpp
+  src/app/batch_response.cpp
+  src/app/motor_batch.cpp
+  src/native_airgap_matrix.cpp
+)
+set(GPU_SOLVER_TEST_SOURCES
+  tests/native/comparison.cpp
+  tests/native/fixtures.cpp
+  tests/native/mesh_artifact_test.cpp
+  tests/native/reference.cpp
+  tests/native/reference_adapter.cu
+  tests/native/reference_commands.cu
+  tests/native/block_preconditioner_regression.cu
+  tests/native/cudss_regression.cu
+  tests/native/nonlinear_tolerance_regression.cu
+  tests/native/pcg_regression.cu
+  tests/native/pcg_spmv_layout_regression.cu
+  tests/native/physics_regression.cu
+  tests/native/protocol_contract_tests.cu
+  tests/native/self_test.cu
+)
+
+add_library(femm_gpu_core STATIC ${GPU_SOLVER_CORE_SOURCES})
+target_include_directories(femm_gpu_core
+  PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
+)
+target_link_libraries(femm_gpu_core PUBLIC Threads::Threads CUDA::cudart)
+
+add_library(femm_gpu_test_support STATIC ${GPU_SOLVER_TEST_SOURCES})
+target_include_directories(femm_gpu_test_support PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/native"
+)
+target_link_libraries(femm_gpu_test_support PUBLIC femm_gpu_core)
 
 add_executable(gpu_linear_p1_poc
   src/linear_p1_poc.cu
-  src/native_airgap_matrix.cpp
+  src/app/cli.cpp
 )
-# CUDA's Visual Studio dependency scanner can omit local .inc/.cuh includes.
-# List them explicitly so an incremental build cannot test an old kernel.
+target_include_directories(gpu_linear_p1_poc PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/native"
+)
+target_link_libraries(gpu_linear_p1_poc PRIVATE femm_gpu_test_support)
+# NVCC's Visual Studio scanner can miss local CUDA headers. Track the actual
+# module headers for every CUDA translation unit, including newly added ones.
 if(CMAKE_GENERATOR MATCHES "Visual Studio" AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
-  set(GPU_SOLVER_CUDA_HEADERS
-    axisymmetric_p1.h native_airgap_matrix.h signed_node_constraints.h
-    safeguarded_nonlinear_solve.inc pcg_regression_tests.inc
-    nonlinear_tolerance_tests.inc block_preconditioner_tests.inc
-    block_jacobi_preconditioner.cuh pcg_spmv_layout.cuh pcg_spmv_layout_tests.inc)
-  list(APPEND GPU_SOLVER_CUDA_HEADERS cudss_direct_solver.cuh cudss_regression_tests.inc)
-  list(TRANSFORM GPU_SOLVER_CUDA_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/src/")
+  file(GLOB_RECURSE GPU_SOLVER_CUDA_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cuh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/physics/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/physics/*.cuh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/solvers/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/solvers/*.cuh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/io/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/io/*.cuh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/postprocess/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/postprocess/*.cuh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/app/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/app/*.cuh"
+  )
+  list(APPEND GPU_SOLVER_CUDA_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/axisymmetric_p1.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/native_airgap_matrix.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/signed_node_constraints.h"
+  )
+  file(GLOB_RECURSE GPU_SOLVER_TEST_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/*.cuh"
+  )
+  list(APPEND GPU_SOLVER_TEST_HEADERS ${GPU_SOLVER_CUDA_HEADERS})
   string(REPLACE ";" "\\;" GPU_SOLVER_CUDA_HEADERS "${GPU_SOLVER_CUDA_HEADERS}")
+  string(REPLACE ";" "\\;" GPU_SOLVER_TEST_HEADERS "${GPU_SOLVER_TEST_HEADERS}")
+  foreach(GPU_SOLVER_SOURCE IN LISTS GPU_SOLVER_CORE_SOURCES)
+    if(GPU_SOLVER_SOURCE MATCHES "\\.cu$")
+      set_property(SOURCE "${GPU_SOLVER_SOURCE}" APPEND PROPERTY VS_SETTINGS
+        "AdditionalDependencies=${GPU_SOLVER_CUDA_HEADERS}")
+    endif()
+  endforeach()
+  foreach(GPU_SOLVER_SOURCE IN LISTS GPU_SOLVER_TEST_SOURCES)
+    if(GPU_SOLVER_SOURCE MATCHES "\\.cu$")
+      set_property(SOURCE "${GPU_SOLVER_SOURCE}" APPEND PROPERTY VS_SETTINGS
+        "AdditionalDependencies=${GPU_SOLVER_TEST_HEADERS}")
+    endif()
+  endforeach()
   set_property(SOURCE src/linear_p1_poc.cu APPEND PROPERTY VS_SETTINGS
-    "AdditionalDependencies=${GPU_SOLVER_CUDA_HEADERS}")
+    "AdditionalDependencies=${GPU_SOLVER_TEST_HEADERS}")
 endif()
 # Keep the historical executable name for the MATLAB integration and publish
 # a neutral name for standalone users.  Both files are byte-identical.
@@ -52,17 +145,14 @@ if(NOT GPU_FEMM_AGE_MATRIX_SOURCE)
 endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gpu_femm_native_age_matrix.inc"
   "${GPU_FEMM_AGE_MATRIX_SOURCE}")
-target_include_directories(gpu_linear_p1_poc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-target_link_libraries(gpu_linear_p1_poc PRIVATE Threads::Threads)
 option(GPU_SOLVER_ENABLE_CUDSS "Build the optional FP64 cuDSS sparse direct backend" OFF)
 set(CUDSS_ROOT "" CACHE PATH "cuDSS prefix matching the CUDA Toolkit major version")
 if(GPU_SOLVER_ENABLE_CUDSS)
-  find_package(CUDAToolkit REQUIRED)
   find_path(CUDSS_INCLUDE_DIR cudss.h HINTS "${CUDSS_ROOT}/include" REQUIRED)
   find_library(CUDSS_LIBRARY NAMES cudss HINTS "${CUDSS_ROOT}/lib" REQUIRED)
-  target_include_directories(gpu_linear_p1_poc PRIVATE "${CUDSS_INCLUDE_DIR}")
-  target_link_libraries(gpu_linear_p1_poc PRIVATE "${CUDSS_LIBRARY}" CUDA::cublas)
-  target_compile_definitions(gpu_linear_p1_poc PRIVATE GPU_FEMM_ENABLE_CUDSS=1)
+  target_include_directories(femm_gpu_core PUBLIC "${CUDSS_INCLUDE_DIR}")
+  target_link_libraries(femm_gpu_core PUBLIC "${CUDSS_LIBRARY}" CUDA::cublas)
+  target_compile_definitions(femm_gpu_core PUBLIC GPU_FEMM_ENABLE_CUDSS=1)
   if(WIN32)
     file(GLOB CUDSS_RUNTIME_DLLS "${CUDSS_ROOT}/bin/cudss64*.dll")
     if(NOT CUDSS_RUNTIME_DLLS)
@@ -76,7 +166,7 @@ endif()
 # This target uses CUDA cooperative groups.  The existing FEMM-derived source
 # relies on the legacy MSVC preprocessor's token handling, so acknowledge the
 # CUDA header warning without changing the compiler mode for legacy code.
-target_compile_definitions(gpu_linear_p1_poc PRIVATE
+target_compile_definitions(femm_gpu_core PUBLIC
   CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
 )
 
@@ -98,14 +188,8 @@ else()
   )
 endif()
 
-set_target_properties(gpu_linear_p1_poc PROPERTIES
-  CXX_STANDARD 17
-  CXX_STANDARD_REQUIRED ON
-  CUDA_STANDARD 17
-  CUDA_STANDARD_REQUIRED ON
-)
-
-set_target_properties(gpu_bh_curve_poc PROPERTIES
+set_target_properties(femm_gpu_core femm_gpu_test_support
+  gpu_linear_p1_poc gpu_bh_curve_poc PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
   CUDA_STANDARD 17
@@ -120,20 +204,18 @@ set_target_properties(gpu_femm_mesh_noop_solver PROPERTIES
 # Forward UTF-8 handling only to the MSVC host compiler used by NVCC. This
 # prevents C4819 noise from NVIDIA headers without changing legacy targets.
 if(MSVC)
-  target_compile_options(gpu_linear_p1_poc PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-  )
-  target_compile_options(gpu_bh_curve_poc PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-  )
+  foreach(GPU_SOLVER_TARGET IN ITEMS femm_gpu_core femm_gpu_test_support
+      gpu_linear_p1_poc gpu_bh_curve_poc)
+    target_compile_options(${GPU_SOLVER_TARGET} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    )
+  endforeach()
 endif()
 
 # CMAKE_CUDA_ARCHITECTURES remains usable as the standard CMake override.
 if(GPU_SOLVER_CUDA_ARCHITECTURES)
-  set_target_properties(gpu_linear_p1_poc PROPERTIES
-    CUDA_ARCHITECTURES "${GPU_SOLVER_CUDA_ARCHITECTURES}"
-  )
-  set_target_properties(gpu_bh_curve_poc PROPERTIES
+  set_target_properties(femm_gpu_core femm_gpu_test_support
+    gpu_linear_p1_poc gpu_bh_curve_poc PROPERTIES
     CUDA_ARCHITECTURES "${GPU_SOLVER_CUDA_ARCHITECTURES}"
   )
 endif()
@@ -198,6 +280,11 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:gpu_femm_mesh_noop_solver> ignored-mesh-stem
   )
   if(Python3_Interpreter_FOUND)
+    add_test(NAME gpu_femm_source_layout
+      COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_source_layout.py")
+    set_tests_properties(gpu_femm_source_layout PROPERTIES
+      LABELS "no_cuda;source_layout" TIMEOUT 10)
     add_test(NAME gpu_cudss_cli
       COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cudss_cli.py"
         $<TARGET_FILE:gpu_linear_p1_poc>)

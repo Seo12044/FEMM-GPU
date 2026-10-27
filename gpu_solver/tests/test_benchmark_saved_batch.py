@@ -19,6 +19,17 @@ class ParityGateTests(unittest.TestCase):
         difference = compare({"torque": 0.1}, {"torque": 0.1 + 1e-12})
         self.assertGreater(difference[".torque"], 0)
 
+    def test_strict_refactor_gate_rejects_even_small_numeric_changes(self):
+        with self.assertRaises(AssertionError):
+            compare({"torque": 0.1}, {"torque": 0.1 + 1e-15}, strict=True)
+
+    def test_strict_refactor_gate_includes_counters_and_convergence(self):
+        for key in ("cache", "convergence"):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                compare({key: {"iterations": 10}}, {key: {"iterations": 11}}, strict=True)
+        compare({"timing": {"seconds": 1}, "B": [0.1]},
+                {"timing": {"seconds": 2}, "B": [0.1]}, strict=True)
+
     def test_corrupt_observable_fails(self):
         with self.assertRaises(AssertionError):
             compare({"B": [1.0]}, {"B": [1.01]})

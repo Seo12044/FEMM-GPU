@@ -7,6 +7,9 @@ does not modify an installed FEMM directory.
 See the repository [README](../README.md) for build instructions and a quick
 start.
 
+Source ownership, module boundaries and refactor checks are described in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Commands
 
 | Command | Purpose |

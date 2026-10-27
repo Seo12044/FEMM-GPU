@@ -20,28 +20,31 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def compare(reference, actual, path="", differences=None, violations=None):
+def compare(reference, actual, path="", differences=None, violations=None, *, strict=False):
     if differences is None:
         differences = {}
     if isinstance(reference, dict):
         assert isinstance(actual, dict), f"{path}: expected object"
         assert reference.keys() == actual.keys(), f"{path}: response fields changed"
         for key in reference:
-            if key in ("timing", "cache", "convergence"):
+            if key == "timing" or (not strict and key in ("cache", "convergence")):
                 continue
-            compare(reference[key], actual[key], f"{path}.{key}", differences, violations)
+            compare(reference[key], actual[key], f"{path}.{key}", differences, violations,
+                    strict=strict)
     elif isinstance(reference, list):
         assert isinstance(actual, list), f"{path}: expected array"
         assert len(reference) == len(actual), f"{path}: array length changed"
         for a, b in zip(reference, actual):
-            compare(a, b, path, differences, violations)
+            compare(a, b, path, differences, violations, strict=strict)
     elif isinstance(reference, float):
         assert isinstance(actual, (float, int)) and not isinstance(actual, bool), path
         assert math.isfinite(reference) and math.isfinite(actual), path
         delta = abs(reference - actual)
         differences[path] = max(differences.get(path, 0.0), delta)
         # A numerical comparison gate, never a production convergence setting.
-        if not math.isclose(reference, actual, rel_tol=1e-8, abs_tol=1e-9):
+        if not math.isclose(reference, actual,
+                            rel_tol=0.0 if strict else 1e-8,
+                            abs_tol=0.0 if strict else 1e-9):
             error = f"{path}: {reference} != {actual} (absolute difference {delta})"
             if violations is None:
                 raise AssertionError(error)
@@ -65,11 +68,14 @@ def main():
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--continue-on-parity-failure", action="store_true",
                         help="Collect numeric mismatches; report/exit still FAIL. Solver failures still stop.")
+    parser.add_argument("--strict-parity", action="store_true",
+                        help="Require exact results, cache counters and convergence; ignore timing only.")
     args = parser.parse_args()
     assert args.rounds > 0 and args.timeout > 0
     args.output.mkdir(parents=True, exist_ok=False)
     executables = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     report = {"status": "RUNNING", "requested_count": len(args.request),
+              "strict_parity": args.strict_parity,
               "executables": {k: {"path": str(v), "sha256": sha256(v),
                                   "preconditioner": getattr(args, f"{k}_preconditioner")}
                               for k, v in executables.items()}, "requests": []}
@@ -126,7 +132,8 @@ def run_requests(args, executables, report):
                     reference = response
                 violations = []
                 compare(reference, response, differences=maxima,
-                        violations=violations if args.continue_on_parity_failure else None)
+                        violations=violations if args.continue_on_parity_failure else None,
+                        strict=args.strict_parity)
                 record = {"binary": label, "round": repeat, "wall_seconds": elapsed,
                           "parity": "FAIL" if violations else "PASS", "parity_errors": violations,
                           "timing": response["timing"],
