@@ -2,6 +2,7 @@
 
 #include "core/cuda_buffer.cuh"
 #include "physics/nonlinear_model.h"
+#include "physics/nonlinear_topology.h"
 #include "solvers/csr_solver.cuh"
 
 #include <cstddef>
@@ -10,38 +11,11 @@
 namespace gpu_femm
 {
 
-struct DeviceNonlinearTriangle {
-  int32_t node[3];
-  int32_t quadrature_count;
-  double weight[7];
-  double b_x[7][3];
-  double b_y[7][3];
-  double shape[7][3];
-  double reluctivity_zero;
-  double alpha;
-  int32_t curve_offset;
-  int32_t curve_count;
-  double cold_secant;
-  int32_t circuit_index;
-};
-
-struct DeviceMatrixContributor {
-  int32_t triangle;
-  int8_t local_row;
-  int8_t local_column;
-  int8_t sign;
-};
-
-struct DeviceRhsContributor {
-  int32_t triangle;
-  int8_t local_row;
-  int8_t sign;
-};
-
 class DeviceNonlinearAssemblyPlan
 {
 public:
   Status Initialize(const NonlinearModel &model);
+  Status Initialize(PreparedNonlinearAssembly prepared);
 
   const Assembly &symbolic_assembly() const;
   bool initialized() const;
@@ -65,6 +39,9 @@ private:
   DeviceBuffer<DeviceRhsContributor> d_rhs_entries_;
   DeviceBuffer<int> d_valid_;
   DeviceBuffer<double> d_old_, d_currents_, d_bx_, d_by_, d_nu_, d_derivative_;
+  PinnedBuffer<double> h_old_, h_currents_;
+  PinnedBuffer<int> h_valid_;
+  std::vector<double> uploaded_currents_;
 };
 
 } // namespace gpu_femm

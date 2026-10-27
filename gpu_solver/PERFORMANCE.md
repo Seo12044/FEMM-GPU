@@ -1,5 +1,60 @@
 # GPU solver performance
 
+## Overlap nonlinear CPU preparation, 2026-10-27
+
+The adapter prepares the next two distinct operators' nonlinear topology on
+CPU while the dispatcher solves the current operator. The immutable host
+payload is separated into `physics/nonlinear_topology.{h,cpp}`; CUDA uploads,
+cuDSS calls and destruction remain on the dispatcher. Each payload belongs
+to its own model. Reinitializing a solver clears any earlier prepared payload.
+Pending result work is joined before its retired solver can be destroyed,
+including exception unwinding. At most two nonlinear CPU preparations are live.
+
+Newton stopping, damping, precision and residual checks are unchanged. State
+updates remain on CPU. Pinned staging batches the state/current/validation
+transfers into one default-stream sequence, with an explicit owned-stream
+drain on failure. Current uploads are skipped only for bitwise-equal ordered
+vectors; changing active slots or buffer capacity invalidates that shortcut.
+The isolated pinned-transfer trial was 30.081 -> 29.897 s in one pair, not an
+established separate speedup. A GPU-resident-state prototype retained exact
+node-order FP64 sums but slowed the same suite from 29.661 to 38.483 s; it was
+removed rather than weakening the stopping calculation or shipping unused code.
+
+Release evidence against the previous deterministic pipeline on RTX 4060 Ti:
+
+| Complete six-request sequence | Previous pipeline | CPU preparation pipeline | Method |
+|---|---:|---:|---|
+| cuDSS | 39.529550 s | 29.305157 s | Three alternating A/B pairs, median; 25.86% shorter, 1.349x |
+| Default Jacobi PCG | 122.784 s | 111.723 s | One compatibility pair, not an established PCG speedup |
+
+All 648 final item executions match every non-timing field exactly, including
+force, torque, flux, air-gap samples, convergence records and cache counters.
+The six saved request sets contain 81 item slots, including overlapping subsets;
+they are not six independent motor designs. In the 32-pose no-load request,
+CPU topology preparation accumulated 9.197 s but exposed only 0.322 s of wait
+in the stage-one trial. These overlapping CPU sums must not be added to wall time.
+
+The matching one-shot Nsight traces contain 23,592 kernels each. Between the
+first and last recorded CUDA activities, the no-activity interval sum falls
+14.149512 -> 6.303524 s. Kernel/copy/memset union fractions are 32.80% -> 51.12%.
+These trace unions are not SM occupancy or Windows Task Manager percentages.
+They retain Nsight instrumentation overhead; use the unprofiled A/B medians
+above for speed claims. There are still backend analysis and dependent-iteration
+gaps; this change does not execute arbitrary different-angle CUDA graphs in parallel.
+
+Native CTest: cuDSS enabled 18/18, disabled 16/16 PASS. Added regressions
+exercise exact prepared/unprepared fields and histories, invalid currents and
+replacement-model invalidation. Compute Sanitizer direct and saved-motor
+memchecks report zero errors and zero leaked bytes; saved-motor synccheck
+reports zero errors. Default PCG and standalone/one-shot interfaces remain.
+
+Baseline SHA-256: `30ee81c5f15e32990a082701eda1c69f8358bc41db97133df5d51feb990b02db`.
+Release SHA-256: `fb1cea611a4c4902529a4c42ef90cb3aa64a15df2c6a65941d905b2998f46372`.
+Raw responses, transport acknowledgements, hashes, traces and trial reports:
+local `../serial-20261027/`. The release executable and `femm_gpu.exe` alias
+are byte-identical. Old executables, meshes, source CAD and checkpoints were
+not replaced or relabelled.
+
 ## Deterministic solve pipeline, 2026-10-27
 
 The direct backend now dispatches independent numeric matrices through two

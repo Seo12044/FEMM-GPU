@@ -34,6 +34,9 @@ class NonlinearP1Solver
 public:
   Status Initialize(NonlinearModel model);
 
+  // May run on a CPU producer before this solver has acquired CUDA resources.
+  void PrepareDeviceAssembly(size_t count, NonlinearAssemblyMode mode);
+
   size_t csr_symbolic_reuse_count() const;
 
   NonlinearSolveResult Solve(double current_a, const NonlinearOptions &options = {},
@@ -78,6 +81,7 @@ private:
   NonlinearModel model_;
   bool has_nonlinear_materials_ = false;
   std::unique_ptr<DeviceNonlinearAssemblyPlan> device_assembly_;
+  std::unique_ptr<PreparedNonlinearAssembly> prepared_assembly_;
 };
 
 } // namespace gpu_femm

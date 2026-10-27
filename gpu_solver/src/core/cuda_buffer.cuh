@@ -53,4 +53,33 @@ private:
 Status CopyToDevice(void *destination, const void *source, size_t bytes);
 Status CopyToHost(void *destination, const void *source, size_t bytes);
 
+template <typename T> class PinnedBuffer
+{
+public:
+  PinnedBuffer() = default;
+  ~PinnedBuffer() { reset(); }
+  PinnedBuffer(const PinnedBuffer &) = delete;
+  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
+
+  Status allocate(size_t count)
+  {
+    reset();
+    if (count && cudaMallocHost(&ptr_, count * sizeof(T)) != cudaSuccess) {
+      ptr_ = nullptr;
+      return Status::kGpuAllocationFailed;
+    }
+    return Status::kOk;
+  }
+  T *get() { return ptr_; }
+  void reset()
+  {
+    if (ptr_)
+      cudaFreeHost(ptr_);
+    ptr_ = nullptr;
+  }
+
+private:
+  T *ptr_ = nullptr;
+};
+
 } // namespace gpu_femm

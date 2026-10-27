@@ -222,7 +222,10 @@ NonlinearP1Solver::SolveBatch(const std::vector<std::vector<double>> &currents,
       (requested_mode == NonlinearAssemblyMode::kAuto && device_assembly_worthwhile);
   if (device_assembly_active) {
     device_assembly_ = std::make_unique<DeviceNonlinearAssemblyPlan>();
-    const Status plan_status = device_assembly_->Initialize(model_);
+    const Status plan_status = prepared_assembly_
+                                   ? device_assembly_->Initialize(std::move(*prepared_assembly_))
+                                   : device_assembly_->Initialize(model_);
+    prepared_assembly_.reset();
     const Status setup_status = plan_status == Status::kOk
                                     ? csr_solver_.Initialize(device_assembly_->symbolic_assembly())
                                     : plan_status;
@@ -767,6 +770,17 @@ NonlinearSolveResult NonlinearP1Solver::Solve(const std::vector<double> &circuit
 
 size_t NonlinearP1Solver::csr_symbolic_reuse_count() const { return csr_symbolic_reuse_count_; }
 
+void NonlinearP1Solver::PrepareDeviceAssembly(size_t count, NonlinearAssemblyMode mode)
+{
+  const size_t points = model_.problem_type == MagneticProblemType::kAxisymmetric ? 7 : 1;
+  if (!initialized_ || mode == NonlinearAssemblyMode::kHost ||
+      (mode == NonlinearAssemblyMode::kAuto && model_.triangles.size() * points * count < 4096))
+    return;
+  auto prepared = std::make_unique<PreparedNonlinearAssembly>();
+  if (PrepareNonlinearAssembly(model_, prepared.get()) == Status::kOk)
+    prepared_assembly_ = std::move(prepared);
+}
+
 Status NonlinearP1Solver::Initialize(NonlinearModel model)
 {
   const Status status = ValidateNonlinearModel(model);
@@ -780,6 +794,7 @@ Status NonlinearP1Solver::Initialize(NonlinearModel model)
       });
   csr_symbolic_reuse_count_ = 0;
   device_assembly_.reset();
+  prepared_assembly_.reset();
   initialized_ = true;
   return Status::kOk;
 }

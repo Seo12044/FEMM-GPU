@@ -129,7 +129,7 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
   // geometry artifact is parsed once for the whole batch regardless of CUDA
   // chunk width.
   std::vector<MotorBatchResponseDto> responses(request.items.size());
-  NonlinearP1Solver cached_solver;
+  auto cached_solver = std::make_unique<NonlinearP1Solver>();
   std::string cached_fingerprint;
   int32_t cache_hits = 0;
   int32_t chunk_count = 0;
@@ -234,6 +234,30 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
     // then overlap pure-CPU stencil construction with the magnetic solve.
     const std::vector<std::vector<size_t>> operator_groups =
         GroupMotorBatchPreparedItemsByOperator(prepared);
+    struct PreparedSolver {
+      std::unique_ptr<NonlinearP1Solver> solver;
+      Status status = Status::kInternalError;
+      double compute_seconds = 0.0;
+    };
+    auto launch_solver = [&](size_t index) {
+      return LaunchCpuTask([&, index]() {
+        PreparedSolver result;
+        const auto start = ProfileClock::now();
+        const auto &group = operator_groups[index];
+        result.solver = std::make_unique<NonlinearP1Solver>();
+        result.status = result.solver->Initialize(prepared[group.front()].model);
+        if (result.status == Status::kOk)
+          result.solver->PrepareDeviceAssembly(group.size(), assembly_mode);
+        result.compute_seconds = ProfileSecondsSince(start);
+        return result;
+      });
+    };
+    // Only CPU plans run ahead. CUDA allocations and submissions stay on this
+    // dispatcher, and each plan remains bound to its own immutable model.
+    const size_t solver_window = std::min<size_t>(2, operator_groups.size());
+    std::vector<std::future<PreparedSolver>> pending_solvers(operator_groups.size());
+    for (size_t index = 0; index < solver_window; ++index)
+      pending_solvers[index] = launch_solver(index);
     struct PreparedFrozenPostprocessPlan {
       FrozenPostprocessOptions options;
       FrozenPostprocessPlan plan;
@@ -297,10 +321,13 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
     for (size_t group_index = 0; group_index < frozen_plan_prefetch_window; ++group_index) {
       pending_frozen_plans[group_index] = launch_group_frozen_plan(group_index);
     }
+    std::unique_ptr<NonlinearP1Solver> retired_solver;
     std::future<MotorBatchPostprocessResult> pending_postprocess;
     auto consume_postprocess = [&]() {
-      if (!pending_postprocess.valid())
+      if (!pending_postprocess.valid()) {
+        retired_solver.reset();
         return;
+      }
       auto result = pending_postprocess.get();
       for (size_t index : result.indices)
         responses[index] = std::move(result.responses[index]);
@@ -311,11 +338,18 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
       timing.tangent_operator_seconds += result.timing.tangent_operator_seconds;
       timing.tangent_postprocess_seconds += result.timing.tangent_postprocess_seconds;
       timing.postprocess_seconds += result.timing.postprocess_seconds;
+      retired_solver.reset();
     };
     for (size_t group_index = 0; group_index < operator_groups.size(); ++group_index) {
       const std::vector<size_t> &group = operator_groups[group_index];
       if (group.empty())
         continue;
+      const auto solver_wait_start = ProfileClock::now();
+      auto ready_solver = pending_solvers[group_index].get();
+      timing.nonlinear_prepare_wait_seconds += ProfileSecondsSince(solver_wait_start);
+      timing.nonlinear_prepare_compute_seconds += ready_solver.compute_seconds;
+      if (group_index + solver_window < operator_groups.size())
+        pending_solvers[group_index + solver_window] = launch_solver(group_index + solver_window);
       const ProfileClock::time_point plan_wait_start = ProfileClock::now();
       PreparedFrozenPostprocessPlan prepared_frozen_plan = pending_frozen_plans[group_index].get();
       const double plan_wait_seconds = ProfileSecondsSince(plan_wait_start);
@@ -358,10 +392,13 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
       }
       if (cached_fingerprint != representative.operator_key) {
         const ProfileClock::time_point initialize_start = ProfileClock::now();
-        const Status initialize_status = cached_solver.Initialize(representative.model);
+        const Status initialize_status = ready_solver.status;
+        retired_solver = std::move(cached_solver);
+        cached_solver = std::move(ready_solver.solver);
         timing.solver_initialize_seconds += ProfileSecondsSince(initialize_start);
         cached_fingerprint = initialize_status == Status::kOk ? representative.operator_key : "";
         if (initialize_status != Status::kOk) {
+          consume_postprocess();
           for (size_t prepared_index : group)
             responses[prepared[prepared_index].request_index].status = initialize_status;
           continue;
@@ -381,9 +418,9 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
         group_currents.push_back(prepared[prepared_index].currents);
       const NonlinearOptions options = ProductionSampleOptions();
       NonlinearBatchTiming chunk_timing;
-      std::vector<NonlinearSolveResult> chunk_solutions = cached_solver.SolveBatch(
+      std::vector<NonlinearSolveResult> chunk_solutions = cached_solver->SolveBatch(
           group_currents, options, &batched_pcg_launches, &chunk_timing, assembly_mode);
-      const size_t current_csr_symbolic_reuse_count = cached_solver.csr_symbolic_reuse_count();
+      const size_t current_csr_symbolic_reuse_count = cached_solver->csr_symbolic_reuse_count();
       if (current_csr_symbolic_reuse_count >= accounted_csr_symbolic_reuse_count) {
         csr_symbolic_cache_hits +=
             current_csr_symbolic_reuse_count - accounted_csr_symbolic_reuse_count;
@@ -421,10 +458,11 @@ int MotorBatchAdapter(const std::string &request_path, const std::string &respon
                  item.sector_performance.enabled ==
                      representative_request.sector_performance.enabled));
       });
-      auto postprocess_group = [&, group, options, chunk_solutions = std::move(chunk_solutions),
+      auto postprocess_group = [&, group, options, group_solver = cached_solver.get(),
+                                chunk_solutions = std::move(chunk_solutions),
                                 prepared_frozen_plan = std::move(prepared_frozen_plan)]() mutable {
         return PostprocessMotorBatchGroup(request, prepared, group, std::move(chunk_solutions),
-                                          std::move(prepared_frozen_plan.plan), cached_solver,
+                                          std::move(prepared_frozen_plan.plan), *group_solver,
                                           options, &batched_pcg_launches);
       };
       // At most one previous result group is retained. Only the dispatcher

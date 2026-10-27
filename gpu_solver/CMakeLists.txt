@@ -22,6 +22,7 @@ set(GPU_SOLVER_CORE_SOURCES
   src/core/cuda_buffer.cu
   src/physics/linear_model.cpp
   src/physics/nonlinear_model.cpp
+  src/physics/nonlinear_topology.cpp
   src/physics/nonlinear_assembly.cu
   src/solvers/options.cpp
   src/solvers/block_jacobi_preconditioner.cu

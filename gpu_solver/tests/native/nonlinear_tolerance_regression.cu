@@ -96,15 +96,39 @@ int NonlinearToleranceTests()
   for (auto mode : {NonlinearAssemblyMode::kHost, NonlinearAssemblyMode::kDevice}) {
     const auto control = solver.SolveBatch(currents, fixed, nullptr, nullptr, mode);
     const auto batch = solver.SolveBatch(currents, adaptive, nullptr, nullptr, mode);
+    solver.PrepareDeviceAssembly(currents.size(), mode);
+    const auto prepared = solver.SolveBatch(currents, adaptive, nullptr, nullptr, mode);
     for (size_t item = 0; item < 3; ++item) {
       expect(same_field(control[item], batch[item]), "adaptive host/device batch field parity");
       expect(batch[item].last_linear_tolerance == adaptive.linear_relative_tolerance,
              "each valid batch item finishes at exact precision");
+      expect(prepared[item].a_wb_per_m == batch[item].a_wb_per_m &&
+                 prepared[item].residual_history == batch[item].residual_history &&
+                 prepared[item].linear_iterations == batch[item].linear_iterations &&
+                 prepared[item].circuit_flux_linkage_wb == batch[item].circuit_flux_linkage_wb,
+             "CPU-prepared operator retains exact fields, stopping history and flux");
     }
     expect(batch[3].info.status == Status::kInvalidArgument &&
                batch[4].info.status == Status::kInvalidArgument,
            "invalid batch currents remain failures");
   }
+  auto changed_model = model;
+  for (auto &node : changed_model.nodes)
+    node.x_m *= 1.1;
+  solver.PrepareDeviceAssembly(3, NonlinearAssemblyMode::kDevice);
+  NonlinearP1Solver changed_solver;
+  expect(solver.Initialize(changed_model) == Status::kOk &&
+             changed_solver.Initialize(changed_model) == Status::kOk,
+         "replacement model initializes independently of prefetched topology");
+  const auto replaced = solver.SolveBatch({{2.0}, {0.0}, {-1.5}}, adaptive, nullptr, nullptr,
+                                          NonlinearAssemblyMode::kDevice);
+  const auto fresh = changed_solver.SolveBatch({{2.0}, {0.0}, {-1.5}}, adaptive, nullptr, nullptr,
+                                               NonlinearAssemblyMode::kDevice);
+  expect(replaced[0].a_wb_per_m == fresh[0].a_wb_per_m &&
+             replaced[1].a_wb_per_m == fresh[1].a_wb_per_m &&
+             replaced[2].residual_history == fresh[2].residual_history,
+         "initializing a different model discards old CPU topology");
+  expect(solver.Initialize(model) == Status::kOk, "restore original nonlinear fixture");
   const auto guarded = solver.SolveSafeguarded({2.0}, adaptive);
   expect(same_field(reference, guarded) &&
              guarded.verified_equation_residual_relative <= adaptive.relative_tolerance &&

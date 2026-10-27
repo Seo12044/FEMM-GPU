@@ -165,6 +165,8 @@ struct MotorBatchTiming {
   double preflight_seconds = 0.0;
   double artifact_read_validate_seconds = 0.0;
   double solver_initialize_seconds = 0.0;
+  double nonlinear_prepare_compute_seconds = 0.0;
+  double nonlinear_prepare_wait_seconds = 0.0;
   NonlinearBatchTiming nonlinear;
   double postprocess_plan_compute_seconds = 0.0;
   double postprocess_plan_seconds = 0.0;

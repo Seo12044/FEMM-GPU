@@ -311,6 +311,9 @@ bool WriteMotorBatchResponse(const std::string &path, const MotorBatchRequest *r
            << ", \"preflight_seconds\": " << timing->preflight_seconds
            << ", \"artifact_read_validate_seconds\": " << timing->artifact_read_validate_seconds
            << ", \"solver_initialize_seconds\": " << timing->solver_initialize_seconds
+           << ", \"nonlinear_prepare_compute_seconds\": "
+           << timing->nonlinear_prepare_compute_seconds
+           << ", \"nonlinear_prepare_wait_seconds\": " << timing->nonlinear_prepare_wait_seconds
            << ", \"host_assembly_seconds\": " << timing->nonlinear.host_assembly_seconds
            << ", \"device_assembly_seconds\": " << timing->nonlinear.device_assembly_seconds
            << ", \"gpu_upload_seconds\": " << timing->nonlinear.gpu_upload_seconds
