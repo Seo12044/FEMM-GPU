@@ -1,5 +1,155 @@
 # GPU solver performance
 
+## Optional cuDSS direct backend, 2026-10-27
+
+The default remains Jacobi PCG. `GPU_SOLVER_ENABLE_CUDSS=ON` adds an explicit
+`--linear-solver cudss` option; it does not change any MATLAB run, result
+signature, request, mesh, material table, or original executable. The direct
+backend is experimental: convergence/reference tests pass, but some saved
+motor force components exceed the existing binary-comparison gate. Do not
+describe that benchmark as an accuracy-gate PASS or silently replace a
+production PCG executable.
+
+Implementation: `src/cudss_direct_solver.cuh`. cuDSS solves the FP64 SPD inner
+system with sparse Cholesky, retaining the existing nonlinear solve and all
+postprocessors. Deterministic mode is enabled; factor downcasting, hybrid
+CPU execution, and pivot perturbation are disabled. cuDSS 1.0 does not allow
+its iterative refinement in deterministic mode, so library refinement is
+disabled. Each returned solution still has to pass the caller's original
+full-CSR `||Ax-b||/||b||` tolerance. An inaccurate direct result fails; it
+does not receive a looser tolerance or a CPU fallback.
+
+The full CSR graph must have strictly sorted columns and reciprocal entries.
+Numeric skew is checked on the local diagonal/operator scale, not relative
+to a nearly cancelled off-diagonal. The first strict entry-relative check
+rejected an actual motor matrix with maximum skew `2.3283064e-10` against a
+largest diagonal `5.1421439e6`. The final guard accepts roundoff-scale skew
+only and still checks the original, unmodified matrix in the true residual.
+Significant asymmetry, nonfinite values, non-positive diagonals, and failed
+Cholesky minors are rejected. The original matrix is never symmetrized or
+shifted in application memory.
+
+Symbolic analysis is reused for one initialized graph. Numerical factors
+are retained only for a private, unchanged operator. A coefficient update
+invalidates them, including off-diagonal-only changes and writes to the same
+device address. Distinct batch operators refactor sequentially using one
+factor workspace per solver; they cannot inherit a previous slot's factors.
+The real nonlinear benchmarks therefore have many factorizations but few
+analyses, not one numerical factorization for an entire nonlinear campaign.
+
+Tests cover manufactured solutions and an independent residual at
+1/7/33/4097 rows, shared and distinct operators, zero and failed RHS slots,
+host/device coefficient updates, reinitialization, singular and malformed
+systems, matrix scales `1e-140` and `1e140`, invalid tolerances and budgets,
+and 100 deterministic refactorizations with no warmed GPU-memory growth.
+Four concurrent independent plans also verify solution isolation and exact
+phase accounting. Geometry-mask prefetch threads publish their diagnostics
+under a mutex; each plan retains its own factors and buffers.
+Neutral periodic, anti-periodic, and axisymmetric fixtures compare full
+fields across host/device assembly and PCG/direct solves. Default and
+explicit PCG results are identical on those fixtures. The frozen nonlinear
+FEMM field/flux reference passes with cuDSS.
+The frozen linear FEMM reference and nonlinear force/torque/air-gap
+postprocessing reference also pass with direct solving selected explicitly.
+With `CUDA_VISIBLE_DEVICES=-1`, direct solving returns
+`GPU_FEMM_GPU_UNAVAILABLE` rather than switching to a CPU solve.
+
+Final CTest: **16/16 passed** with cuDSS and **14/14 passed** with it disabled.
+The disabled build does not link/load cuDSS and rejects its option.
+The Python benchmark parity/option tests pass 14/14. Compute Sanitizer
+memcheck reports **0 errors, 0 leaked bytes** and synccheck **0 errors** on
+the direct regression, including singular-factor recovery and 100 repeated
+factorizations. NVIDIA's [configuration restrictions](https://docs.nvidia.com/cuda/cudss/latest/types.html)
+and [runtime requirements](https://docs.nvidia.com/cuda/cudss/latest/getting_started.html)
+are reflected in the build and documented in [README.md](README.md).
+
+Two saved full-field requests from the current optimization, Cases 0334 and
+0466 (`id=0, iq=1 A-command`, 0 mechanical degrees), were also solved without
+preparing new meshes. Both PCG/direct runs passed with 21 nonlinear iterations.
+Maximum PCG/direct differences:
+
+| Case | Nodal A [Wb/m] | Element B component [T] | Torque [N m] | Force component [N] |
+| --- | ---: | ---: | ---: | ---: |
+| 0334 | 4.289e-12 | 5.657e-8 | 2.159e-10 | 1.012e-8 |
+| 0466 | 1.539e-11 | 3.855e-8 | 1.803e-10 | 3.118e-9 |
+
+These are measured differences, not an assertion that the old PCG field is
+an exact solution or that every full-field element passes the benchmark's
+flat `1e-9` absolute gate. Original saturation fields and plots were not
+overwritten. The new enabled binary in explicit PCG mode also reproduces
+the saved 3-item no-load and 4-item suspension PCG responses with **zero**
+observable difference, identical convergence records, and identical PCG
+iteration totals.
+
+### Final saved-motor measurements
+
+RTX 4060 Ti 8 GB, driver 610.62, CUDA 13.3, cuDSS 1.0.0.35, MSVC 19.44,
+Release (`sm_86` plus PTX). Optimization and sanitizer processes were stopped.
+Each row is the median complete-process time over three alternating A/B
+rounds, including parsing, symbolic analysis, numerical factorization,
+nonlinear iteration, and postprocessing. Baseline is optimized Jacobi PCG.
+
+| Saved request | Items | PCG [s] | cuDSS [s] | Speedup | Time reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Case 118, no-load poses | 3 | 7.315 | 3.013 | 2.428x | 58.81% |
+| Case 118, suspension-current perturbations | 4 | 4.650 | 2.258 | 2.059x | 51.44% |
+| Case 882, native cyclic sector | 6 | 2.230 | 1.407 | 1.585x | 36.91% |
+| Case 117, eccentric dynamics | 4 | 12.224 | 5.972 | 2.047x | 51.14% |
+| Case 118, complete saved no-load batch | 32 | 73.113 | 22.844 | 3.201x | 68.76% |
+| Case 118, complete saved suspension batch | 32 | 32.993 | 10.917 | 3.022x | 66.91% |
+
+All **486 item executions** converged below the unchanged `1e-6` gate;
+maximum reported nonlinear residual was `9.984785278794787e-7`. Small requests
+overlap the larger batches, so these are not 81 independent operating states.
+Nonlinear iteration counts matched PCG. The three direct responses per
+request, including all returned convergence records, were exactly repeatable.
+The largest cuDSS plan device-memory estimate was `66,043,580` bytes
+(62.98 MiB), excluding application buffers and other live plans.
+
+Maximum differences across the batch comparisons:
+
+- Torque: `1.373e-10 N m`.
+- Fx/Fy component: `2.817e-8 N`.
+- Sampled radial air-gap B: `4.189e-10 T`.
+- Circuit flux linkage: `7.926e-12 Wb`.
+
+The unchanged comparison uses `rtol=1e-8`, `atol=1e-9`. Force-component
+differences exceeded it in five of six request sets (15 candidate process
+runs). The sector set passed. The final comparison report is therefore
+**FAILED**, despite every physical solve converging. The gate was not
+relaxed and the failed comparisons were not discarded. These measurements
+establish a saved-input speed benefit and quantify the numerical differences;
+they do not establish strict binary parity, a full-optimization speedup, or
+mesh-discretization accuracy. PCG remains the default.
+
+Local evidence under `../../cudss-20261027/`:
+
+- `final-threadsafe-ab/report.json`: final timings, raw response paths,
+  per-run differences, and input/executable hashes. Earlier `smoke-*` and
+  `final-ab` directories are intermediate evidence, not this release's timings.
+- `motor-fields/`: the two current-design full-field comparisons.
+- `default-pcg-parity/report.json`: unchanged PCG outputs, **PASS**.
+- `ctest-delivery.log`, `ctest-off-threadsafe.log`,
+  `memcheck-direct-threadsafe.log`, `synccheck-direct-threadsafe.log`.
+
+Executable SHA-256 values:
+
+- Baseline: `a0d2a58945a752ac28555342b233e64322bbda9af8547ec5f3d7c88488071f39`.
+- Candidate: `91d0413e80929bfd8d20227b243922e1cb67206b77aa265a7bdf378ebfb4947b`.
+
+Candidate: `build-cudss-20261027/Release`; `femm_gpu.exe` and
+`gpu_linear_p1_poc.exe` are byte-identical. The mode must be selected explicitly.
+
+The production optimization was already `CANCELLED` when inspected and was
+left stopped for these benchmarks. The user subsequently accepted the measured
+differences and requested an explicit cuDSS continuation. MATLAB integration
+now forwards the option and separates its checkpoint identity; a validated
+observation-migration receipt retains 1,033 completed PCG cases without
+rebasing their solver checkpoints. Integration/reuse regressions passed
+140/140, and Python frontend tests passed 15/15. Production continuation is
+recorded in the MATLAB repository's `docs/agent-handoff.md`. This acceptance
+does not change the failed strict comparison report or the native PCG default.
+
 ## Jacobi execution and sparse-storage optimization, 2026-10-21
 
 This change keeps Jacobi, FP64, CSR row order, scalar reduction order, the

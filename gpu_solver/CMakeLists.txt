@@ -27,6 +27,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio" AND CMAKE_VERSION VERSION_GREATER_EQU
     safeguarded_nonlinear_solve.inc pcg_regression_tests.inc
     nonlinear_tolerance_tests.inc block_preconditioner_tests.inc
     block_jacobi_preconditioner.cuh pcg_spmv_layout.cuh pcg_spmv_layout_tests.inc)
+  list(APPEND GPU_SOLVER_CUDA_HEADERS cudss_direct_solver.cuh cudss_regression_tests.inc)
   list(TRANSFORM GPU_SOLVER_CUDA_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/src/")
   string(REPLACE ";" "\\;" GPU_SOLVER_CUDA_HEADERS "${GPU_SOLVER_CUDA_HEADERS}")
   set_property(SOURCE src/linear_p1_poc.cu APPEND PROPERTY VS_SETTINGS
@@ -53,6 +54,25 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gpu_femm_native_age_matrix.inc"
   "${GPU_FEMM_AGE_MATRIX_SOURCE}")
 target_include_directories(gpu_linear_p1_poc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(gpu_linear_p1_poc PRIVATE Threads::Threads)
+option(GPU_SOLVER_ENABLE_CUDSS "Build the optional FP64 cuDSS sparse direct backend" OFF)
+set(CUDSS_ROOT "" CACHE PATH "cuDSS prefix matching the CUDA Toolkit major version")
+if(GPU_SOLVER_ENABLE_CUDSS)
+  find_package(CUDAToolkit REQUIRED)
+  find_path(CUDSS_INCLUDE_DIR cudss.h HINTS "${CUDSS_ROOT}/include" REQUIRED)
+  find_library(CUDSS_LIBRARY NAMES cudss HINTS "${CUDSS_ROOT}/lib" REQUIRED)
+  target_include_directories(gpu_linear_p1_poc PRIVATE "${CUDSS_INCLUDE_DIR}")
+  target_link_libraries(gpu_linear_p1_poc PRIVATE "${CUDSS_LIBRARY}" CUDA::cublas)
+  target_compile_definitions(gpu_linear_p1_poc PRIVATE GPU_FEMM_ENABLE_CUDSS=1)
+  if(WIN32)
+    file(GLOB CUDSS_RUNTIME_DLLS "${CUDSS_ROOT}/bin/cudss64*.dll")
+    if(NOT CUDSS_RUNTIME_DLLS)
+      message(FATAL_ERROR "CUDSS_ROOT must contain the matching cuDSS runtime DLL")
+    endif()
+    add_custom_command(TARGET gpu_linear_p1_poc POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDSS_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:gpu_linear_p1_poc> VERBATIM)
+  endif()
+endif()
 # This target uses CUDA cooperative groups.  The existing FEMM-derived source
 # relies on the legacy MSVC preprocessor's token handling, so acknowledge the
 # CUDA header warning without changing the compiler mode for legacy code.
@@ -123,6 +143,16 @@ if(BUILD_TESTING)
   add_test(NAME gpu_linear_p1_selftest
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --self-test
   )
+  if(GPU_SOLVER_ENABLE_CUDSS)
+    add_test(NAME gpu_cudss_regression
+      COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --internal-cudss-test)
+    add_test(NAME gpu_cudss_nonlinear_reference
+      COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --linear-solver cudss --nonlinear-reference
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nonlinear_pm_coil_v1/nonlinear_pm_coil_planar"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/35PN230_v1")
+    set_tests_properties(gpu_cudss_regression gpu_cudss_nonlinear_reference PROPERTIES
+      LABELS "gpu;requires_cuda;cudss" TIMEOUT 120)
+  endif()
   add_test(NAME gpu_block_jacobi_selftest
     COMMAND $<TARGET_FILE:gpu_linear_p1_poc> --preconditioner block-jacobi --self-test
   )
@@ -168,6 +198,10 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:gpu_femm_mesh_noop_solver> ignored-mesh-stem
   )
   if(Python3_Interpreter_FOUND)
+    add_test(NAME gpu_cudss_cli
+      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cudss_cli.py"
+        $<TARGET_FILE:gpu_linear_p1_poc>)
+    set_tests_properties(gpu_cudss_cli PROPERTIES LABELS "gpu;cli;cudss" TIMEOUT 180)
     add_test(NAME gpu_preconditioner_cli
       COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_preconditioner_cli.py"
         $<TARGET_FILE:gpu_linear_p1_poc>

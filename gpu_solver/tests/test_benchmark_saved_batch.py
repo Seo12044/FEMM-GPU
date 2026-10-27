@@ -82,17 +82,21 @@ class ParityGateTests(unittest.TestCase):
                 self.assertEqual(len(report["requests"]), 1)
                 self.assertEqual(report["requests"][0]["runs"], [])
 
-    def test_successful_run_records_both_binaries_once(self, modes=False, mismatch=False):
+    def test_successful_run_records_both_binaries_once(self, modes=False, mismatch=False,
+                                                      linear_solvers=False):
         response = {"status": "PASS", "timing": {}, "items": [{"response": {
             "status": "PASS", "convergence": {"iterations": 2, "residual_l2": 0.0},
             "B": [0.1]}}]}
 
         def solve(command, **kwargs):
+            expected = []
+            candidate = "candidate" in str(command[-1])
+            if linear_solvers:
+                expected += ["--linear-solver", "cudss" if candidate else "pcg"]
             if modes:
-                self.assertEqual(command[1], "--preconditioner")
-                self.assertIn(command[2], ("jacobi", "block-jacobi"))
-            else:
-                self.assertEqual(command[1], "--motor-batch-profile")
+                expected += ["--preconditioner", "block-jacobi" if candidate else "jacobi"]
+            expected += ["--motor-batch-profile", str(request)]
+            self.assertEqual(command[1:-1], expected)
             if mismatch and "candidate" in str(command[-1]):
                 response["items"][0]["response"]["B"] = [0.2]
             Path(command[-1]).write_text(json.dumps(response), encoding="utf-8")
@@ -109,6 +113,8 @@ class ParityGateTests(unittest.TestCase):
                     "--request", str(request), "--output", str(output), "--rounds", "1"]
             if modes:
                 argv += ["--baseline-preconditioner", "jacobi", "--candidate-preconditioner", "block-jacobi"]
+            if linear_solvers:
+                argv += ["--baseline-linear-solver", "pcg", "--candidate-linear-solver", "cudss"]
             if mismatch:
                 argv += ["--continue-on-parity-failure"]
             with patch("sys.argv", argv), patch("subprocess.run", side_effect=solve):
@@ -124,6 +130,9 @@ class ParityGateTests(unittest.TestCase):
                              ["baseline", "candidate"])
             self.assertEqual(report["executables"]["candidate"]["preconditioner"],
                              "block-jacobi" if modes else None)
+            for label in ("baseline", "candidate"):
+                self.assertEqual(report["executables"][label]["linear_solver"],
+                                 ("cudss" if label == "candidate" else "pcg") if linear_solvers else None)
             self.assertEqual(report["requests"][0]["runs"][-1]["parity"], "FAIL" if mismatch else "PASS")
 
     def test_same_binary_preconditioner_comparison_records_modes(self):
@@ -131,6 +140,9 @@ class ParityGateTests(unittest.TestCase):
 
     def test_collected_parity_failure_retains_results_but_fails_report(self):
         self.test_successful_run_records_both_binaries_once(modes=True, mismatch=True)
+
+    def test_same_binary_linear_solver_comparison_records_modes(self):
+        self.test_successful_run_records_both_binaries_once(linear_solvers=True)
 
 
 if __name__ == "__main__":

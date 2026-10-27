@@ -26,6 +26,86 @@ start.
 `gpu_bh_curve_poc --fixture <directory>` tests B-H preprocessing and
 interpolation separately.
 
+### Optional GPU direct solver
+
+The default remains `pcg` with Jacobi. A build with
+`GPU_SOLVER_ENABLE_CUDSS=ON` also accepts:
+
+```powershell
+femm_gpu.exe --linear-solver cudss --solve request.json direct.json
+femm_gpu.exe --linear-solver cudss --motor-batch-profile batch.json direct-batch.json
+femm_gpu.exe --linear-solver cudss --self-test
+```
+
+The project-neutral Python frontend forwards the same explicit choice:
+
+```powershell
+python gpu_solver/tools/femm_gpu.py --solver C:/solvers/femm_gpu.exe `
+  --linear-solver cudss solve model.gpu.json direct.json --fields
+```
+
+The option precedes the command. `--capabilities` lists the backends compiled
+into the executable. A normal build has no cuDSS dependency and rejects the
+direct option explicitly. `--preconditioner` applies only to PCG; combining
+it with `cudss` is an error. `--self-test` with this option runs the direct
+backend's manufactured-solution, validation, reuse, and lifecycle tests.
+
+The direct path uses FP64 sparse Cholesky for symmetric positive-definite
+systems. It replaces the inner linear solve, not the nonlinear B-H model,
+Newton iteration, signed periodic constraints, or magnetic postprocessing.
+It verifies `||Ax-b||/||b||` against the original full CSR at the caller's
+tolerance. No pivot shift, relaxed tolerance, or CPU magnetic-solver fallback
+is used. Singular, non-positive, significantly asymmetric, or nonfinite
+operators fail instead of being silently repaired.
+
+Each initialized CSR graph gets one symbolic analysis. Numeric factors are
+reused only while the private operator is unchanged. Host updates, device
+writes, and distinct numeric batch slots require refactorization, even if
+they share a mesh or buffer address. Batch items execute sequentially with
+one factor workspace per graph, rather than allocating a factor for every
+operating point. Different graphs can have separate live plans.
+
+The profile adds direct analysis/factorization/solve times and counts,
+factor reuse, and the largest cuDSS plan's estimated device-memory peak.
+This estimate excludes the application's CSR/vector buffers and other
+simultaneously live plans; it is not total process VRAM usage. Direct solves
+report zero PCG iterations, while the ordinary convergence record continues
+to count nonlinear iterations.
+The legacy cache `actual_parallel_width` describes the nonlinear assembly
+group width, not the number of concurrent cuDSS factorizations.
+
+#### Building with cuDSS
+
+Tested with cuDSS 1.0.0.35, CUDA 13.3, and MSVC 19.44 on Windows. Obtain the
+cuDSS package for the **same CUDA major version** as the Toolkit from
+[NVIDIA's distribution](https://developer.nvidia.com/cudss-downloads).
+Keep its `include`, `lib`, and `bin` directories together:
+
+```powershell
+cmake -S gpu_solver -B build-cudss -G "Visual Studio 17 2022" -A x64 `
+  -DGPU_SOLVER_ENABLE_CUDSS=ON -DCUDSS_ROOT=C:/libraries/cudss `
+  -DBUILD_TESTING=ON
+cmake --build build-cudss --config Release --parallel 4
+
+# CUDA 13.3 on Windows keeps these dependent DLLs in bin/x64.
+$env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;" + $env:PATH
+ctest --test-dir build-cudss -C Release --output-on-failure
+```
+
+CMake copies the cuDSS DLL beside the Windows executable. cuDSS 1.0 also
+requires the matching cuBLAS and NVRTC runtime libraries on the library
+search path. This changes only the current shell's path. See NVIDIA's
+[runtime requirements](https://docs.nvidia.com/cuda/cudss/latest/getting_started.html).
+An enabled executable requires these DLLs even when selecting PCG. Use the
+default OFF build for an installation without cuDSS.
+The dependency's required vendor notice is in [CUDSS-NOTICE.md](CUDSS-NOTICE.md).
+
+No MATLAB launcher or optimization identity is changed automatically.
+Callers must include the linear-solver choice in any result-cache identity;
+an executable hash alone does not distinguish two modes of the same binary.
+See [PERFORMANCE.md](PERFORMANCE.md) for measured speed, accuracy differences,
+and the current experimental status before using it in a campaign.
+
 The default Jacobi path uses fused PCG vector work and a bounded hybrid
 Sliced-ELL/CSR memory layout for larger systems. It keeps FP64, each row's
 entry order and the true-residual convergence checks. No input setting is

@@ -308,7 +308,9 @@ def command_solve(args: argparse.Namespace) -> int:
             mode="w", encoding="utf-8", suffix=".tmp", dir=output.parent, delete=False
         ) as stream:
             response_path = Path(stream.name)
-        returncode = run_solver(solver, "--solve", str(request_path), str(response_path))
+        mode = getattr(args, "linear_solver", None)
+        prefix = [] if mode is None else ["--linear-solver", mode]
+        returncode = run_solver(solver, *prefix, "--solve", str(request_path), str(response_path))
         validate_response(
             response_path, str(request["mesh_artifact_sha256"]), returncode, protocol
         )
@@ -350,6 +352,8 @@ def command_prepare(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="femm_gpu")
     parser.add_argument("--solver", help="path to the CUDA solver executable")
+    parser.add_argument("--linear-solver", choices=("pcg", "cudss"),
+                        help="inner linear solver; native executable default when omitted")
     commands = parser.add_subparsers(dest="command", required=True)
 
     prepare = commands.add_parser(

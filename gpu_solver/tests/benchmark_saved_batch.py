@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--candidate", type=Path, required=True)
     for label in ("baseline", "candidate"):
         parser.add_argument(f"--{label}-preconditioner", choices=("jacobi", "block-jacobi"))
+        parser.add_argument(f"--{label}-linear-solver", choices=("pcg", "cudss"))
     parser.add_argument("--request", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
@@ -72,6 +73,8 @@ def main():
               "executables": {k: {"path": str(v), "sha256": sha256(v),
                                   "preconditioner": getattr(args, f"{k}_preconditioner")}
                               for k, v in executables.items()}, "requests": []}
+    for label in executables:
+        report["executables"][label]["linear_solver"] = getattr(args, f"{label}_linear_solver")
     (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     try:
         run_requests(args, executables, report)
@@ -97,6 +100,9 @@ def run_requests(args, executables, report):
                 output = args.output / f"request_{index:02d}_{label}_{repeat}.json"
                 start = time.perf_counter()
                 command = [str(executables[label])]
+                linear_solver = getattr(args, f"{label}_linear_solver")
+                if linear_solver is not None:
+                    command += ["--linear-solver", linear_solver]
                 mode = getattr(args, f"{label}_preconditioner")
                 if mode is not None:
                     command += ["--preconditioner", mode]
@@ -106,7 +112,9 @@ def run_requests(args, executables, report):
                     capture_output=True, timeout=args.timeout,
                 )
                 elapsed = time.perf_counter() - start
-                assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+                assert completed.returncode == 0, (
+                    f"Solver exited {completed.returncode}; response: {output}; "
+                    + completed.stderr.decode(errors="replace"))
                 response = json.loads(output.read_text(encoding="utf-8"))
                 assert response["status"] == "PASS"
                 for item in response["items"]:

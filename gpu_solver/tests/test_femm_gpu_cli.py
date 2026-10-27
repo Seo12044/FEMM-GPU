@@ -24,6 +24,24 @@ SOLVER = (
 
 
 class FemmGpuCliTests(unittest.TestCase):
+    def test_explicit_direct_selection_reaches_native_solver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact, output = root / "mesh.json", root / "response.json"
+            self._write_artifact(artifact)
+            args = self._solve_args(artifact, output)
+            args.linear_solver = "cudss"
+            artifact_sha = femm_gpu.sha256_file(artifact)
+
+            def fake_run(_solver, *arguments):
+                self.assertEqual(arguments[:3], ("--linear-solver", "cudss", "--solve"))
+                Path(arguments[-1]).write_text(json.dumps(self._response(artifact_sha)), encoding="utf-8")
+                return 0
+
+            with mock.patch.object(femm_gpu, "require_solver", return_value=Path("fake")), \
+                    mock.patch.object(femm_gpu, "run_solver", side_effect=fake_run):
+                self.assertEqual(femm_gpu.command_solve(args), 0)
+
     @staticmethod
     def _write_artifact(path, schema=femm_gpu.LEGACY_ARTIFACT_SCHEMA):
         path.write_text(json.dumps({"schema_version": schema}) + "\n", encoding="utf-8")

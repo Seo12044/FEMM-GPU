@@ -19,12 +19,16 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
+#ifdef GPU_FEMM_ENABLE_CUDSS
+#include <cudss.h>
+#endif
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -1331,16 +1335,24 @@ struct SharedOperatorBatchEvidence {
   size_t rhs_workspace_bytes = 0;
 };
 
+#include "cudss_direct_solver.cuh"
+
 class GpuCsrSolver {
   public:
-  explicit GpuCsrSolver(PcgPreconditioner mode = selected_preconditioner, bool interleaved = true)
-      : preconditioner_mode_(mode), interleaved_(interleaved) {}
+  explicit GpuCsrSolver(PcgPreconditioner mode = selected_preconditioner, bool interleaved = true,
+      LinearSolverBackend backend = selected_linear_solver)
+      : preconditioner_mode_(mode), interleaved_(interleaved), backend_(backend) {}
   const PreconditionerStats& preconditioner_stats() const { return block_plan_.stats(); }
   size_t preconditioner_bytes() const { return block_plan_.bytes(); }
   bool interleaved_spmv() const { return spmv_layout_.enabled(); }
 
   Status Initialize(const Assembly& assembly)
   {
+#ifdef GPU_FEMM_ENABLE_CUDSS
+    direct_plan_.Reset(); // Release wrappers before their borrowed buffers.
+#else
+    if (backend_ == LinearSolverBackend::kCudss) return Status::kUnsupportedFeature;
+#endif
     initialized_ = false;
     spmv_layout_.Reset();
     current_preconditioner_ready_ = false;
@@ -1389,7 +1401,13 @@ class GpuCsrSolver {
     }
     host_row_offsets_ = assembly.row_offsets;
     host_column_indices_ = assembly.column_indices;
-    if ((status = spmv_layout_.Initialize(host_row_offsets_, host_column_indices_, interleaved_)) != Status::kOk)
+    if (backend_ == LinearSolverBackend::kCudss) {
+#ifdef GPU_FEMM_ENABLE_CUDSS
+      status = direct_plan_.Initialize(n_, host_row_offsets_, host_column_indices_,
+          row_offsets_.get(), column_indices_.get(), values_.get(), rhs_.get(), solution_.get());
+#endif
+    } else status = spmv_layout_.Initialize(host_row_offsets_, host_column_indices_, interleaved_);
+    if (status != Status::kOk)
       return status;
     initialized_ = true;
     return Status::kOk;
@@ -1405,6 +1423,9 @@ class GpuCsrSolver {
   Status UpdateValues(const Assembly& assembly)
   {
     current_preconditioner_ready_ = false;
+#ifdef GPU_FEMM_ENABLE_CUDSS
+    direct_plan_.InvalidateValues();
+#endif
     if (!HasMatchingStructure(assembly) || assembly.values.size() != host_column_indices_.size()
         || assembly.diagonal.size() != static_cast<size_t>(n_))
       return Status::kInvalidArgument;
@@ -1440,7 +1461,7 @@ class GpuCsrSolver {
     // a second cooperative launch/validation path. Small fixtures retain the
     // established single-block arithmetic; unsupported devices still fall
     // back inside SolveCurrentOperatorBatch.
-    if (n_ >= kPcgMinCooperativeRows) {
+    if (backend_ == LinearSolverBackend::kCudss || n_ >= kPcgMinCooperativeRows) {
       std::vector<SolveInfo> infos;
       std::vector<std::vector<double>> solutions;
       const Status status = SolveCurrentOperatorBatch({ rhs }, relative_tolerance,
@@ -1522,6 +1543,10 @@ class GpuCsrSolver {
     }
     if (timing != nullptr)
       timing->upload_seconds += ProfileSecondsSince(upload_start);
+    if (backend_ == LinearSolverBackend::kCudss)
+      return SolveDirectBatch(count, nnz, batch_values_.get(), batch_diagonal_.get(),
+          batch_rhs_.get(), batch_solution_.get(), relative_tolerance, max_iterations,
+          infos, solutions, launches, timing);
     const Status preconditioner_status = PreparePreconditioner(count,
         batch_values_.get(), batch_diagonal_.get(), timing);
     if (preconditioner_status != Status::kOk) return preconditioner_status;
@@ -1599,6 +1624,17 @@ class GpuCsrSolver {
     }
     if (timing != nullptr)
       timing->upload_seconds += ProfileSecondsSince(upload_start);
+    if (backend_ == LinearSolverBackend::kCudss) {
+      if (evidence != nullptr) {
+        evidence->physical_operator_count = evidence->operator_upload_count = 1;
+        evidence->rhs_count = count;
+        evidence->operator_bytes = values_.count()*sizeof(double);
+        evidence->rhs_workspace_bytes = count*static_cast<size_t>(n_)*6*sizeof(double);
+      }
+      return SolveDirectBatch(count, 0, values_.get(), diagonal_.get(),
+          batch_rhs_.get(), batch_solution_.get(), relative_tolerance, max_iterations,
+          infos, solutions, launches, timing);
+    }
     const Status preconditioner_status = PreparePreconditioner(1, values_.get(), diagonal_.get(), timing);
     if (preconditioner_status != Status::kOk) return preconditioner_status;
     if (evidence != nullptr) {
@@ -1714,6 +1750,10 @@ class GpuCsrSolver {
         || count > batch_capacity_)
       return Status::kInvalidArgument;
     const size_t nnz = host_column_indices_.size();
+    if (backend_ == LinearSolverBackend::kCudss)
+      return SolveDirectBatch(count, nnz, batch_values_.get(), batch_diagonal_.get(),
+          batch_rhs_.get(), batch_solution_.get(), relative_tolerance, max_iterations,
+          infos, solutions, launches, timing);
     const Status preconditioner_status = PreparePreconditioner(count,
         batch_values_.get(), batch_diagonal_.get(), timing);
     if (preconditioner_status != Status::kOk) return preconditioner_status;
@@ -1766,6 +1806,18 @@ class GpuCsrSolver {
   }
 
   private:
+  Status SolveDirectBatch(size_t count, size_t stride, const double* values,
+      const double* diagonal, const double* rhs, double* solution, double tolerance,
+      int max_iterations, std::vector<SolveInfo>* infos,
+      std::vector<std::vector<double>>* solutions, int* launches, GpuBatchSolveTiming* timing)
+  {
+#ifdef GPU_FEMM_ENABLE_CUDSS
+    return direct_plan_.SolveBatch(count, stride, values, diagonal, rhs, solution,
+        tolerance, max_iterations, infos, solutions, launches, timing);
+#else
+    return Status::kUnsupportedFeature;
+#endif
+  }
   const int32_t* SpmvColumns() const
   { return spmv_layout_.enabled() ? spmv_layout_.columns() : column_indices_.get(); }
   const double* SpmvValues(const double* csr) const
@@ -1947,6 +1999,7 @@ class GpuCsrSolver {
   int n_ = 0;
   PcgPreconditioner preconditioner_mode_;
   bool interleaved_;
+  LinearSolverBackend backend_;
   PcgSpmvLayout spmv_layout_;
   BlockJacobiPlan block_plan_;
   bool current_preconditioner_ready_ = false;
@@ -1975,6 +2028,9 @@ class GpuCsrSolver {
   bool batch_inverse_diagonal_usable_ = true;
   int batch_dimension_ = 0;
   size_t batch_nnz_ = 0;
+#ifdef GPU_FEMM_ENABLE_CUDSS
+  CudssDirectPlan direct_plan_; // Destroy before the borrowed device buffers.
+#endif
 };
 
 class LinearP1FixtureSolver {
@@ -8764,7 +8820,17 @@ bool WriteMotorBatchResponse(const std::string& path, const MotorBatchRequest* r
            << ", \"gpu_upload_seconds\": " << timing->nonlinear.gpu_upload_seconds
            << ", \"gpu_kernel_sync_seconds\": " << timing->nonlinear.gpu_kernel_sync_seconds
            << ", \"gpu_download_seconds\": " << timing->nonlinear.gpu_download_seconds
-           << ", \"preconditioner\": \"" << (selected_preconditioner == PcgPreconditioner::kJacobi ? "jacobi" : "block-jacobi") << "\""
+           << ", \"linear_solver\": \"" << (selected_linear_solver == LinearSolverBackend::kCudss ? "cudss" : "pcg") << "\""
+           << ", \"direct_analyses\": " << direct_solver_stats.analyses
+           << ", \"direct_factorizations\": " << direct_solver_stats.factorizations
+           << ", \"direct_solves\": " << direct_solver_stats.solves
+           << ", \"direct_factor_reuses\": " << direct_solver_stats.factor_reuses
+           << ", \"direct_analysis_seconds\": " << direct_solver_stats.analysis_seconds
+           << ", \"direct_factor_seconds\": " << direct_solver_stats.factor_seconds
+           << ", \"direct_solve_seconds\": " << direct_solver_stats.solve_seconds
+           << ", \"direct_peak_plan_device_bytes\": " << direct_solver_stats.peak_device_estimate_bytes
+           << ", \"preconditioner\": \"" << (selected_linear_solver == LinearSolverBackend::kCudss ? "none"
+               : selected_preconditioner == PcgPreconditioner::kJacobi ? "jacobi" : "block-jacobi") << "\""
            << ", \"preconditioner_setup_seconds\": " << timing->nonlinear.preconditioner.setup_seconds
            << ", \"interleaved_spmv_solves\": " << timing->nonlinear.interleaved_spmv_solves
            << ", \"preconditioner_builds\": " << timing->nonlinear.preconditioner.builds
@@ -9573,6 +9639,7 @@ bool SameBits(const SolveResult& left, const SolveResult& right)
 #include "block_preconditioner_tests.inc"
 #include "nonlinear_tolerance_tests.inc"
 #include "pcg_spmv_layout_tests.inc"
+#include "cudss_regression_tests.inc"
 
 int SelfTest()
 {
@@ -11584,20 +11651,44 @@ int main(int argc, char** argv)
 {
   // Keep argv[0] intact: output-file protection compares it with the response.
   std::vector<char*> arguments;
-  if (argc >= 2 && std::string(argv[1]) == "--preconditioner") {
-    if (argc < 4 || (std::string(argv[2]) != "jacobi" && std::string(argv[2]) != "block-jacobi")) {
-      std::cerr << "--preconditioner requires jacobi or block-jacobi, followed by a command\n";
-      return 2;
+  int next = 1;
+  bool have_preconditioner = false, have_solver = false;
+  while (next < argc && (std::string(argv[next]) == "--preconditioner"
+                         || std::string(argv[next]) == "--linear-solver")) {
+    const bool solver = std::string(argv[next]) == "--linear-solver";
+    if (next+2 >= argc || (solver ? have_solver : have_preconditioner)) {
+      std::cerr << "Solver options require a single value and a command\n"; return 2;
     }
-    gpu_femm::selected_preconditioner = std::string(argv[2]) == "block-jacobi"
-        ? gpu_femm::PcgPreconditioner::kBlockJacobi : gpu_femm::PcgPreconditioner::kJacobi;
+    const std::string value = argv[next+1];
+    if (solver) {
+      if (value != "pcg" && value != "cudss") { std::cerr << "--linear-solver requires pcg or cudss\n"; return 2; }
+#ifndef GPU_FEMM_ENABLE_CUDSS
+      if (value == "cudss") { std::cerr << "cuDSS was not enabled in this build\n"; return 2; }
+#endif
+      gpu_femm::selected_linear_solver = value == "cudss"
+          ? gpu_femm::LinearSolverBackend::kCudss : gpu_femm::LinearSolverBackend::kPcg;
+      have_solver = true;
+    } else {
+      if (value != "jacobi" && value != "block-jacobi") { std::cerr << "--preconditioner requires jacobi or block-jacobi\n"; return 2; }
+      gpu_femm::selected_preconditioner = value == "block-jacobi"
+          ? gpu_femm::PcgPreconditioner::kBlockJacobi : gpu_femm::PcgPreconditioner::kJacobi;
+      have_preconditioner = true;
+    }
+    next += 2;
+  }
+  if (gpu_femm::selected_linear_solver == gpu_femm::LinearSolverBackend::kCudss && have_preconditioner) {
+    std::cerr << "--preconditioner only applies to pcg\n"; return 2;
+  }
+  if (next != 1) {
     arguments.push_back(argv[0]);
-    for (int i = 3; i < argc; ++i) arguments.push_back(argv[i]);
+    for (int i = next; i < argc; ++i) arguments.push_back(argv[i]);
     arguments.push_back(nullptr);
-    argc -= 2;
+    argc = static_cast<int>(arguments.size())-1;
     argv = arguments.data();
   }
   if (argc == 2 && std::string(argv[1]) == "--self-test") {
+    if (gpu_femm::selected_linear_solver == gpu_femm::LinearSolverBackend::kCudss)
+      return gpu_femm::CudssRegressionTests() == 0 ? 0 : 1;
     return gpu_femm::SelfTest();
   }
   if (argc == 2 && std::string(argv[1]) == "--internal-preconditioner-test") {
@@ -11605,6 +11696,9 @@ int main(int argc, char** argv)
   }
   if (argc == 2 && std::string(argv[1]) == "--internal-pcg-storage-test") {
     return gpu_femm::PcgSpmvLayoutTests() == 0 ? 0 : 1;
+  }
+  if (argc == 2 && std::string(argv[1]) == "--internal-cudss-test") {
+    return gpu_femm::CudssRegressionTests() == 0 ? 0 : 1;
   }
   if (argc == 3 && std::string(argv[1]) == "--femm-reference") {
     return gpu_femm::FemmReferenceTest(argv[2]);
@@ -11664,6 +11758,12 @@ int main(int argc, char** argv)
         << "  \"problem_types\": [\"planar\", \"axisymmetric\"],\n"
         << "  \"frequency_hz\": [0],\n"
         << "  \"precision\": \"fp64\",\n"
+#ifdef GPU_FEMM_ENABLE_CUDSS
+        << "  \"linear_solvers\": [\"pcg\", \"cudss\"],\n"
+#else
+        << "  \"linear_solvers\": [\"pcg\"],\n"
+#endif
+        << "  \"default_linear_solver\": \"pcg\",\n"
         << "  \"preconditioners\": [\"jacobi\", \"block-jacobi\"],\n"
         << "  \"default_preconditioner\": \"jacobi\",\n"
         << "  \"nonlinear_bh\": true,\n"
@@ -11683,7 +11783,7 @@ int main(int argc, char** argv)
         << "}\n";
     return 0;
   }
-  std::cerr << "Usage: gpu_linear_p1_poc [--preconditioner jacobi|block-jacobi] --self-test | --femm-reference <stem>"
+  std::cerr << "Usage: gpu_linear_p1_poc [--linear-solver pcg|cudss] [--preconditioner jacobi|block-jacobi] --self-test | --femm-reference <stem>"
             << " | --nonlinear-reference <stem> <curve_dir>"
             << " | --postprocess-reference <stem> <curve_dir>"
             << " | --single-sample <request.json> <response.json>"
